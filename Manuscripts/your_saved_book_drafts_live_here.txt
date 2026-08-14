@@ -1,0 +1,11 @@
+Books you write in the app's "Convert Inputted Text into PDF Signatures" view
+are saved here, one JSON file per draft, named after the draft.
+
+Each file holds everything: the title page, every section's heading and text,
+and the page size, margins and typeface it is set in. They are plain text, so
+you can copy one to another machine, keep one in version control, or open one in
+a text editor if you ever need to.
+
+Nothing in here is read by the conversion side of the app. A draft becomes an
+ordinary PDF in Input/ the moment you click "Create the book PDF", and takes the
+same route as any other book from there.

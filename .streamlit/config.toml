@@ -1,0 +1,100 @@
+# --------------------------------------------------------------------------
+# Strip the developer chrome
+# --------------------------------------------------------------------------
+# This is a local tool with one job, not a Streamlit app someone is building.
+# Everything in the top-right corner that exists to *develop* an app is noise
+# here, and some of it is worse than noise: Rerun and Stop both interrupt a
+# conversion in progress, which is the one thing the whole page-drawing order in
+# app.py is arranged to prevent.
+#
+# "minimal" hides the Deploy button, Rerun, Auto rerun and Clear cache, and also
+# Print and Record screen — "viewer" would leave those last two behind. What it
+# keeps is the System / Light / Dark switcher and the "Made with Streamlit v…"
+# footer, which are the two things in that menu worth having.
+#
+# In minimal mode Streamlit drops the whole header unless the app defines a menu
+# item of its own, so app.py passes an About entry to `st.set_page_config`. Take
+# that away and the theme switcher goes with it.
+[client]
+toolbarMode = "minimal"
+
+[server]
+# No source-file watcher. Its only visible output is the "File change. Rerun /
+# Always rerun" prompt in the header — a developer's control, offered to someone
+# who is here to fold paper and cannot edit the source from the browser anyway.
+# Turned off at the source rather than hidden, so nothing is watching for edits
+# that will not happen. Set this back to "auto" while working on the app itself.
+fileWatcherType = "none"
+
+# --------------------------------------------------------------------------
+# Theme: paper and foliage.
+# --------------------------------------------------------------------------
+#
+# The app is about paper, so the page is an off-white with a little green in it
+# rather than a flat white, and the accents are leaf greens. Every colour here
+# was picked against its own background for contrast, not by eye: body text is
+# ~14:1 on the page, captions and secondary text stay above 4.5:1, and the green
+# used behind white button text is dark enough to clear 4.5:1 on its own.
+#
+# Both appearance modes are defined, so the ⋮ menu's Light/Dark switch moves
+# between two versions of the same palette instead of dropping back to
+# Streamlit's stock colours in one of them.
+
+[theme]
+base = "light"
+font = "sans-serif"
+# Softer corners than the default: this is a hobby tool, not a control panel.
+baseRadius = "0.6rem"
+buttonRadius = "0.5rem"
+# The page and the cards are close in tone, so inputs need an outline to read as
+# inputs rather than as patches of background.
+showWidgetBorder = true
+
+# --------------------------------------------------------------------------
+# Light — pale paper, leaf accents
+# --------------------------------------------------------------------------
+[theme.light]
+backgroundColor = "#F6FAF2"           # paper with a green cast
+secondaryBackgroundColor = "#E7F1DE"  # sage, for cards and widget fills
+textColor = "#1C2B1F"                 # deep forest; ~14:1 on the page
+primaryColor = "#2E7D32"              # leaf green; 5.1:1 under white button text
+linkColor = "#256B2A"
+borderColor = "#CBDEBB"
+codeBackgroundColor = "#EDF5E4"
+codeTextColor = "#27512C"
+
+# Success messages should belong to the palette — they are the app's good news.
+# Red, orange, yellow and blue are left at Streamlit's defaults on purpose: an
+# error or a warning has to break out of the green, not blend into it.
+greenColor = "#2E7D32"
+greenBackgroundColor = "#DCEDD2"
+greenTextColor = "#1E5B23"
+
+[theme.light.sidebar]
+backgroundColor = "#E9F3E1"           # a shade deeper, so the panel reads as one
+secondaryBackgroundColor = "#F7FBF3"  # near-white widget fills on the sage panel
+borderColor = "#C4D9B3"
+codeBackgroundColor = "#F7FBF3"
+
+# --------------------------------------------------------------------------
+# Dark — the same palette after sundown
+# --------------------------------------------------------------------------
+[theme.dark]
+backgroundColor = "#121A11"
+secondaryBackgroundColor = "#1D271B"
+textColor = "#E4EEDC"
+primaryColor = "#7CC47F"              # lifted, so it carries on a dark ground
+linkColor = "#9AD79C"
+borderColor = "#2F3D2B"
+codeBackgroundColor = "#1A2318"
+codeTextColor = "#B7DDB6"
+
+greenColor = "#7CC47F"
+greenBackgroundColor = "#1F3320"
+greenTextColor = "#A6DCA8"
+
+[theme.dark.sidebar]
+backgroundColor = "#161F14"
+secondaryBackgroundColor = "#212C1E"
+borderColor = "#2F3D2B"
+codeBackgroundColor = "#212C1E"

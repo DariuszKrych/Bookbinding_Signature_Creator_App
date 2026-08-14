@@ -4,26 +4,54 @@ Usable headless (`python main.py`) or behind the Streamlit GUI (`streamlit run a
 """
 
 import argparse
+import os
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
+from Script.paper_sizes import (
+    INCHES,
+    MILLIMETRES,
+    book_page_table,
+    describe_size,
+    paper_size_table,
+    parse_paper_size,
+)
 from Script.print_formatting import (
+    ACTUAL_SIZE,
+    FIT,
+    PT_PER_INCH,
+    SCALE_MODES,
     ColumnLayout,
+    SheetFit,
     inspect_book,
-    layout_problems,
     plan_signatures,
+    sheet_problems,
+    sheet_warnings,
     split_to_signatures,
     stamp_book,
 )
+from Script.typesetting import is_generated_book, render_manuscript
 
 ROOT_DIR = Path(__file__).resolve().parent
 INPUT_DIR = ROOT_DIR / "Input"
 OUTPUT_DIR = ROOT_DIR / "Output"
 PREVIOUS_DIR = ROOT_DIR / "Previously_Converted"
+# Books being written in the GUI's editor, one JSON file per draft. Nothing in
+# the conversion path reads this folder: a draft becomes an ordinary input PDF
+# in Input/ the moment it is built, and takes the same route as any other book
+# from there.
+MANUSCRIPT_DIR = ROOT_DIR / "Manuscripts"
 
 DEFAULT_SHEETS_PER_SIGNATURE = 5
 NUMBERED_SUFFIX = "_Numbered"
+INSTRUCTIONS_NAME = "print_instructions.txt"
+
+# What `--paper` accepts to mean "do not resize anything".
+SAME_AS_SOURCE = "same"
 
 
 @dataclass(frozen=True)
@@ -49,23 +77,50 @@ def list_previous_books():
     return _list_pdfs(PREVIOUS_DIR)
 
 
+def _signature_number(path):
+    """The N in signature_N.pdf, or None if this is not one of our files.
+
+    Anything else the user happens to have dropped in the folder is ignored
+    rather than sorted. Reading its name as an integer used to raise, and the
+    listing is built while the whole GUI is being drawn, so one stray file took
+    the entire app down instead of being passed over.
+    """
+    tail = path.stem[len("signature_"):]
+    return int(tail) if tail.isdigit() else None
+
+
+def _signatures_in(folder):
+    numbered = [
+        (number, path)
+        for path in folder.glob("signature_*.pdf")
+        if (number := _signature_number(path)) is not None
+    ]
+    return [path for _number, path in sorted(numbered)]
+
+
 def list_ready_books():
     """Books already converted, newest first."""
     if not OUTPUT_DIR.is_dir():
         return []
     ready = []
-    for folder in OUTPUT_DIR.iterdir():
+    for folder in sorted(OUTPUT_DIR.iterdir()):
         if not folder.is_dir():
             continue
-        signatures = sorted(
-            (folder / "book_signatures").glob("signature_*.pdf"),
-            key=lambda p: int(p.stem.split("_")[-1]),
-        )
+        signatures = _signatures_in(folder / "book_signatures")
         if not signatures:
             continue
         ready.append(ReadyBook(name=folder.name, folder=folder, signatures=signatures))
-    ready.sort(key=lambda b: b.folder.stat().st_mtime, reverse=True)
-    return ready
+    # Sorted on a stat taken once here, not inside the comparison: a folder that
+    # disappears mid-sort would otherwise raise out of a listing whose whole job
+    # is to describe what is currently there.
+    stamped = []
+    for book in ready:
+        try:
+            stamped.append((book.folder.stat().st_mtime, book))
+        except OSError:
+            continue
+    stamped.sort(key=lambda pair: pair[0], reverse=True)
+    return [book for _mtime, book in stamped]
 
 
 def numbered_copy_path(pdf_path):
@@ -77,14 +132,15 @@ def numbered_copy_path(pdf_path):
 def number_book(pdf_path, layout=None, progress=None):
     """Write a page-numbered copy of `pdf_path` beside it, as a new book.
 
-    The original is left untouched, so a wrong layout costs nothing to undo:
-    delete the copy and try again.
+    `layout` None means "fit the columns to each page of this book", which is
+    right for any page size. The original is left untouched, so a wrong layout
+    costs nothing to undo: delete the copy and try again.
     """
     pdf_path = Path(pdf_path)
     target = numbered_copy_path(pdf_path)
     if target.exists():
         raise FileExistsError(f"“{target.name}” already exists.")
-    return stamp_book(pdf_path, target, layout or ColumnLayout(), progress=progress)
+    return stamp_book(pdf_path, target, layout, progress=progress)
 
 
 def move_book(pdf_path, destination_dir, overwrite=False):
@@ -104,39 +160,240 @@ def move_book(pdf_path, destination_dir, overwrite=False):
     return destination
 
 
+def _inside(path, *folders):
+    """Resolve `path` and require it to sit *under* one of `folders`.
+
+    Deleting is the one irreversible thing this app does, and `shutil.rmtree`
+    aimed at the wrong place cannot be taken back. Both delete functions are
+    handed a path that came from a listing of these folders, so this should never
+    fire — which is exactly why it is cheap to keep: it costs one stat call and
+    it turns "a bug somewhere upstream" into a refusal instead of a lost folder.
+    A path equal to the folder itself is rejected too, so no caller can empty
+    Output/ or Previously_Converted/ wholesale.
+    """
+    resolved = Path(path).resolve()
+    for folder in folders:
+        if Path(folder).resolve() in resolved.parents:
+            return resolved
+    allowed = ", ".join(str(Path(f)) for f in folders)
+    raise ValueError(f"“{path}” is not inside {allowed}, so it will not be deleted.")
+
+
+def delete_book(pdf_path):
+    """Delete one PDF from Input/ or Previously_Converted/."""
+    target = _inside(pdf_path, INPUT_DIR, PREVIOUS_DIR)
+    if not target.is_file():
+        raise FileNotFoundError(f"“{target.name}” is not there any more.")
+    target.unlink()
+    return target
+
+
+def delete_ready_book(folder):
+    """Delete one converted book's whole Output/ folder.
+
+    The signature files and the print_instructions.txt that explains how to print
+    them are only useful together, so they go together. The input PDF this was
+    made from is a separate file in another folder and is left alone.
+    """
+    target = _inside(folder, OUTPUT_DIR)
+    if not target.is_dir():
+        raise FileNotFoundError(f"“{target.name}” is not there any more.")
+    shutil.rmtree(target)
+    return target
+
+
+def open_folder(path):
+    """Show `path` in the desktop file manager.
+
+    Only meaningful because this is a local app: the GUI is a browser front end
+    onto a Streamlit process running on the user's own machine, so "the machine
+    that opens the window" and "the machine holding the files" are the same one.
+    A hosted deployment would open a folder on the server, where nobody is
+    looking, which is why this is a button and not a link.
+    """
+    path = Path(path)
+    if not path.is_dir():
+        raise FileNotFoundError(f"“{path}” is not a folder that exists.")
+    if sys.platform == "win32":
+        os.startfile(str(path))  # noqa: S606  (Explorer, on a path we just checked)
+    else:
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        # check=True so a missing xdg-open surfaces as an error the GUI can show,
+        # rather than a button that silently does nothing.
+        subprocess.run([opener, str(path)], check=True)
+    return path
+
+
+# --------------------------------------------------------------------------
+# Books typed into the editor
+# --------------------------------------------------------------------------
+
+
+def book_pdf_path(file_name):
+    """Where a typed book is built: an ordinary input PDF in Input/.
+
+    Only the last component of the name is kept and only a `.pdf` is ever
+    written, so whatever the editor's file-name box contains, the build lands
+    in Input/ and nowhere else.
+    """
+    stem = Path(str(file_name)).name
+    stem = stem[:-4] if stem.lower().endswith(".pdf") else stem
+    stem = "".join(" " if character in '<>:"/\\|?*' else character
+                   for character in stem)
+    stem = " ".join(stem.split()).strip(" .")[:80].strip(" .")
+    return INPUT_DIR / f"{stem or 'Untitled book'}.pdf"
+
+
+def typeset_book(manuscript, file_name, progress=None, page_size_in=None):
+    """Set one typed manuscript as an input PDF, ready to convert.
+
+    `page_size_in` is the finished page size to set the book at, overriding the
+    one in its design; the GUI passes half the sheet chosen on the writing tab,
+    so that a book destined for particular paper is set at that size instead of
+    being scaled on to it afterwards.
+
+    Rebuilding a book after an edit is the normal loop, so a PDF this editor
+    wrote is replaced without asking. A PDF that came from anywhere else is
+    never replaced: the editor's file name defaults to the book's title, and a
+    title that happens to match a book the user dropped into Input/ themselves
+    would otherwise overwrite it with no warning at all.
+    """
+    target = book_pdf_path(file_name)
+    if target.exists() and not is_generated_book(target):
+        raise FileExistsError(
+            f"“{target.name}” is already in Input, and this editor did not "
+            f"write it. Choose a different file name so the book already there "
+            f"is left alone."
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return render_manuscript(
+        manuscript, target, progress=progress, page_size_in=page_size_in
+    )
+
+
+def print_instructions(book_name, fit, plans, flip_on_long_edge, unit=INCHES):
+    """The note dropped next to the signatures, so the settings reach the printer.
+
+    A signature file is useless without knowing what paper it wants and that it
+    must not be scaled again on the way out, and that knowledge otherwise lives
+    only in whichever GUI session created it.
+    """
+    sheet_w, sheet_h = fit.sheet_size_in
+    page_w, page_h = fit.book_page_size_in
+    sheets = sum(plan.sheets for plan in plans)
+    edge = "long" if flip_on_long_edge else "short"
+    lines = [
+        f"{book_name}",
+        f"Created {datetime.now():%Y-%m-%d %H:%M}",
+        "",
+        f"Paper to load        {describe_size(sheet_w, sheet_h, unit)}",
+        f"Folded book page     {unit.size_label(page_w, page_h)}",
+        f"Scaling applied      {fit.scale * 100:.1f}% of the original",
+        f"Signatures           {len(plans)} ({sheets} sheets of paper, "
+        f"{sheets * 2} printed sides)",
+        f"Sheets per signature {[plan.sheets for plan in plans]}",
+        "",
+        "How to print",
+        "  1. Print one signature file at a time, double-sided.",
+        "  2. Set the scale to 100% / 'Actual size'. Do not use 'Fit to page':",
+        "     the pages are already sized for this paper and scaling again would",
+        "     shrink the margins and move the fold off centre.",
+        f"  3. Set the printer's duplex option to flip on the {edge} edge.",
+        "  4. Fold every sheet of a signature in half, then nest them one inside",
+        "     the other. The first sheet printed is the outermost.",
+        "  5. Check that the page numbers run in order through the folded",
+        "     signature. If every other page is upside down, the duplex setting",
+        "     is the other one; switch it and reprint.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def convert_book(
     pdf_path,
     layout=None,
     sheets_per_signature=DEFAULT_SHEETS_PER_SIGNATURE,
     flip_on_long_edge=True,
+    sheet_size_pt=None,
+    scale_mode=FIT,
     move_input=True,
     progress=None,
 ):
     """Convert one input PDF into per-signature print files.
 
-    Raises ValueError if the column layout does not fit the book, rather than
-    quietly printing sheets that fold through a column of text.
+    `sheet_size_pt` is the paper to print on, in points; None keeps the source
+    page's own size, which is the case where nothing is scaled at all.
+
+    Raises ValueError only when the book genuinely cannot be printed as asked:
+    an unreadable or empty PDF, or a book kept at its original size that runs off
+    the chosen sheet. Everything else proceeds.
+
+    `layout` is accepted and ignored. Imposition splits every source page at its
+    own midpoint, which is where the fold is by definition, so no column
+    measurement can change the output — see `ColumnLayout`. It stays in the
+    signature because the callers that impose also number, and numbering does
+    read it.
 
     Page numbering is a separate, opt-in step (`number_book`), so what gets
     imposed here is exactly the PDF handed in.
     """
     pdf_path = Path(pdf_path)
-    layout = layout or ColumnLayout()
     info = inspect_book(pdf_path)
 
-    problems = layout_problems(layout, info.page_width_pt)
+    fit = SheetFit.compute(
+        (info.page_width_pt, info.page_height_pt), sheet_size_pt, scale_mode
+    )
+    problems = sheet_problems(fit)
     if problems:
         raise ValueError("; ".join(problems))
 
-    signature_folder = OUTPUT_DIR / pdf_path.stem / "book_signatures"
-    signature_folder.mkdir(parents=True, exist_ok=True)
+    book_folder = OUTPUT_DIR / pdf_path.stem
+    signature_folder = book_folder / "book_signatures"
 
-    signatures = split_to_signatures(
-        pdf_path,
-        sheets_per_signature,
-        signature_folder,
-        flip_on_long_edge=flip_on_long_edge,
-        progress=progress,
+    # The new signatures are built in a staging folder and swapped in only once
+    # the whole set exists.
+    #
+    # Reconverting the same book on different paper is the normal way to use
+    # this, and a smaller sheet or a bigger signature can produce fewer files
+    # than last time, so last run's surplus has to go. Deleting it up front and
+    # writing over the top is what made that dangerous: a conversion that failed
+    # or was interrupted half way left a folder that looks finished but holds a
+    # mixture of two different impositions — pages that would be printed, folded
+    # and bound before anyone noticed. Staging means a failure leaves the
+    # previous, complete set exactly as it was.
+    staging = book_folder / "_new_signatures"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+
+    try:
+        written = split_to_signatures(
+            pdf_path,
+            sheets_per_signature,
+            staging,
+            flip_on_long_edge=flip_on_long_edge,
+            sheet_size_pt=sheet_size_pt,
+            scale_mode=scale_mode,
+            progress=progress,
+        )
+        if signature_folder.exists():
+            shutil.rmtree(signature_folder)
+        staging.rename(signature_folder)
+    except BaseException:
+        # BaseException, not Exception: a rerun or a stop raised through this by
+        # the GUI must not be the one path that leaves a half-written folder
+        # behind, which is the entire point of staging.
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    signatures = [signature_folder / path.name for path in written]
+
+    plans = plan_signatures(info.book_pages, sheets_per_signature)
+    # utf-8-sig, not plain utf-8: this file is meant to be opened by hand next to
+    # a printer, and without a BOM the older Windows text tools read the "×" in a
+    # page size as mojibake.
+    (book_folder / INSTRUCTIONS_NAME).write_text(
+        print_instructions(pdf_path.stem, fit, plans, flip_on_long_edge),
+        encoding="utf-8-sig",
     )
 
     if move_input:
@@ -147,15 +404,85 @@ def convert_book(
     return signatures
 
 
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+
+def _print_size_tables():
+    """The reference the GUI shows in an expander, for people who never open it."""
+    print("\nSheets you can print on  (--paper <name>, or --paper 12x9in)\n")
+    print(f"  {'Name':<14} {'Sheet':<16} {'Folded book page':<22} Notes")
+    for _family, name, sheet, folded, note in paper_size_table(unit=MILLIMETRES):
+        print(f"  {name:<14} {sheet:<16} {folded:<22} {note}")
+    print("\nCommon finished book sizes, and the sheet each one needs\n")
+    print(f"  {'Name':<22} {'Book page':<14} {'Sheet needed':<16} Nearest stock")
+    for _family, name, trim, needed, stock, _note in book_page_table(unit=MILLIMETRES):
+        print(f"  {name:<22} {trim:<14} {needed:<16} {stock}")
+    print(
+        "\n  A sheet is folded across its width, so a book page is half a sheet wide\n"
+        "  and a full sheet tall. 'Nearest stock' is the smallest standard paper the\n"
+        "  needed sheet fits on; print on that and trim the book down afterwards.\n"
+    )
+
+
+def _resolve_sheet_size(paper, landscape):
+    """Turn the --paper argument into a (width, height) in points, or None."""
+    if paper is None or str(paper).strip().casefold() == SAME_AS_SOURCE:
+        return None
+    width_in, height_in = parse_paper_size(paper, landscape=landscape)
+    return (width_in * PT_PER_INCH, height_in * PT_PER_INCH)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--sheets", type=int, default=DEFAULT_SHEETS_PER_SIGNATURE,
         help="sheets of paper per signature (each sheet holds 4 book pages)",
     )
-    parser.add_argument("--margin", type=float, default=ColumnLayout.page_margin_in)
-    parser.add_argument("--gap", type=float, default=ColumnLayout.column_gap_in)
-    parser.add_argument("--column-width", type=float, default=ColumnLayout.column_width_in)
+    parser.add_argument(
+        "--margin", type=float, default=ColumnLayout.page_margin_in,
+        help="outer page margin of the input PDF, in inches. Only affects where "
+             "--number stamps page numbers",
+    )
+    parser.add_argument(
+        "--gap", type=float, default=ColumnLayout.column_gap_in,
+        help="gutter between the two columns of the input PDF, in inches. Only "
+             "affects where --number stamps page numbers",
+    )
+    parser.add_argument(
+        "--column-width", type=float, default=None,
+        help="column width of the input PDF, in inches. The default is to widen "
+             "the columns to fill each book's own page, keeping --margin and "
+             "--gap, which suits any page size; give a number to override that",
+    )
+    parser.add_argument(
+        "--fit-columns", action="store_true",
+        help="the default, kept for compatibility: ignore --column-width and fit "
+             "the columns to each book's own page",
+    )
+    parser.add_argument(
+        "--paper", default=SAME_AS_SOURCE, metavar="SIZE",
+        help=f"paper to print on: “{SAME_AS_SOURCE}” (default) keeps the input PDF's "
+             f"own page size, or give a name such as “A4”, “Letter”, “Tabloid”, or "
+             f"explicit dimensions such as “12x9in” or “420x297mm”. See --list-paper",
+    )
+    parser.add_argument(
+        "--portrait", action="store_true",
+        help="use the named --paper size with its short edge horizontal. Rarely what "
+             "you want: a sheet is folded across its width, so a portrait sheet gives "
+             "tall, narrow book pages",
+    )
+    parser.add_argument(
+        "--scale", choices=SCALE_MODES, default=FIT,
+        help=f"how to place the book on a differently sized sheet: “{FIT}” (default) "
+             f"scales each book page to fill the sheet, “{ACTUAL_SIZE}” keeps the "
+             f"original size and centres it",
+    )
+    parser.add_argument(
+        "--list-paper", action="store_true",
+        help="print the paper and book size tables and exit",
+    )
     parser.add_argument(
         "--number", action="store_true",
         help="instead of converting, write a page-numbered copy of each input book "
@@ -167,7 +494,15 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    layout = ColumnLayout(args.margin, args.gap, args.column_width)
+    if args.list_paper:
+        _print_size_tables()
+        return
+
+    try:
+        sheet_size_pt = _resolve_sheet_size(args.paper, landscape=not args.portrait)
+    except ValueError as error:
+        parser.error(str(error))
+
     books = list_available_books()
     if not books:
         print(f"No PDFs found in {INPUT_DIR}")
@@ -179,11 +514,19 @@ def main(argv=None):
                 continue
             print(f"\nNumbering {pdf_path.name} ...")
             try:
+                # None means "fit the columns to each page", which stays right
+                # through a book whose pages are not all the same size; a
+                # hand-given --column-width is carried through as it stands.
+                layout = (
+                    ColumnLayout(args.margin, args.gap, args.column_width)
+                    if args.column_width is not None and not args.fit_columns
+                    else None
+                )
                 numbered = number_book(
                     pdf_path, layout,
                     progress=lambda f, msg: print(f"  [{f:>5.0%}] {msg}", end="\r"),
                 )
-            except FileExistsError as error:
+            except (FileExistsError, ValueError) as error:
                 print(f"  Skipped: {error}")
             else:
                 print(f"\n  Wrote {numbered}")
@@ -192,17 +535,64 @@ def main(argv=None):
     for pdf_path in books:
         print(f"\nConverting {pdf_path.name} ...")
         info = inspect_book(pdf_path)
+        try:
+            layout = _layout_for(info, args)
+            fit = SheetFit.compute(
+                (info.page_width_pt, info.page_height_pt), sheet_size_pt, args.scale
+            )
+        except ValueError as error:
+            print(f"  Skipped: {error}")
+            continue
+
+        print(f"  source page {describe_size(*info.page_size_in, INCHES)}"
+              + (" (pages carry a /Rotate)" if info.rotated_pages else ""))
+
+        # Say no before describing a job that will not happen. The column layout
+        # is not consulted: imposition never reads it, so it cannot make a
+        # conversion wrong.
+        refusals = sheet_problems(fit)
+        if refusals:
+            for refusal in refusals:
+                print(f"  Skipped: {refusal}")
+            continue
+
         plans = plan_signatures(info.book_pages, args.sheets)
         print(f"  {info.source_pages} source pages -> {info.book_pages} book pages "
               f"-> {len(plans)} signatures")
-        signatures = convert_book(
-            pdf_path,
-            layout=layout,
-            sheets_per_signature=args.sheets,
-            flip_on_long_edge=not args.short_edge,
-            progress=lambda f, msg: print(f"  [{f:>5.0%}] {msg}", end="\r"),
-        )
+        print(f"  printing on {describe_size(*fit.sheet_size_in, INCHES)} at "
+              f"{fit.scale * 100:.1f}%, folding to book pages of "
+              f"{INCHES.size_label(*fit.book_page_size_in)}")
+        for warning in sheet_warnings(fit, layout):
+            print(f"  ! {warning}")
+
+        try:
+            signatures = convert_book(
+                pdf_path,
+                layout=layout,
+                sheets_per_signature=args.sheets,
+                flip_on_long_edge=not args.short_edge,
+                sheet_size_pt=sheet_size_pt,
+                scale_mode=args.scale,
+                progress=lambda f, msg: print(f"  [{f:>5.0%}] {msg}", end="\r"),
+            )
+        except ValueError as error:
+            print(f"  Skipped: {error}")
+            continue
         print(f"\n  Wrote {len(signatures)} files to {signatures[0].parent}")
+        print(f"  Printing notes in {signatures[0].parent.parent / INSTRUCTIONS_NAME}")
+
+
+def _layout_for(info, args):
+    """The column layout for one book: fitted to its own page unless overridden.
+
+    Fitting is the default because the alternative — one fixed column width for
+    every book — is only ever right for the one page size it was measured on.
+    """
+    if args.column_width is not None and not args.fit_columns:
+        return ColumnLayout(args.margin, args.gap, args.column_width)
+    return ColumnLayout.fitted(
+        info.page_width_pt / PT_PER_INCH, args.margin, args.gap
+    )
 
 
 if __name__ == "__main__":
