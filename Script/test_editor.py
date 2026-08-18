@@ -627,7 +627,7 @@ class TestDesignPanel(EditorTestCase):
         self.at.number_input(key="bk-len-m-in-in").set_value(0.60).run()
         # The unit switch is the sidebar's, and it is shared with the other
         # view — the editor only borrows it, which is what these keys record.
-        self.at.sidebar.radio[0].set_value("Millimetres (mm)").run()
+        self.sidebar_widget("setting-units").set_value("Millimetres (mm)").run()
         # Converted, not reinterpreted: 0.6 in reads as ~15.2 mm, not as 0.6 mm.
         # The box shows one decimal place and writes back what it shows, so the
         # stored length can move by half a displayed step — 0.05 mm here.
@@ -875,8 +875,11 @@ class TestSettingsAreNotAskedTwice(EditorTestCase):
         "setting-units": "Millimetres (mm)",
         "setting-sheets": 3,
         "setting-duplex": "Flip on short edge",
-        "setting-move-input": False,
     }
+    # Not one of the shared settings: it says nothing about the book, only about
+    # the light the app is read in. It is in the sidebar because that is where
+    # the ⋮ menu's switcher moved to when the corner was taken away.
+    APPEARANCE = ("setting-theme",)
     CONVERT_ONLY = ("setting-sheet-size", "setting-orientation",
                     "setting-scale-mode", "setting-auto-columns")
     WRITE_ONLY = ("bkpref-size-from", "bkpref-sheet", "bkpref-sheet-landscape")
@@ -890,8 +893,8 @@ class TestSettingsAreNotAskedTwice(EditorTestCase):
             for element in kind
         )
 
-    def test_the_sidebar_is_the_four_settings_both_tabs_share_and_no_more(self):
-        expected = sorted(self.SHARED)
+    def test_the_sidebar_is_the_settings_both_tabs_share_and_no_more(self):
+        expected = sorted([*self.SHARED, *self.APPEARANCE])
         self.assertEqual(self.sidebar_keys(), expected, "in the writing view")
         self.at.radio(key="view").set_value(CONVERT_VIEW).run()
         self.assertEqual(self.sidebar_keys(), expected, "in the conversion view")

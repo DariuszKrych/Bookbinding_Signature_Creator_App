@@ -9,12 +9,15 @@
 #
 # "minimal" hides the Deploy button, Rerun, Auto rerun and Clear cache, and also
 # Print and Record screen — "viewer" would leave those last two behind. What it
-# keeps is the System / Light / Dark switcher and the "Made with Streamlit v…"
-# footer, which are the two things in that menu worth having.
+# leaves behind is the System / Light / Dark switcher and the "Made with
+# Streamlit v…" footer.
 #
-# In minimal mode Streamlit drops the whole header unless the app defines a menu
-# item of its own, so app.py passes an About entry to `st.set_page_config`. Take
-# that away and the theme switcher goes with it.
+# Neither of those is wanted in the corner either, and no config option reaches
+# them. Nor can they simply be left unbuilt: in minimal mode Streamlit builds
+# the corner only for an app that has defined a menu item of its own, and with
+# no corner there is no switcher anywhere on the page — so app.py keeps the
+# About entry that builds it, hides the lot with a style block, and drives that
+# same switcher from the top of the sidebar instead.
 [client]
 toolbarMode = "minimal"
 
@@ -36,7 +39,7 @@ fileWatcherType = "none"
 # ~14:1 on the page, captions and secondary text stay above 4.5:1, and the green
 # used behind white button text is dark enough to clear 4.5:1 on its own.
 #
-# Both appearance modes are defined, so the ⋮ menu's Light/Dark switch moves
+# Both appearance modes are defined, so the sidebar's Light/Dark switch moves
 # between two versions of the same palette instead of dropping back to
 # Streamlit's stock colours in one of them.
 

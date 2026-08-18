@@ -60,11 +60,17 @@ st.set_page_config(
     page_title="Bookbinding Signature Creator",
     page_icon="📖",
     layout="wide",
-    # `client.toolbarMode = "minimal"` in .streamlit/config.toml strips the
-    # developer controls out of the top-right corner, and Streamlit then hides
-    # the header entirely unless the app has defined a menu item of its own.
-    # This About entry is what keeps the ⋮ menu — and with it the System /
-    # Light / Dark switcher and the "Made with Streamlit v…" line — on the page.
+    # This About entry is the price of the theme control in the sidebar, and it
+    # buys nothing else.
+    #
+    # In minimal mode Streamlit builds the top-right toolbar only for an app
+    # that has defined a menu item of its own — with no `menu_items` there is no
+    # toolbar, no ⋮ menu, and so no System / Light / Dark switcher anywhere in
+    # the page for the sidebar control to reach. The switcher is the only way
+    # into the theme that does not throw the session away, so the menu has to be
+    # built. The style block below then hides the whole corner, so this entry,
+    # the About dialog it opens and the "Made with Streamlit v…" line under it
+    # are all unreachable: built, never shown.
     menu_items={
         "About": """
             ### 📖 Bookbinding Signature Creator
@@ -115,6 +121,55 @@ st.html(
     """
 )
 
+# The top-right corner, taken off the page without taking it out of the page.
+#
+# `stMainMenu` is the ⋮ button and `stMainMenuPopover` the panel it drops —
+# drawn through a portal, so it needs a rule of its own rather than inheriting
+# the first. Hidden, not removed: `set_page_config` above explains why the menu
+# has to go on being built, and `APPEARANCE_SCRIPT` at the foot of this file is
+# what reaches into it. `display: none` takes both out of the tab order too, so
+# neither can be reached by keyboard.
+#
+# The rest of this undoes what building that menu costs. The header is an
+# absolutely positioned strip across the top of the page, 3.75rem tall, that
+# pushes nothing down — and the moment it has something to hold it stops being
+# transparent and starts taking clicks. Over a page whose content now starts at
+# 2rem that would be a band of background colour across the title and an
+# invisible catcher over the top of the right-hand column. Transparent and
+# click-through it is exactly what it was when it held nothing, with the one
+# control it still owns — the ⟩⟩ that appears there when the sidebar is folded
+# away — put back on its feet by hand.
+#
+# The gap itself: Streamlit pads the main column by 6rem to clear that strip,
+# which is 6rem of nothing for an app whose corner is empty.
+#
+# The sidebar counts its own top space separately — a 3.75rem strip and a 1rem
+# margin under it — so it needs its own rule to start where the page does. The
+# strip is not removed: it holds the ⟨⟨ that folds the sidebar away, and 2rem
+# is the height of the logo slot beside it, so nothing in there is squeezed.
+st.html(
+    """
+    <style>
+    [data-testid="stMainMenu"],
+    [data-testid="stMainMenuPopover"] { display: none !important; }
+
+    [data-testid="stHeader"],
+    [data-testid="stToolbar"] {
+        background: transparent !important;
+        pointer-events: none !important;
+    }
+    [data-testid="stExpandSidebarButton"] { pointer-events: auto !important; }
+
+    [data-testid="stMainBlockContainer"] { padding-top: 2rem !important; }
+
+    [data-testid="stSidebarHeader"] {
+        height: 2.5rem !important;
+        margin-bottom: 0 !important;
+    }
+    </style>
+    """
+)
+
 for folder in (INPUT_DIR, OUTPUT_DIR, PREVIOUS_DIR, MANUSCRIPT_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +186,11 @@ VIEW_LABELS = {
 }
 
 UNITS = {"Inches (in)": INCHES, "Centimetres (cm)": CENTIMETRES, "Millimetres (mm)": MILLIMETRES}
+
+# The three appearance modes, spelled exactly as Streamlit spells them: these
+# are the labels on its own switcher, and `APPEARANCE_SCRIPT` finds the control
+# to click by building a selector out of the chosen one.
+APPEARANCE_MODES = ("System", "Light", "Dark")
 
 # The "do not resize anything" entry in the conversion tab's sheet menu.
 SAME_AS_INPUT = "Same as the input PDF"
@@ -351,7 +411,25 @@ writing = view == WRITE_VIEW
 # page.
 with st.sidebar:
     st.header("Settings")
-    st.caption("These four apply to both tabs. The paper is set on the tab itself.")
+
+    # First under the header, and not one of the four the caption below counts:
+    # this one says nothing about the book, only about the light the app is read
+    # in. It is locked with everything else while a job runs, and for the same
+    # reason — a widget that changes asks Streamlit for a rerun, and Streamlit
+    # grants it by stopping the running script dead, half way through writing a
+    # book's signatures.
+
+    st.divider()
+
+    appearance = st.radio(
+        "Theme",
+        APPEARANCE_MODES,
+        horizontal=True,
+        key="setting-theme",
+        disabled=busy,
+    )
+
+    st.divider()
 
     if busy:
         st.warning(
@@ -411,20 +489,6 @@ with st.sidebar:
              "upside down. If a test signature comes out that way, switch this.",
     )
     flip_on_long_edge = duplex == "Flip on long edge"
-
-    move_input = st.checkbox(
-        "Move the PDF to the archive when it is converted",
-        value=True, key="setting-move-input", disabled=busy,
-        help="Keeps the conversion list to books you have not done yet, whether "
-             "the PDF was dropped into Input or built from the writing tab. The "
-             "archive panel can move any of them back.",
-    )
-
-    st.divider()
-
-    st.caption(
-        "Light and dark versions of the palette live in the **⋮** menu, top right."
-    )
 
 
 # Drawn wherever it is called from, which is now the conversion tab rather than
@@ -550,8 +614,7 @@ if view == CONVERT_VIEW:
             sheet_size_pt = None
             scale_mode = FIT
             st.caption(
-                "Each book keeps its own page size and nothing is scaled. The "
-                "folded book page is half the input PDF's page width."
+                "Each book keeps its own page size and nothing is scaled."
             )
         else:
             if sheet_choice == CUSTOM_SIZE:
@@ -614,12 +677,9 @@ if view == CONVERT_VIEW:
         # book and is nothing of the kind: every page is folded down its own
         # middle whatever is in here, and the columns are fitted to each book by
         # default, so most people never need to open it at all.
-        with st.expander("Column layout: where stamped page numbers go"):
+        with st.expander("Stamped page number positioning"):
             st.caption(
-                f"Where the two columns sit on a page of the *input* PDF, in "
-                f"{unit.name}. This only places **stamped page numbers**. Every "
-                f"page is folded down its own middle, so nothing here can change "
-                f"a conversion."
+                f"Dictates where **stamped page numbers** are placed."
             )
 
             sticky("setting-auto-columns", True)
@@ -1117,6 +1177,93 @@ with reference:
         )
 
 # --------------------------------------------------------------------------
+# Carrying the appearance choice out to the browser
+# --------------------------------------------------------------------------
+# Which palette the app is drawn in is decided in the browser, not on the
+# server: Streamlit sends both versions of the theme once, when the page is
+# first opened, and the switcher in its ⋮ menu picks between them client-side
+# without a rerun. There is no Python call for that choice, so the sidebar
+# radio reaches the same switcher the same way a click would — the menu is
+# still built, only hidden, and its System / Light / Dark items are still
+# there to be clicked.
+#
+# Reaching across from an `st.iframe` is what makes that possible: it is drawn
+# from `srcdoc`, so it shares the page's origin and can see `window.parent`.
+# The rest is the shape of that menu: the radio items only exist while the
+# panel is open, so it is opened, the wanted one is clicked, and it is shut
+# again — selecting a theme is the one thing in there that does not close it.
+#
+# Nothing here runs on an ordinary rerun. The script carries the chosen mode,
+# so the iframe's content only changes when the choice does, and an unchanged
+# `srcdoc` is never reloaded.
+APPEARANCE_SCRIPT = """
+<style>html, body { margin: 0; background: transparent; }</style>
+<script>
+(function () {
+  var page;
+  try {
+    page = window.parent.document;
+  } catch (error) {
+    return;                       // Not the same origin: nothing to reach.
+  }
+
+  var TRIGGER = '[data-testid="stMainMenuButton"]';
+  var PANEL = '[data-testid="stMainMenuPopover"]';
+  var OPTION = '[data-testid="stMainMenuItem-theme-__MODE__"]';
+
+  function again(step, tries) {
+    if (tries > 0) window.setTimeout(function () { step(tries - 1); }, 50);
+  }
+
+  // Escape first, because it can only ever close. Clicking the button is a
+  // toggle, and is kept back as the fallback for the same reason.
+  function shut() {
+    var panel = page.querySelector(PANEL);
+    if (!panel) return;
+    panel.dispatchEvent(new window.parent.KeyboardEvent(
+      "keydown", { key: "Escape", bubbles: true }
+    ));
+    window.setTimeout(function () {
+      var trigger = page.querySelector(TRIGGER);
+      if (page.querySelector(PANEL) && trigger) trigger.click();
+    }, 80);
+  }
+
+  function choose(tries) {
+    var option = page.querySelector(OPTION);
+    if (!option) {
+      again(choose, tries);
+      return;
+    }
+    if (option.getAttribute("aria-checked") !== "true") option.click();
+    window.setTimeout(shut, 0);
+  }
+
+  function open(tries) {
+    var trigger = page.querySelector(TRIGGER);
+    if (!trigger) {
+      again(open, tries);
+      return;
+    }
+    if (!page.querySelector(OPTION)) trigger.click();
+    choose(20);
+  }
+
+  open(100);                      // The header is not drawn on the first frame.
+})();
+</script>
+"""
+
+# One transparent pixel, at the very foot of the page, where nothing is pushed
+# about by it. `st.iframe` will not take a height of nought.
+st.iframe(
+    APPEARANCE_SCRIPT.replace("__MODE__", appearance),
+    width=1,
+    height=1,
+    tab_index=-1,
+)
+
+# --------------------------------------------------------------------------
 # The job itself, run last of all
 # --------------------------------------------------------------------------
 # Nothing above this point does any work. The whole page — all three panels, the
@@ -1170,7 +1317,10 @@ if pending_job is not None:
             flip_on_long_edge=flip_on_long_edge,
             sheet_size_pt=pending_job.get("sheet_size_pt"),
             scale_mode=pending_job.get("scale_mode", FIT),
-            move_input=move_input,
+            # Always, and no longer asked: a converted book belongs in the
+            # archive, so the conversion list stays the books not done yet.
+            # The archive panel moves any of them back.
+            move_input=True,
             progress=report,
         )
 

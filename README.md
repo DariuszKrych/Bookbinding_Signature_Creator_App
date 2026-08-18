@@ -80,7 +80,7 @@ Deleting is the only thing here that cannot be undone, so it always asks first, 
 buttons, **Yes, delete** and **Keep it**, under the card naming the file.
 
 The interface ships a light-green paper-and-foliage theme in `.streamlit/config.toml`, in a
-light and a dark version; the **⋮** menu, top right, switches between them.
+light and a dark version; **Theme**, at the top of the sidebar, switches between them.
 
 ### The top-right corner
 
@@ -91,13 +91,21 @@ page-drawing order above is arranged to prevent.
 
 `client.toolbarMode = "minimal"` in `.streamlit/config.toml` removes **Deploy**, **Rerun**,
 **Auto rerun**, **Clear cache**, **Print** and **Record screen**, and disables the `C`
-clear-cache keyboard shortcut. What is left in the **⋮** menu is the System / Light / Dark
-switcher, an **About** entry, and the *Made with Streamlit* line. In minimal mode Streamlit
-hides the whole header unless the app defines a menu item of its own, so the About entry in
-`st.set_page_config` is what keeps the theme switcher reachable; remove it and the corner
-goes blank. `server.fileWatcherType = "none"` drops the source-file watcher and with it the
-"File change. Rerun / Always rerun" prompt; set it back to `"auto"` when working on the app
-itself.
+clear-cache keyboard shortcut. That leaves the System / Light / Dark switcher, an **About**
+entry, and the *Made with Streamlit* line, and no config option reaches any of them.
+
+They cannot simply be left unbuilt either. In minimal mode Streamlit builds the top-right
+toolbar only for an app that has defined a menu item of its own, so dropping the About entry
+from `st.set_page_config` takes the whole corner with it — switcher included, and the
+switcher is the only way into the theme that does not throw the session away. So the About
+entry stays, the style block in `app.py` hides the corner, and **Theme** at the top of the
+sidebar drives the switcher inside it: a one-pixel `st.iframe` at the foot of the page opens
+the hidden menu, clicks the mode you chose and shuts it again. The same style block puts the
+header strip back to transparent and click-through, which is what it was while it held
+nothing, leaving only the **⟩⟩** that appears there when the sidebar is folded away.
+
+`server.fileWatcherType = "none"` drops the source-file watcher and with it the "File change.
+Rerun / Always rerun" prompt; set it back to `"auto"` when working on the app itself.
 
 Two things no config option reaches are handled by a style block at the top of `app.py`: the
 **Stop** button and the running figure beside it, and the "Is Streamlit still running? …

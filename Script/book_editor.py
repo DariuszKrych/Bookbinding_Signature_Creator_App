@@ -874,7 +874,8 @@ def _formatting_note():
     with st.expander("How to type the text"):
         st.markdown(
             """
-Type plainly. Only these things mean anything special:
+Type plainly. Titles, headings, text etc are formatted automatically.
+For customisation only these things mean anything special:
 
 | What you type | What you get |
 | --- | --- |
@@ -885,14 +886,6 @@ Type plainly. Only these things mean anything special:
 | `## Two hashes` | a smaller heading inside the section |
 | a line of `***` or `---` | a scene break |
 | lines starting with `>` | a quotation, keeping its line breaks |
-
-A single line break inside a paragraph is treated as wrapping, not as a new
-line, the same as in every other text box. Use a blank line for a new
-paragraph, or `>` if you are setting verse and need the breaks kept.
-
-The first paragraph of a section, and the first after any heading or scene
-break, is not indented. That is a typesetting convention, not a mistake: the
-indent is there to show that a paragraph continues the one above it.
 """
         )
 
@@ -925,9 +918,7 @@ def _design_panel(editor, book):
                 stock = smallest_sheet_for(sheet_w, sheet_h)
                 st.caption(
                     f"Two of these side by side make one sheet of "
-                    f"**{describe_size(sheet_w, sheet_h, unit)}**"
-                    + (f". The nearest standard paper is **{stock.name}**."
-                       if stock else ", larger than any standard paper listed.")
+                    f"**{describe_size(sheet_w, sheet_h, unit)}**."
                 )
             else:
                 # The page read off `build_design` rather than off the sheet,
@@ -1422,15 +1413,6 @@ def render(editor, folder):
 
     with writing:
         _title_panel(editor, book)
-
-        _spacer, close = st.columns([3, 1], vertical_alignment="center")
-        if close.button("Collapse all sections", key=f"{FIELD_PREFIX}close-all",
-                        use_container_width=True, disabled=editor.busy,
-                        help="Closes every section below, to get back to the "
-                             "shape of the book."):
-            for section in book.sections:
-                st.session_state[f"{FIELD_PREFIX}open-{section.id}"] = False
-            st.rerun()
 
         numbers = numbered_sections(book)
         for part, heading, keys, blurb in PARTS:
