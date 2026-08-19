@@ -3,6 +3,7 @@
 Run with:  streamlit run app.py
 """
 
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -25,10 +26,10 @@ from main import (
     move_book,
     number_book,
     numbered_copy_path,
-    open_folder,
+    printing_steps,
     typeset_book,
 )
-from Script import book_editor
+from Script import book_editor, workspace
 from Script.paper_sizes import (
     BOOK_PAGE_FAMILIES,
     BOOK_PAGE_SIZES,
@@ -56,6 +57,18 @@ from Script.print_formatting import (
     sheet_warnings,
 )
 
+# What the app is, in one paragraph. Said once here because it is wanted in two
+# places — the caption under the title, which is what a visitor reads, and the
+# About entry below, which nobody ever reads. Those were two hand-kept copies,
+# and they had already drifted apart in three places.
+TAGLINE = (
+    "Turns a 2-column PDF book, or a book typed straight into the app, "
+    "into printable signature files. Works on any paper size you can feed a "
+    "printer. Print one signature double-sided, fold every sheet in half "
+    "and nest them one inside another. Then sew the signatures together and "
+    "you have a book."
+)
+
 st.set_page_config(
     page_title="Bookbinding Signature Creator",
     page_icon="📖",
@@ -71,20 +84,13 @@ st.set_page_config(
     # built. The style block below then hides the whole corner, so this entry,
     # the About dialog it opens and the "Made with Streamlit v…" line under it
     # are all unreachable: built, never shown.
+    #
+    # ► NOTHING WRITTEN HERE APPEARS ANYWHERE. Editing this text changes nothing
+    # ► on the page. The paragraph a visitor actually reads is the `st.caption`
+    # ► under `st.title`, further down — both now come from `TAGLINE` above, so
+    # ► edit that.
     menu_items={
-        "About": """
-            ### 📖 Bookbinding Signature Creator
-
-            Turns a 2-column PDF book, or a book typed straight into the app,
-            into printable signature files, on any paper you can feed a
-            printer. Print one signature double-sided, fold every sheet in half
-            and nest them one inside another; sew the signatures together and
-            you have a book.
-
-            Everything happens on this machine: the PDFs never leave the
-            `Input/`, `Previously_Converted/` and `Output/` folders beside the
-            app.
-        """,
+        "About": f"### 📖 Bookbinding Signature Creator\n\n{TAGLINE}",
     },
 )
 
@@ -163,15 +169,83 @@ st.html(
     [data-testid="stMainBlockContainer"] { padding-top: 2rem !important; }
 
     [data-testid="stSidebarHeader"] {
-        height: 2.5rem !important;
+        height: 3rem !important;
         margin-bottom: 0 !important;
     }
     </style>
     """
 )
 
-for folder in (INPUT_DIR, OUTPUT_DIR, PREVIOUS_DIR, MANUSCRIPT_DIR):
-    folder.mkdir(parents=True, exist_ok=True)
+# The one upload limit Streamlit will print, corrected on the one uploader it is
+# wrong for.
+#
+# `server.maxUploadSize` is a single number for the whole app, and it has to be
+# the data zip's 500 MB or a full session could never be loaded back. The book
+# uploader's real limit is a fifth of that — see `MAX_UPLOAD_BYTES` — so the
+# "500MB per file • PDF" line the dropzone writes under it is not merely
+# unhelpful, it contradicts the refusal a 200 MB book would get.
+#
+# That line is not in any Python file and no config option reaches it: the
+# frontend builds it from `maxUploadSize` (`static/js/FileUploader.*.js`,
+# `` `${C(t,T.Byte,0)} per file` ``). So it is overwritten here for the book
+# uploader only, through the `st-key-pdf-uploader` class `st.container(key=…)`
+# puts on the block. The zip uploader is untouched, because 500 MB is the truth
+# there.
+#
+# The text sits in a *span* inside the instructions element — not a `small`,
+# which is what the equivalent element is in some other Streamlit versions. If
+# this ever stops matching after an upgrade, that markup is the first thing to
+# check; the selector is deliberately loose (`… span`) because the instructions
+# element holds nothing else.
+#
+# Hiding the original and drawing the replacement over it, rather than swapping
+# the text: CSS cannot edit a text node, and `display: none` on the original
+# would shift the dropzone's height away from the zip uploader's for no reason a
+# reader could see.
+st.html(
+    f"""
+    <style>
+    .st-key-pdf-uploader [data-testid="stFileUploaderDropzoneInstructions"] span {{
+        visibility: hidden !important;
+        position: relative;
+    }}
+    .st-key-pdf-uploader [data-testid="stFileUploaderDropzoneInstructions"] span::after {{
+        content: "{workspace.MAX_UPLOAD_BYTES // (1024 * 1024)}MB per file • PDF";
+        visibility: visible;
+        position: absolute;
+        left: 0;
+        top: 0;
+        white-space: nowrap;
+    }}
+    </style>
+    """
+)
+
+# This session's scratch space, settled before anything reads it.
+#
+# Nothing here is storage. `open_session` makes a folder named after this
+# session under the system temp folder, points `main`'s four names into it, and
+# starts the sweeper that deletes it seconds after the browser goes away. A
+# visitor's books are never anywhere near the app's own folder, never visible to
+# another visitor, and never left behind — see `Script/workspace.py` for the
+# three guarantees that make that true.
+#
+# The names bound here are this run's copy, and are what the panels below draw.
+# See the job runner at the foot of this file, which says them again before any
+# file is written.
+WORKSPACE = workspace.open_session(st.session_state)
+INPUT_DIR = WORKSPACE["Input"]
+OUTPUT_DIR = WORKSPACE["Output"]
+PREVIOUS_DIR = WORKSPACE["Previously_Converted"]
+MANUSCRIPT_DIR = WORKSPACE["Manuscripts"]
+
+# What this session is holding, measured once here so every panel agrees about
+# it, the same way `job` is read once below. `full` closes every control that
+# would write: an app that lets you start a conversion it has already decided it
+# will not let you finish is worse than one that says so on the button.
+used = workspace.usage(WORKSPACE)
+room = max(0, workspace.LIMIT_BYTES - used)
+full = room < workspace.ROOM_TO_WORK
 
 # The two halves of the app. One is picked at the top of the page and the other
 # is not drawn at all — not hidden, not disabled, simply not there — so a
@@ -211,11 +285,6 @@ DEFAULT_LENGTHS_IN = {
 def human_size(path):
     kb = path.stat().st_size / 1024
     return f"{kb / 1024:.1f} MB" if kb >= 1024 else f"{kb:.0f} KB"
-
-
-def folder_line(label, path):
-    st.caption(label)
-    st.code(str(path), language=None)
 
 
 def finish(message=None, error=None):
@@ -294,7 +363,7 @@ def remember(key):
     st.session_state[f"kept-{key}"] = st.session_state[key]
 
 
-def arm_delete(token, help_text, container=st, disabled=False):
+def arm_delete(token, help_text, container=st, disabled=False, label="🗑 Delete"):
     """The 🗑 button. It only *arms* the delete; `confirm_delete` does the work.
 
     Everything else in this app can be undone by clicking the opposite button, so
@@ -306,7 +375,7 @@ def arm_delete(token, help_text, container=st, disabled=False):
     and there is never more than one confirmation on screen.
     """
     if container.button(
-        "🗑 Delete", key=f"arm-delete-{token}", use_container_width=True,
+        label, key=f"arm-delete-{token}", use_container_width=True,
         disabled=disabled, help=help_text,
     ):
         st.session_state.armed_delete = token
@@ -350,6 +419,20 @@ def confirm_delete(token, do_delete, disabled=False):
         st.rerun()
 
 
+def named(names):
+    """“Book.pdf”, or “Book.pdf” and 2 others — a refusal a person can act on.
+
+    Listing every name of a large batch would push the rest of the message off
+    the banner, and naming none of them leaves somebody counting files to work
+    out which one it meant. Quoted here rather than by the caller, so a message
+    reads the same whether it names one file or twenty.
+    """
+    if len(names) == 1:
+        return f"“{names[0]}”"
+    return (f"“{names[0]}” and {len(names) - 1} "
+            f"other{'' if len(names) == 2 else 's'}")
+
+
 def signature_count(written):
     """"3 signatures", or "1 signature" — a book can be one gathering."""
     return f"{len(written)} signature" + ("" if len(written) == 1 else "s")
@@ -365,12 +448,9 @@ def markdown_table(header, rows):
 # Settings
 # --------------------------------------------------------------------------
 st.title("📖 Bookbinding Signature Creator")
-st.caption(
-    "Turns a 2-column PDF book, or a book typed straight into the app, into "
-    "printable signature files, on any paper you can feed a printer. Print one "
-    "signature double-sided, fold every sheet in half and nest them one inside "
-    "another; sew the signatures together and you have a book."
-)
+# This is the paragraph on the page. `TAGLINE` is defined at the top of the file
+# and the unreachable About entry reads the same one.
+st.caption(TAGLINE)
 
 # Nothing on the page may move while a job runs. Streamlit restarts the script
 # the instant any widget changes, so a click made during a conversion tears down
@@ -403,13 +483,116 @@ view = st.radio(
 )
 writing = view == WRITE_VIEW
 
-# The sidebar holds the settings that mean the same thing on both tabs, and
-# only those. Everything about the paper is decided on the tab it belongs to —
-# the sheet an existing PDF is printed on is a different question from the size
-# a book being typed is set at, and asking both here is what left the writing
-# tab with two menus for one measurement, one in the sidebar and one on the
-# page.
 with st.sidebar:
+    # --------------------------------------------------------------------------
+    # Your data — the whole workspace, in and out, as one zip
+    # --------------------------------------------------------------------------
+    # Above the settings because it is the first thing a visitor does and the
+    # last thing they do, and because it is the only way in or out: nothing here
+    # is stored, so the zip is the whole of what a person keeps.
+    st.header("Your data")
+
+    # A fresh key after each load, for the reason the PDF uploader has one: a
+    # `file_uploader` hands back the same file on every rerun, so without this
+    # the zip would be loaded again the moment anything else on the page moved.
+    load_round = st.session_state.setdefault("workspace_round", 0)
+    incoming = st.file_uploader(
+        "📥 Load my data (.zip)",
+        type="zip",
+        key=f"workspace-zip-{load_round}",
+        disabled=busy,
+        help=f"A zip saved by the button below. Puts back every book, draft, "
+             f"archived PDF and finished signature it holds, up to "
+             f"{workspace.human(workspace.LIMIT_BYTES)}.",
+    )
+
+    # A second click before anything is deleted. A `file_uploader` fires the
+    # moment a file is *picked* — no button involved — and this load replaces
+    # the workspace rather than adding to it, so with no confirmation the wrong
+    # file in the dialog would take the books with it. Same rule as `arm_delete`
+    # below, drawn inline because there is only ever one of these on screen.
+    if incoming is not None:
+        st.caption(
+            "⚠️ Replaces everything now in the app: every input PDF, "
+            "archived book, finished signature and draft."
+        )
+        if st.button(
+            "Replace everything with this zip",
+            key="workspace-load-go",
+            type="primary",
+            use_container_width=True,
+            disabled=busy,
+        ):
+            try:
+                loaded = workspace.unpack(incoming.getvalue(), WORKSPACE)
+            except Exception as error:
+                finish(error=f"Could not load that zip: {error}")
+            else:
+                st.session_state.workspace_round = load_round + 1
+                finish(f"Loaded {loaded} file(s) from the zip.")
+
+    # `data` is the function, not its result: Streamlit calls it when the button
+    # is actually clicked, so the workspace is not zipped up again on every
+    # rerun of the page just to have a file sitting ready.
+    st.download_button(
+        "📤 Save my data (.zip)",
+        data=lambda: workspace.pack(WORKSPACE),
+        file_name=f"bookbinding-data-{datetime.now():%Y-%m-%d}.zip",
+        mime="application/zip",
+        key="workspace-save",
+        type="primary",
+        use_container_width=True,
+        disabled=busy,
+        help="Everything in the app — input PDFs, the archive, finished "
+             "signatures and book drafts — in one zip on your own machine. "
+             "Load it back with the box above.",
+    )
+
+    # How full the session is, on screen rather than only in an error message.
+    # A limit somebody only meets by being refused is a limit that reads as a
+    # fault; a bar that has been filling up all along reads as a rule.
+    st.progress(
+        min(1.0, used / workspace.LIMIT_BYTES),
+        text=f"{workspace.human(used)} of {workspace.human(workspace.LIMIT_BYTES)} used",
+    )
+    if full:
+        st.warning(
+            "This session is full. Save your data, then delete a book or two — "
+            "or start again with 🗑 below.",
+            icon="🚫",
+        )
+
+    # The retention rule, in one line, where the person it applies to is
+    # standing. Not buried in an About dialog nobody opens.
+    st.caption(
+        "**Nothing is stored.** Your files are held only while this tab is "
+        "open and are erased when it closes. Save your zip first."
+    )
+
+    # The same rule, on demand. Someone who has just converted something they
+    # would rather not leave sitting anywhere should not have to close the tab
+    # and take it on trust.
+    arm_delete(
+        "workspace",
+        "Erases every file in this session right now: input PDFs, the archive, "
+        "finished signatures and drafts.",
+        disabled=busy,
+        label="🗑 Delete my data now",
+    )
+
+    def erase_everything():
+        workspace.discard(st.session_state)
+        return "Erased. Nothing of yours is left on the server."
+
+    confirm_delete("workspace", erase_everything, disabled=busy)
+
+    st.divider()
+
+    # Settings holds what means the same thing on both tabs, and only that.
+    # Everything about the paper is decided on the tab it belongs to — the sheet
+    # an existing PDF is printed on is a different question from the size a book
+    # being typed is set at, and asking both here is what left the writing tab
+    # with two menus for one measurement, one in the sidebar and one on the page.
     st.header("Settings")
 
     # First under the header, and not one of the four the caption below counts:
@@ -721,18 +904,35 @@ if view == CONVERT_VIEW:
 
     with left:
         st.header("Available for conversion")
-        folder_line("Drop input PDFs in this folder:", INPUT_DIR)
 
         # The uploader is rebuilt under a fresh key after each save. Without that it
         # keeps handing back the same files on every rerun, which either re-saves a
         # file the user has since moved away, or loops forever on the rerun below.
         upload_round = st.session_state.setdefault("upload_round", 0)
-        uploaded = st.file_uploader(
-            "…or upload PDFs here", type="pdf", accept_multiple_files=True,
-            key=f"uploader-{upload_round}", disabled=busy,
-        )
+        # Keyed so the style block at the top of this file can reach inside it
+        # and correct the dropzone's own limit line: Streamlit has one upload
+        # ceiling for the whole app, it has to be the zip's 500 MB, and it would
+        # otherwise be printed here as the limit on a book.
+        #
+        # That corrected line is the *only* place the per-book limit is written.
+        # It was in the label, the help and a caption as well, all within an inch
+        # of each other and all saying the same thing — which reads as three
+        # different rules rather than one. How much of the session is left is a
+        # question about the session, and is answered once, in the sidebar.
+        with st.container(key="pdf-uploader"):
+            uploaded = st.file_uploader(
+                "Upload 2-column PDF books",
+                type="pdf", accept_multiple_files=True,
+                key=f"uploader-{upload_round}", disabled=busy or full,
+            )
         if uploaded:
             saved = []
+            too_big = []
+            no_space = []
+            # Counted down as we go rather than checked once: three files that
+            # each fit the space that was free before any of them was written
+            # would otherwise all be written.
+            spare = room
             for item in uploaded:
                 # The browser supplies this name, so it is taken apart and only its
                 # final component kept: a name carrying separators would otherwise
@@ -741,19 +941,45 @@ if view == CONVERT_VIEW:
                 if not name or not name.lower().endswith(".pdf"):
                     continue
                 target = INPUT_DIR / name
-                if not target.exists():
-                    target.write_bytes(item.getbuffer())
-                    saved.append(name)
+                if target.exists():
+                    continue
+                size = item.size if item.size is not None else len(item.getbuffer())
+                # Two different refusals, kept apart because they mean different
+                # things to the person: one book is too big to work on at all,
+                # against one that would fit if something else were deleted.
+                if size > workspace.MAX_UPLOAD_BYTES:
+                    too_big.append(name)
+                    continue
+                if size > spare:
+                    no_space.append(name)
+                    continue
+                target.write_bytes(item.getbuffer())
+                spare -= size
+                saved.append(name)
             st.session_state.upload_round = upload_round + 1
+            added = f"Added {len(saved)} PDF(s). " if saved else ""
+            if too_big:
+                finish(error=(
+                    f"{added}{named(too_big)} "
+                    f"{'is' if len(too_big) == 1 else 'are'} over the "
+                    f"{workspace.human(workspace.MAX_UPLOAD_BYTES)} limit for a "
+                    f"single book. Split it, or shrink it in a PDF tool first."
+                ))
+            if no_space:
+                finish(error=(
+                    f"{added}No room for {named(no_space)}. A session may hold "
+                    f"{workspace.human(workspace.LIMIT_BYTES)} — save your data "
+                    f"and delete something to make space."
+                ))
             finish(
-                f"Added {len(saved)} PDF(s) to Input."
+                f"Added {len(saved)} PDF(s)."
                 if saved
-                else "Those PDFs are already in Input."
+                else "Those PDFs are already here."
             )
 
         available = list_available_books()
         if not available:
-            st.info("No PDFs waiting. Add a 2-column PDF book to the folder above.")
+            st.info("No PDFs waiting. Upload a 2-column PDF book above.")
         else:
             for pdf_path in available:
                 with st.container(border=True):
@@ -826,6 +1052,24 @@ if view == CONVERT_VIEW:
                     for problem in problems:
                         st.error(problem)
 
+                    # A conversion writes roughly what it reads: imposition
+                    # copies each page's own content on to a sheet, so the
+                    # signatures for a book come to about the size of the book,
+                    # plus the printing notes. A tenth on top covers the sheet
+                    # objects imposition adds. This is only an estimate — the
+                    # watcher on the job itself is what actually holds the line —
+                    # but it is close enough to say "this will not fit" before
+                    # the work starts rather than half way through it.
+                    needs = int(pdf_path.stat().st_size * 1.1) + 4096
+                    no_room = full or needs > room
+                    if no_room and not problems:
+                        st.warning(
+                            f"Not enough room to convert this: it needs about "
+                            f"{workspace.human(needs)} and there is "
+                            f"{workspace.human(room)} free.",
+                            icon="🚫",
+                        )
+
                     # One job at a time, across every book: a conversion moves the
                     # input PDF and rewrites a whole output folder, so two at once
                     # would race over the same files.
@@ -841,7 +1085,7 @@ if view == CONVERT_VIEW:
                         "Creating signatures…" if converting else "Create signatures",
                         key=f"convert-{pdf_path.name}",
                         type="primary",
-                        disabled=bool(problems) or busy,
+                        disabled=bool(problems) or busy or no_room,
                         use_container_width=True,
                     ):
                         claim_job(("convert", pdf_path.name))
@@ -894,7 +1138,9 @@ if view == CONVERT_VIEW:
                         key=f"number-{pdf_path.name}",
                         # Not gated on `problems`: those are about the sheet this book
                         # would be printed on, and numbering only rewrites the book.
-                        disabled=already_numbered or busy,
+                        # It is gated on room, because it writes a second copy of
+                        # this whole book beside it.
+                        disabled=already_numbered or busy or no_room,
                         use_container_width=True,
                         help="Only needed if this book's pages are not numbered already. "
                              "Stamps a page number centred at the foot of each column "
@@ -940,7 +1186,6 @@ if view == CONVERT_VIEW:
     # --------------------------------------------------------------------------
     with middle:
         st.header("Archive of previously converted")
-        folder_line("Input PDFs are moved here after conversion:", PREVIOUS_DIR)
 
         previous = list_previous_books()
         if not previous:
@@ -956,7 +1201,7 @@ if view == CONVERT_VIEW:
 
                     restore_col, delete_col = st.columns([2, 1])
                     if restore_col.button(
-                        "Move back to Input", key=f"restore-{pdf_path.name}",
+                        "Move back to the list", key=f"restore-{pdf_path.name}",
                         use_container_width=True, disabled=busy,
                         help="Puts this book back in the conversion list, e.g. to redo it "
                              "on a different paper size.",
@@ -966,7 +1211,10 @@ if view == CONVERT_VIEW:
                         except Exception as error:
                             st.error(f"Could not move it: {error}")
                         else:
-                            finish(f"Moved “{pdf_path.name}” back to Input.")
+                            finish(
+                                f"Moved “{pdf_path.name}” back to the "
+                                f"conversion list."
+                            )
 
                     arm_delete(
                         f"archive-{pdf_path.name}",
@@ -987,7 +1235,6 @@ if view == CONVERT_VIEW:
     # --------------------------------------------------------------------------
     with right:
         st.header("Ready to print")
-        folder_line("Finished files are written here:", OUTPUT_DIR)
 
         ready = list_ready_books()
         if not ready:
@@ -995,7 +1242,6 @@ if view == CONVERT_VIEW:
         else:
             for book in ready:
                 with st.container(border=True):
-                    folder = book.signatures[0].parent
                     total_kb = sum(s.stat().st_size for s in book.signatures) / 1024
                     st.markdown(f"**{book.name}**")
                     st.caption(
@@ -1003,27 +1249,25 @@ if view == CONVERT_VIEW:
                         + (f"{total_kb / 1024:.1f} MB" if total_kb >= 1024
                            else f"{total_kb:.0f} KB")
                     )
-                    st.code(str(folder), language=None)
 
-                    # One button for the whole run, rather than one download per
-                    # signature. These are printed as a set, in order, from the
-                    # folder they already sit in — downloading them one at a time to
-                    # a second folder only creates a chance to print them out of
-                    # order or miss one.
-                    open_col, delete_col = st.columns([2, 1])
-                    if open_col.button(
-                        "📂 Open file location", key=f"open-{book.name}",
+                    # One download for the whole book, rather than one per
+                    # signature. These are printed as a set, in order, and
+                    # fetching them one at a time only creates a chance to print
+                    # them out of order or miss one. `data` is the function, not
+                    # its result, so the zip is built when the button is clicked
+                    # rather than on every rerun of the page.
+                    download_col, delete_col = st.columns([2, 1])
+                    download_col.download_button(
+                        "⬇️ Download this book",
+                        data=lambda target=book.folder, name=book.name:
+                            workspace.pack_folder(target, name),
+                        file_name=f"{book.name}.zip",
+                        mime="application/zip",
+                        key=f"download-{book.name}",
                         type="primary", use_container_width=True, disabled=busy,
-                        help="Opens this book's signature folder in your file "
-                             "manager, with every signature file for this run in "
-                             "print order.",
-                    ):
-                        try:
-                            open_folder(folder)
-                        except Exception as error:
-                            st.error(f"Could not open the folder: {error}")
-                        else:
-                            st.toast(f"Opened {folder.name} for “{book.name}”.", icon="📂")
+                        help="Every signature file for this book, in print "
+                             "order, with its printing notes, as one zip.",
+                    )
 
                     arm_delete(
                         f"ready-{book.name}",
@@ -1073,7 +1317,8 @@ else:
             sticky=sticky,
             remember=remember,
             build_path=book_pdf_path,
-            open_folder=open_folder,
+            pack_folder=workspace.pack_folder,
+            full=full,
         ),
         folder=MANUSCRIPT_DIR,
     )
@@ -1084,23 +1329,17 @@ how_to, choosing, reference = st.columns(3, gap="large")
 
 with how_to:
     with st.expander("How to print and fold"):
+        # The steps themselves live in `main.printing_steps`, because the note
+        # written beside every converted book says the same five things and the
+        # two used to be kept by hand. Edit them there, not here.
+        st.markdown("\n".join(
+            f"{number}. {step}"
+            for number, step in enumerate(printing_steps(flip_on_long_edge), 1)
+        ))
         st.markdown(
-            f"""
-1. Print **one signature file at a time**, double-sided, at **100% / "Actual size"**.
-   Never "fit to page": the pages are already the size of your paper, and letting
-   the printer scale them again shrinks the margins and moves the fold off centre.
-2. Load the paper the book was made for, and check that the print dialog agrees
-   about its size; some drivers quietly fall back to their own default.
-3. Set your printer's duplex option to **{'long' if flip_on_long_edge else 'short'} edge**,
-   matching the setting in the sidebar.
-4. Fold **every sheet** of a signature in half, then **nest** them one inside the
-   other. The first sheet printed is the outermost.
-5. Page numbers should run in order through the folded signature. If every other
-   page is upside down, switch the duplex setting and reprint.
-
-Each converted book also gets a `{INSTRUCTIONS_NAME}` file recording the paper
-size, the scaling and the duplex setting it was made with.
-"""
+            f"Each converted book also gets a `{INSTRUCTIONS_NAME}` file "
+            f"recording the paper size, the scaling and the duplex setting it "
+            f"was made with."
         )
 
 with choosing:
@@ -1289,6 +1528,13 @@ FAILURE_LABELS = {
 }
 
 if pending_job is not None:
+    # Said again, right here, because the four names being written through live
+    # on `main` — one module shared by every session in the process. Between the
+    # top of this run and this line the whole page was drawn, and on a hosted
+    # copy another session's run could have pointed them at its own workspace in
+    # the meantime. One call, immediately before the first byte is written.
+    workspace.reassert(WORKSPACE)
+
     kind = pending_job["kind"]
     slot = pending_job["slot"]
     # What to call it if it throws. ✂️ Create the signatures is two jobs behind
@@ -1300,7 +1546,15 @@ if pending_job is not None:
     failure = FAILURE_LABELS.get(kind, "That did not work")
     bar = slot.progress(0.0, text="Starting…")
 
+    # The limit, held over work whose output size nobody can know in advance.
+    # Imposition reports a page at a time and this is checked at most once a
+    # second, so a job that starts inside the limit and would end outside it is
+    # stopped part way rather than allowed to finish — which is the only way the
+    # cap can be a cap rather than a hope.
+    over_limit = workspace.watcher(WORKSPACE)
+
     def report(fraction, message):
+        over_limit()
         bar.progress(min(max(fraction, 0.0), 1.0), text=message)
 
     def impose(pdf_path, layout, report=report):
@@ -1323,6 +1577,11 @@ if pending_job is not None:
             move_input=True,
             progress=report,
         )
+
+    # Set once the typesetting has finished, so the quota handler below can tell
+    # a book that was never written from one that was written and then had its
+    # imposition stopped. The second is a real result and is kept.
+    built = None
 
     try:
         if kind == "convert":
@@ -1349,6 +1608,7 @@ if pending_job is not None:
                 # printed at is what keeps this path free of any scaling.
                 page_size_in=pending_job["page_size_in"],
             )
+            built = result.path
             book_editor.remember_build(result, result.path.name)
             if whole:
                 failure = "The book was built, but the signatures were not"
@@ -1357,24 +1617,40 @@ if pending_job is not None:
                     report=lambda f, m: report(0.45 + f * 0.55, m),
                 )
                 folder = written[0].parent.parent
-                # Recorded again, now that there is a folder to point at: the
+                # Recorded again, now that there is something to download: the
                 # writing view has no "Ready to print" panel of its own, so
-                # without this the finished signatures are only findable by
+                # without this the finished signatures could only be fetched by
                 # switching views.
                 book_editor.remember_build(
                     result, result.path.name, output_folder=folder
                 )
                 done = (
                     f"Typeset “{result.path.stem}” into {result.book_pages} book "
-                    f"pages, and created {signature_count(written)} for it, in "
-                    f"“{folder.name}”."
+                    f"pages, and created {signature_count(written)} for it."
                 )
             else:
                 done = (
-                    f"Typeset “{result.path.name}” into Input: "
-                    f"{result.book_pages} book pages. Convert it from "
+                    f"Typeset “{result.path.name}”: {result.book_pages} book "
+                    f"pages. Convert it from "
                     f"**{VIEW_LABELS[CONVERT_VIEW].strip()}**."
                 )
+    except workspace.QuotaExceeded as error:
+        # A job stopped part way has left a half-written file behind, and the
+        # whole point of stopping was to stay under the limit — so the wreckage
+        # goes too. A conversion cleans up after itself (`convert_book` writes
+        # into a staging folder and removes it on any failure); these are the two
+        # that write a file directly.
+        wreck = None
+        if kind == "number":
+            wreck = numbered_copy_path(pending_job["path"])
+        elif kind in ("typeset", "typeset_convert") and built is None:
+            # `built is None` means the typesetting itself was stopped. A book
+            # that was typeset and then had only its imposition stopped is a
+            # real result and stays; the writing view offers it as a build.
+            wreck = book_pdf_path(pending_job["file_name"])
+        if wreck is not None:
+            Path(wreck).unlink(missing_ok=True)
+        finish(error=f"Stopped: {error}")
     except Exception as error:
         finish(error=f"{failure}: {error}")
     else:

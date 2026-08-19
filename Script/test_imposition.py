@@ -1358,10 +1358,44 @@ class TestConvertBook(PdfTestCase):
         notes = (self.output_dir / "Book" / main.INSTRUCTIONS_NAME).read_text(
             encoding="utf-8-sig"
         )
-        self.assertIn("Letter", notes)
-        self.assertIn("94.1%", notes)          # A4 landscape shrunk onto Letter
-        self.assertIn("long edge", notes)
-        self.assertIn("Actual size", notes)
+        # Read with the wrapping taken out. Where the steps break across lines
+        # is a matter of how long the words are, and a phrase landing on a line
+        # end is not a change in what the note says.
+        said = " ".join(notes.split())
+        self.assertIn("Letter", said)
+        self.assertIn("94.1%", said)           # A4 landscape shrunk onto Letter
+        self.assertIn("long edge", said)
+        self.assertIn("Actual size", said)
+
+    def test_the_note_and_the_page_give_the_same_instructions(self):
+        """The five steps are one list, rendered twice.
+
+        They were written out separately in `main.print_instructions` and in
+        app.py's "How to print and fold" expander, so a correction to either one
+        left the other saying something else — which is worse than saying it
+        once, because both look authoritative.
+        """
+        # `print_instructions` reads four things off these, and none of them is
+        # what this test is about, so they are stood in for rather than measured.
+        class Fit:
+            sheet_size_in = (11.0, 8.5)
+            book_page_size_in = (5.5, 8.5)
+            scale = 0.941
+
+        class Plan:
+            sheets = 2
+
+        for flip, edge in ((True, "long"), (False, "short")):
+            steps = main.printing_steps(flip)
+            self.assertEqual(len(steps), 5)
+
+            note = main.print_instructions("Book", Fit(), [Plan()], flip)
+            said = " ".join(note.split())
+            for number, step in enumerate(steps, 1):
+                # The note carries every step, in order, without the markdown.
+                self.assertIn(f"{number}. {step.replace('**', '')}", said)
+            self.assertNotIn("**", note)
+            self.assertIn(f"flip on the {edge} edge", said)
 
     def test_reconverting_on_smaller_paper_leaves_no_stale_signatures(self):
         main.convert_book(self.source, sheets_per_signature=1, move_input=False)
@@ -1591,48 +1625,15 @@ class TestCommandLine(PdfTestCase):
         self.assertEqual(list(main.OUTPUT_DIR.iterdir()), [])
 
 
-class TestOpenFolder(unittest.TestCase):
-    """The "Open file location" button, which replaced per-signature downloads."""
+class TestOneRunIsOneSetOfFiles(unittest.TestCase):
+    """What the download on a finished book is handed.
 
-    def launcher(self):
-        """The call `open_folder` makes on this platform, patched out."""
-        if sys.platform == "win32":
-            return mock.patch("os.startfile", create=True)
-        return mock.patch("subprocess.run")
+    There is no "open the folder" any more: the app holds a book only while
+    the tab is open, so the way out is a file the browser is given. What that
+    download must contain is every signature of the run and nothing else.
+    """
 
-    def launched_path(self, launch):
-        """The path handed to the file manager: startfile(p) or run([opener, p])."""
-        argument = launch.call_args.args[0]
-        return argument if sys.platform == "win32" else argument[1]
-
-    def test_an_existing_folder_is_handed_to_the_file_manager(self):
-        with tempfile.TemporaryDirectory() as folder:
-            with self.launcher() as launch:
-                self.assertEqual(main.open_folder(folder), Path(folder))
-            launch.assert_called_once()
-            # Whichever platform, the folder itself is what gets opened.
-            self.assertEqual(self.launched_path(launch), str(Path(folder)))
-
-    def test_a_missing_folder_is_reported_rather_than_launched(self):
-        with tempfile.TemporaryDirectory() as folder:
-            with self.launcher() as launch:
-                with self.assertRaises(FileNotFoundError):
-                    main.open_folder(Path(folder) / "gone")
-            launch.assert_not_called()
-
-    def test_a_file_is_refused_because_it_is_not_a_folder(self):
-        # Handing a PDF to the shell would launch a PDF reader instead of the
-        # file manager, which is not what the button says it does.
-        with tempfile.TemporaryDirectory() as folder:
-            pdf = Path(folder) / "signature_1.pdf"
-            pdf.write_bytes(b"%PDF-1.4\n")
-            with self.launcher() as launch:
-                with self.assertRaises(FileNotFoundError):
-                    main.open_folder(pdf)
-            launch.assert_not_called()
-
-    def test_a_real_signature_folder_is_what_the_button_would_open(self):
-        """The folder the GUI passes really is the one holding the signatures."""
+    def test_every_signature_of_a_run_lands_in_the_one_folder(self):
         with tempfile.TemporaryDirectory() as workspace:
             workspace = Path(workspace)
             original = main.OUTPUT_DIR
@@ -1646,11 +1647,6 @@ class TestOpenFolder(unittest.TestCase):
                                         move_input=False)
             self.assertEqual(len(written), 2)
             folder = written[0].parent
-            with self.launcher() as launch:
-                main.open_folder(folder)
-            launch.assert_called_once()
-            self.assertEqual(self.launched_path(launch), str(folder))
-            # Every signature of the run is in the one folder the button opens.
             self.assertEqual(
                 sorted(p.name for p in folder.glob("signature_*.pdf")),
                 sorted(p.name for p in written),

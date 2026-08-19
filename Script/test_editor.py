@@ -16,11 +16,15 @@ one that lost a book's title page — is `set_value(...)` and `click()` with a
 single `run()` after both, which is what most of these do.
 """
 
+import io
 import shutil
 import sys
 import tempfile
+import time
 import unittest
+import zipfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -29,6 +33,7 @@ from streamlit.testing.v1 import AppTest  # noqa: E402
 
 import main  # noqa: E402
 
+from Script import workspace  # noqa: E402
 from Script.book_editor import (  # noqa: E402
     MAX_BOX_HEIGHT_PX,
     MIN_BOX_HEIGHT_PX,
@@ -72,19 +77,24 @@ class EditorTestCase(unittest.TestCase):
     """One app, one temporary set of folders, opened on the writing view."""
 
     def setUp(self):
+        # The app makes its own folder per session and points `main` at it, so
+        # the test cannot hand it one. What it can do is say where sessions
+        # live, which keeps every file this test writes inside a temp folder it
+        # owns — and then read back off `main` where the app decided to put
+        # them, exactly as every panel in the app does.
         self.workspace = Path(tempfile.mkdtemp(prefix="editor-test-"))
         self.addCleanup(shutil.rmtree, self.workspace, ignore_errors=True)
+        self.addCleanup(setattr, workspace, "SESSIONS_ROOT",
+                        workspace.SESSIONS_ROOT)
+        workspace.SESSIONS_ROOT = self.workspace
         for name in ("INPUT_DIR", "OUTPUT_DIR", "PREVIOUS_DIR", "MANUSCRIPT_DIR"):
-            folder = self.workspace / name
-            folder.mkdir(parents=True, exist_ok=True)
             self.addCleanup(setattr, main, name, getattr(main, name))
-            setattr(main, name, folder)
-        self.drafts = main.MANUSCRIPT_DIR
 
         self.at = AppTest.from_file(str(APP), default_timeout=180)
         self.at.run()
         self.at.radio(key="view").set_value(WRITE_VIEW).run()
         self.assertFalse(self.at.exception, self.at.exception)
+        self.drafts = main.MANUSCRIPT_DIR
 
     # ---- reading the app -------------------------------------------------
     @property
@@ -529,19 +539,28 @@ class TestSavingAndNaming(EditorTestCase):
 
 
 class TestTheDraftsPanel(EditorTestCase):
-    def test_a_draft_is_carried_between_machines_by_opening_the_folder(self):
-        """One button onto the Manuscripts folder, not a transfer panel.
+    def test_a_draft_leaves_by_download_because_nothing_here_is_kept(self):
+        """No button onto a folder: there is no folder anyone can be shown.
 
-        A draft is a plain JSON file, so copying one is the file manager's job.
-        The download button and the uploader beside it were two more controls
-        doing it worse, and one of them handed over the book as it was *before*
-        the edit that caused the run.
+        The app holds a draft only while the tab is open, so the way to keep
+        one is to be handed the file. There is no uploader beside it either —
+        a draft comes back in through **📥 Load my data** with everything else,
+        which is one route rather than two that half overlap.
         """
         keys = [button.key for button in self.at.button]
-        self.assertIn("bk-open-folder", keys)
-        self.assertNotIn("bk-download", keys)
+        self.assertNotIn("bk-open-folder", keys)
         self.assertFalse([key for key in keys
                           if str(key).startswith("bk-upload")])
+        self.assertIn("bk-download-draft",
+                      [button.key for button in self.at.download_button])
+
+    def test_the_download_hands_over_the_book_as_it_is_on_screen(self):
+        """Not the last version written: saved or not, what you see is it."""
+        self.at.text_input(key="bk-title").set_value("Typed, never saved").run()
+        download = [button for button in self.at.download_button
+                    if button.key == "bk-download-draft"][0]
+        self.assertIn("Typed, never saved", self.book.to_json())
+        self.assertTrue(download.label.startswith("⬇️"))
 
 
 class TestTextBoxHeight(unittest.TestCase):
@@ -778,14 +797,23 @@ class TestBuilding(EditorTestCase):
         self.assertEqual(self.book.design.page_size_name, "US trade")
         self.assertAlmostEqual(self.book.design.page_width_in, 6.0, places=6)
 
-    def test_a_finished_run_says_where_it_put_the_signatures(self):
-        """This view has no “Ready to print” panel to look in."""
+    def test_a_finished_run_hands_the_signatures_over(self):
+        """This view has no “Ready to print” panel, and there is no folder.
+
+        Pointing at a path on the server would be pointing at somewhere nobody
+        can reach and that will not exist in a minute. The signatures leave the
+        same way everything else does: as a file the browser is given.
+        """
         self.a_book()
         self.at.button(key="bk-build-convert").click().run()
 
         folder = main.OUTPUT_DIR / "Bound At Home"
         self.assertEqual(self.state("book_last_build")["output_folder"], str(folder))
-        self.assertIn(str(folder), [block.value for block in self.at.code])
+        self.assertIn("bk-download-built",
+                      [button.key for button in self.at.download_button])
+        # And no path anywhere on the page.
+        self.assertFalse([block for block in self.at.code
+                          if str(folder) in block.value])
 
     def test_the_example_book_goes_all_the_way_to_signatures(self):
         """The one button that shows what the editor can do has to work.
@@ -974,6 +1002,608 @@ class TestSettingsAreNotAskedTwice(EditorTestCase):
         captions = " ".join(caption.value for caption in self.at.caption)
         self.assertIn("Where the two columns sit on a page of the *input* PDF",
                       captions)
+
+
+class TestCarryingTheWorkspaceInAZip(unittest.TestCase):
+    """`Script/workspace.py` on its own, without the app around it.
+
+    The app can be hosted, and a hosted copy has no storage: its disk is wiped
+    on every restart, and "📂 Open file location" opens a folder on a server
+    nobody can see. So the user carries the whole workspace themselves, as one
+    zip. These are the tests for the two ends of that trip.
+    """
+
+    def make_workspace(self):
+        """A folders mapping of the shape `open_session` hands the app.
+
+        Built by hand rather than through `activate`, which would point the
+        real `main` at it and leave it pointed there for whatever ran next.
+        """
+        root = Path(tempfile.mkdtemp(prefix="zip-test-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        folders = {name: root / name for name in workspace.DATA_FOLDERS}
+        for folder in folders.values():
+            folder.mkdir(parents=True)
+        return folders
+
+    def fill(self, folders):
+        """One file in each corner a user would notice losing."""
+        (folders["Input"] / "Waiting.pdf").write_bytes(b"%PDF-1.4 waiting")
+        signatures = folders["Output"] / "Done" / "book_signatures"
+        signatures.mkdir(parents=True)
+        (signatures / "signature_1.pdf").write_bytes(b"%PDF-1.4 signature")
+        (folders["Previously_Converted"] / "Old.pdf").write_bytes(b"%PDF-1.4 old")
+        (folders["Manuscripts"] / f"Draft{DRAFT_SUFFIX}").write_text(
+            '{"title": "Draft"}', encoding="utf-8"
+        )
+
+    def contents(self, folders):
+        return {
+            f"{name}/{path.relative_to(folder).as_posix()}": path.read_bytes()
+            for name, folder in folders.items()
+            for path in sorted(folder.rglob("*")) if path.is_file()
+        }
+
+    # ---- the round trip --------------------------------------------------
+    def test_every_file_comes_back_byte_for_byte(self):
+        saved = self.make_workspace()
+        self.fill(saved)
+        expected = self.contents(saved)
+
+        loaded = self.make_workspace()
+        self.assertEqual(workspace.unpack(workspace.pack(saved), loaded), 4)
+        self.assertEqual(self.contents(loaded), expected)
+
+    def test_an_empty_workspace_comes_back_as_four_empty_folders(self):
+        """Not as an error, and not as four folders that stopped existing."""
+        empty = self.make_workspace()
+        loaded = self.make_workspace()
+        self.fill(loaded)
+
+        self.assertEqual(workspace.unpack(workspace.pack(empty), loaded), 0)
+        for folder in loaded.values():
+            self.assertTrue(folder.is_dir(), folder)
+            self.assertEqual(list(folder.iterdir()), [], folder)
+
+    def test_loading_replaces_the_workspace_rather_than_adding_to_it(self):
+        """A zip is the whole of a workspace, so it is the whole of what stays.
+
+        Merging would leave a book the user had deleted before saving sitting
+        in the listing beside the ones they kept, with nothing to say which zip
+        it came from.
+        """
+        saved = self.make_workspace()
+        self.fill(saved)
+        data = workspace.pack(saved)
+
+        loaded = self.make_workspace()
+        (loaded["Input"] / "Leftover.pdf").write_bytes(b"%PDF-1.4 leftover")
+        workspace.unpack(data, loaded)
+
+        self.assertFalse((loaded["Input"] / "Leftover.pdf").exists())
+        self.assertTrue((loaded["Input"] / "Waiting.pdf").is_file())
+
+    # ---- what a zip is not allowed to do ---------------------------------
+    def test_an_entry_cannot_write_outside_the_folder_it_names(self):
+        """The oldest trick there is against code that unpacks archives."""
+        folders = self.make_workspace()
+        root = folders["Input"].parent
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("Input/../../escaped.pdf", b"no")
+            archive.writestr("../escaped2.pdf", b"no")
+            archive.writestr("Input/Fine.pdf", b"yes")
+
+        self.assertEqual(workspace.unpack(buffer.getvalue(), folders), 1)
+        self.assertTrue((folders["Input"] / "Fine.pdf").is_file())
+        self.assertFalse((root.parent / "escaped.pdf").exists())
+        self.assertFalse((root.parent / "escaped2.pdf").exists())
+
+    def test_a_zip_from_somewhere_else_is_refused_with_nothing_deleted(self):
+        folders = self.make_workspace()
+        self.fill(folders)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("holiday/beach.jpg", b"not a book")
+
+        with self.assertRaises(ValueError):
+            workspace.unpack(buffer.getvalue(), folders)
+        self.assertTrue((folders["Input"] / "Waiting.pdf").is_file())
+
+    def test_a_folder_zipped_by_hand_is_still_read(self):
+        """Right-click → Compress puts everything one level deeper."""
+        folders = self.make_workspace()
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("My Books/Input/Wrapped.pdf", b"%PDF-1.4 wrapped")
+            archive.writestr(f"My Books/Manuscripts/D{DRAFT_SUFFIX}", b"{}")
+
+        self.assertEqual(workspace.unpack(buffer.getvalue(), folders), 2)
+        self.assertTrue((folders["Input"] / "Wrapped.pdf").is_file())
+
+    def test_one_book_can_be_taken_home_without_taking_all_of_them(self):
+        folders = self.make_workspace()
+        self.fill(folders)
+        book = folders["Output"] / "Done"
+
+        names = zipfile.ZipFile(
+            io.BytesIO(workspace.pack_folder(book, "Done"))
+        ).namelist()
+        self.assertEqual(names, ["Done/book_signatures/signature_1.pdf"])
+
+
+class TestNothingIsKept(unittest.TestCase):
+    """The retention rule, which is the reason the rest of this exists.
+
+    A visitor's files live in a folder named after their session and are gone
+    within seconds of the browser going away. Whatever somebody uploads is
+    theirs; the way not to be answerable for it is not to hold it.
+    """
+
+    def setUp(self):
+        self.sessions = Path(tempfile.mkdtemp(prefix="sessions-test-"))
+        self.addCleanup(shutil.rmtree, self.sessions, ignore_errors=True)
+        self.addCleanup(setattr, workspace, "SESSIONS_ROOT",
+                        workspace.SESSIONS_ROOT)
+        workspace.SESSIONS_ROOT = self.sessions
+        for name in ("INPUT_DIR", "OUTPUT_DIR", "PREVIOUS_DIR", "MANUSCRIPT_DIR"):
+            self.addCleanup(setattr, main, name, getattr(main, name))
+
+    def a_session(self, connected):
+        """One session's folder, with a book in it. `connected` is its id."""
+        state = {workspace.SESSION_KEY: connected}
+        folders = workspace.open_session(state)
+        (folders["Input"] / "Theirs.pdf").write_bytes(b"%PDF-1.4 theirs")
+        return self.sessions / state[workspace.SESSION_KEY]
+
+    def sweep_seeing(self, connected, now=None):
+        """One sweep, with the runtime reporting `connected` as still open."""
+        with mock.patch.object(workspace, "_connected_session_ids",
+                               return_value=connected):
+            return workspace.sweep(now=now)
+
+    def test_a_session_still_on_screen_is_left_alone(self):
+        root = self.a_session("live")
+        self.assertEqual(self.sweep_seeing({"live"}), [])
+        self.assertTrue((root / "Input" / "Theirs.pdf").is_file())
+
+    def test_a_session_whose_browser_has_gone_is_erased(self):
+        root = self.a_session("gone")
+        # Nothing yet: the grace period is what a network blip survives on.
+        self.assertEqual(self.sweep_seeing(set()), [])
+        self.assertTrue(root.is_dir())
+
+        later = time.time() + workspace.GRACE_SECONDS + 1
+        self.assertEqual(self.sweep_seeing(set(), now=later), [root])
+        self.assertFalse(root.exists())
+
+    def test_a_runtime_that_cannot_be_read_never_deletes_a_live_session(self):
+        """None means "I do not know", and not knowing must not mean deleting.
+
+        If reading the runtime ever breaks, the failure has to be files kept
+        slightly too long, not somebody's book vanishing mid-sentence.
+        """
+        root = self.a_session("unknown")
+        past_the_grace = time.time() + workspace.GRACE_SECONDS + 1
+        self.assertEqual(self.sweep_seeing(None, now=past_the_grace), [])
+        self.assertTrue(root.is_dir())
+
+        # The backstop still applies, so nothing survives indefinitely.
+        much_later = time.time() + workspace.ORPHAN_SECONDS + 1
+        self.assertEqual(self.sweep_seeing(None, now=much_later), [root])
+
+    def test_asking_for_it_erases_it_now(self):
+        state = {workspace.SESSION_KEY: "impatient"}
+        workspace.open_session(state)
+        root = self.sessions / state[workspace.SESSION_KEY]
+        (root / "Input" / "Regret.pdf").write_bytes(b"%PDF-1.4 regret")
+
+        workspace.discard(state)
+        self.assertFalse(root.exists())
+        # And the next run starts empty under a new name rather than reopening
+        # the folder that was just emptied.
+        self.assertNotIn(workspace.SESSION_KEY, state)
+
+    def test_nothing_this_process_made_outlives_it(self):
+        root = self.a_session("shutting-down")
+        workspace._discard_everything()
+        self.assertFalse(root.exists())
+
+    def test_two_sessions_never_share_a_folder(self):
+        one = self.a_session("first")
+        two = self.a_session("second")
+        self.assertNotEqual(one, two)
+        self.assertTrue((one / "Input" / "Theirs.pdf").is_file())
+
+    def test_the_folders_are_nowhere_near_the_app(self):
+        """Not a subfolder of the repo, under any name."""
+        root = self.a_session("elsewhere")
+        self.assertNotIn(main.ROOT_DIR.resolve(), root.resolve().parents)
+
+
+class TestTheSizeLimit(unittest.TestCase):
+    """500 MB per session, counted over everything and enforced everywhere.
+
+    A per-file cap is not a cap: nothing stops the next file. What has to hold
+    is the total, against uploads, against a loaded zip, and against work whose
+    output size is not knowable until it has been written.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="limit-test-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.folders = {name: self.root / name
+                        for name in workspace.DATA_FOLDERS}
+        for folder in self.folders.values():
+            folder.mkdir(parents=True)
+        # A limit small enough to reach in a test, restored afterwards.
+        self.addCleanup(setattr, workspace, "LIMIT_BYTES",
+                        workspace.LIMIT_BYTES)
+        workspace.LIMIT_BYTES = 1000
+
+    def fill(self, size, name="Big.pdf"):
+        (self.folders["Input"] / name).write_bytes(b"x" * size)
+
+    def test_the_shipped_limits_are_500_mb_a_session_and_100_mb_a_book(self):
+        workspace.LIMIT_BYTES = 500 * 1024 * 1024
+        self.assertEqual(workspace.human(workspace.LIMIT_BYTES), "500 MB")
+        self.assertEqual(workspace.human(workspace.MAX_UPLOAD_BYTES), "100 MB")
+
+    def test_one_book_can_never_fill_the_session_it_is_converted_in(self):
+        """The reason the two numbers are not the same.
+
+        A book allowed to fill the session is a book that cannot then be
+        converted: imposition writes its signatures, which come to about the
+        size of the book again, and there would be nowhere to put them. Room for
+        the book, its signatures and a numbered copy is the least that has to
+        fit, and the shipped pair leaves far more than that.
+        """
+        workspace.LIMIT_BYTES = 500 * 1024 * 1024
+        book = workspace.MAX_UPLOAD_BYTES
+        needed = book + int(book * 1.1) + int(book * 1.1)
+        self.assertLess(needed, workspace.LIMIT_BYTES)
+
+    def test_usage_counts_every_folder_not_just_the_uploads(self):
+        self.fill(100)
+        (self.folders["Output"] / "sig.pdf").write_bytes(b"y" * 250)
+        (self.folders["Manuscripts"] / "d.json").write_bytes(b"z" * 50)
+        self.assertEqual(workspace.usage(self.folders), 400)
+        self.assertEqual(workspace.free(self.folders), 600)
+
+    def test_what_fits_is_allowed_and_what_does_not_is_refused(self):
+        self.fill(900)
+        self.assertEqual(workspace.guard(self.folders, 100), 100)
+        with self.assertRaises(workspace.QuotaExceeded):
+            workspace.guard(self.folders, 101)
+
+    def test_a_zip_bigger_than_the_limit_is_refused_before_the_wipe(self):
+        self.fill(200, "Precious.pdf")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("Input/Huge.pdf", b"x" * 1200)
+
+        with self.assertRaises(workspace.QuotaExceeded):
+            workspace.unpack(buffer.getvalue(), self.folders)
+        # Refused means refused: the session it would have replaced is intact.
+        self.assertTrue((self.folders["Input"] / "Precious.pdf").is_file())
+
+    def test_a_zip_that_lies_about_its_size_gets_nothing_through(self):
+        """The header is the attacker's to write, so it is not what decides.
+
+        A zip declaring a small entry and then streaming a large one is the
+        standard way past a size check that trusts the listing. Two things stop
+        it and either is enough: Python's own reader checks each entry's CRC
+        against its declared length and calls the mismatch damage, and the copy
+        loop counts the bytes that actually arrive rather than the ones that
+        were promised. What this pins is the outcome — refused, with nothing
+        kept — not which of the two got there first.
+        """
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("Input/Bomb.pdf", b"\0" * 20_000)
+        data = bytearray(buffer.getvalue())
+        # Rewrite every declared uncompressed size to something harmless.
+        for header in (b"PK\x03\x04", b"PK\x01\x02"):
+            at = data.find(header)
+            offset = 22 if header == b"PK\x03\x04" else 24
+            data[at + offset:at + offset + 4] = (10).to_bytes(4, "little")
+
+        with self.assertRaises((workspace.QuotaExceeded, ValueError)):
+            workspace.unpack(bytes(data), self.folders)
+        self.assertEqual(workspace.usage(self.folders), 0)
+
+    def test_a_load_that_would_go_over_leaves_nothing_behind(self):
+        """Refused half way is still refused: no partial session survives."""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("Input/One.pdf", b"x" * 600)
+            archive.writestr("Input/Two.pdf", b"y" * 600)
+
+        with self.assertRaises(workspace.QuotaExceeded):
+            workspace.unpack(buffer.getvalue(), self.folders)
+        self.assertEqual(workspace.usage(self.folders), 0)
+
+    def test_a_zip_that_exactly_fits_is_still_accepted(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("Input/Exact.pdf", b"x" * workspace.LIMIT_BYTES)
+        self.assertEqual(workspace.unpack(buffer.getvalue(), self.folders), 1)
+
+    def test_a_long_job_is_stopped_the_moment_it_crosses(self):
+        """The watcher, which is what makes this a limit and not a hope."""
+        check = workspace.watcher(self.folders, every=0)
+        self.fill(500)
+        check()   # still inside
+
+        self.fill(600, "More.pdf")
+        with self.assertRaises(workspace.QuotaExceeded):
+            check()
+
+    def test_the_watcher_does_not_walk_the_session_on_every_page(self):
+        """Imposition reports per page; a directory walk each time is a cost."""
+        check = workspace.watcher(self.folders, every=3600)
+        check()
+        self.fill(5000)
+        # Over the limit, but not yet time to look again.
+        check()
+
+
+class TestAJobStoppedByTheLimit(EditorTestCase):
+    """The backstop, driven through the real app against a real conversion.
+
+    Imposition does not know how big its output will be until it has written
+    it, so the pre-flight estimate on the button cannot be the whole of the
+    limit. This is the half that makes it a limit: a job that starts inside and
+    would end outside is stopped part way, and takes its wreckage with it.
+    """
+
+    def crossing_watcher(self, after=3):
+        """A watcher that lets a job start and then refuses, as running out does."""
+        calls = []
+
+        def crossing(_folders, every=1.0):
+            def check():
+                calls.append(1)
+                if len(calls) > after:
+                    raise workspace.QuotaExceeded("no room left (test)")
+            return check
+
+        return crossing, calls
+
+    def convert_view_with_a_book(self, pages=40):
+        from Script.test_imposition import build_source_pdf
+        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        build_source_pdf(main.INPUT_DIR / "Big.pdf", pages)
+        self.at.run()
+        return "Big.pdf"
+
+    def test_a_conversion_is_stopped_part_way_and_leaves_nothing(self):
+        self.convert_view_with_a_book()
+        crossing, calls = self.crossing_watcher()
+
+        with mock.patch.object(workspace, "watcher", crossing):
+            self.at.button(key="convert-Big.pdf").click().run()
+        self.assertFalse(self.at.exception, self.at.exception)
+
+        self.assertGreater(len(calls), 3, "the job never got going")
+        self.assertIn("Stopped",
+                      " ".join(e.value for e in self.at.error))
+        # The staging folder `convert_book` writes into is gone, and the
+        # half-made book is not offered as something to print.
+        self.assertFalse(list(main.OUTPUT_DIR.rglob("_new_signatures")))
+        self.assertNotIn("Big", [b.name for b in main.list_ready_books()])
+        # The input is still where it was: an abandoned conversion must not
+        # archive the book it failed to convert.
+        self.assertTrue((main.INPUT_DIR / "Big.pdf").is_file())
+
+    def test_numbering_stopped_part_way_leaves_no_half_written_pdf(self):
+        """This one writes its file directly, with no staging folder to drop."""
+        self.convert_view_with_a_book()
+        crossing, _calls = self.crossing_watcher()
+
+        with mock.patch.object(workspace, "watcher", crossing):
+            self.at.button(key="number-Big.pdf").click().run()
+        self.assertFalse(self.at.exception, self.at.exception)
+
+        self.assertFalse((main.INPUT_DIR / "Big_Numbered.pdf").exists())
+
+
+class TestTheZipControls(EditorTestCase):
+    """The two controls at the top of the sidebar, driven through the app."""
+
+    def zip_of(self, entries):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, content in entries.items():
+                archive.writestr(name, content)
+        return ("my-books.zip", buffer.getvalue(), "application/zip")
+
+    def test_both_ways_out_are_offered_above_the_settings(self):
+        headers = [header.value for header in self.at.sidebar.header]
+        self.assertEqual(headers[:2], ["Your data", "Settings"])
+        self.assertIn("workspace-save",
+                      [button.key for button in self.at.sidebar.download_button])
+        self.assertIn("workspace-zip-0",
+                      [box.key for box in self.at.sidebar.file_uploader])
+
+    def test_the_paragraph_on_the_page_is_the_one_in_the_source(self):
+        """There were two copies of it, and only one was ever displayed.
+
+        The About entry in `set_page_config` is built so that Streamlit builds
+        the toolbar the theme switcher lives in, and the toolbar is then hidden —
+        so nothing written there is reachable. It held its own slightly different
+        wording of the same paragraph, which is a trap for whoever edits it next
+        expecting the page to change. Both now read one constant.
+        """
+        opening = "Turns a 2-column PDF book"
+        captions = " ".join(caption.value for caption in self.at.caption)
+        self.assertIn(opening, captions)
+
+        # Written once in the file. If this ever counts two again, one of them is
+        # the copy nobody can see.
+        page = Path(main.__file__).with_name("app.py").read_text(encoding="utf-8")
+        self.assertEqual(page.count(opening), 1)
+        self.assertIn("TAGLINE", page)
+
+    def test_the_retention_rule_is_on_the_page_not_only_in_the_readme(self):
+        captions = " ".join(caption.value for caption in self.at.sidebar.caption)
+        self.assertIn("Nothing is stored", captions)
+        self.assertIn("erased when it closes", captions)
+
+    def test_erasing_on_demand_takes_two_clicks_and_then_everything(self):
+        theirs = main.INPUT_DIR / "Regret.pdf"
+        theirs.write_bytes(b"%PDF-1.4 regret")
+        root = main.INPUT_DIR.parent
+
+        self.at.button(key="arm-delete-workspace").click().run()
+        self.assertTrue(theirs.is_file(), "one click erased it")
+
+        self.at.button(key="yes-delete-workspace").click().run()
+        self.assertFalse(self.at.exception, self.at.exception)
+        self.assertFalse((root / "Input" / "Regret.pdf").exists())
+
+    def test_nothing_is_deleted_until_the_second_click(self):
+        """Picking a file in the dialog is not a decision to delete anything.
+
+        A `file_uploader` fires the moment a file is chosen — no button
+        involved — and this load replaces the workspace rather than adding to
+        it. So the wrong file in the dialog must cost nothing until it is
+        confirmed.
+        """
+        keeper = main.INPUT_DIR / "Keep me.pdf"
+        keeper.write_bytes(b"%PDF-1.4 keep")
+
+        self.assertNotIn("workspace-load-go",
+                         [button.key for button in self.at.button])
+        self.at.sidebar.file_uploader(key="workspace-zip-0").set_value(
+            self.zip_of({"Input/Other.pdf": b"%PDF-1.4 other"})
+        ).run()
+
+        self.assertIn("workspace-load-go",
+                      [button.key for button in self.at.button])
+        self.assertTrue(keeper.is_file(), "the zip was applied without a click")
+
+    def test_a_loaded_zip_replaces_every_folder(self):
+        (main.INPUT_DIR / "Gone.pdf").write_bytes(b"%PDF-1.4 gone")
+
+        self.at.sidebar.file_uploader(key="workspace-zip-0").set_value(
+            self.zip_of({
+                "Input/Arrived.pdf": b"%PDF-1.4 arrived",
+                f"Manuscripts/Carried{DRAFT_SUFFIX}": b'{"title": "Carried"}',
+            })
+        ).run()
+        self.at.button(key="workspace-load-go").click().run()
+        self.assertFalse(self.at.exception, self.at.exception)
+
+        self.assertTrue((main.INPUT_DIR / "Arrived.pdf").is_file())
+        self.assertFalse((main.INPUT_DIR / "Gone.pdf").exists())
+        self.assertEqual([draft.name for draft in list_drafts(self.drafts)],
+                         ["Carried"])
+        # The uploader is rebuilt under a new key, or the same zip would be
+        # loaded again on the next thing the user clicked.
+        self.assertIn("workspace-zip-1",
+                      [box.key for box in self.at.sidebar.file_uploader])
+
+    def test_a_full_session_closes_every_control_that_would_write(self):
+        """Refused on the button, not after the click.
+
+        An app that lets you start work it has already decided it will not let
+        you finish is worse than one that says so up front.
+        """
+        self.addCleanup(setattr, workspace, "LIMIT_BYTES", workspace.LIMIT_BYTES)
+        workspace.LIMIT_BYTES = 1
+        self.at.run()
+        self.assertFalse(self.at.exception, self.at.exception)
+
+        self.assertTrue(self.at.button(key="bk-build").disabled)
+        self.assertTrue(self.at.button(key="bk-build-convert").disabled)
+        self.assertTrue(self.at.button(key="bk-save").disabled)
+        warnings = " ".join(w.value for w in self.at.warning)
+        self.assertIn("full", warnings)
+
+        # The way out is still open: saving and erasing are never blocked.
+        self.assertFalse(self.at.sidebar.download_button(key="workspace-save").disabled)
+        self.assertFalse(self.at.button(key="arm-delete-workspace").disabled)
+
+    def test_the_book_uploader_names_its_own_limit_exactly_once(self):
+        """Streamlit prints one upload ceiling for the whole app, and it is the
+        zip's. The book uploader corrects that line for itself — and says the
+        figure nowhere else, so a reader sees one rule rather than three."""
+        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+
+        uploader = self.at.file_uploader(key="uploader-0")
+        self.assertNotIn("100", uploader.label)
+        self.assertFalse(uploader.help)
+        written = " ".join(caption.value for caption in self.at.caption)
+        self.assertNotIn("100 MB", written)
+        self.assertNotIn("per PDF", written)
+
+        # The one place it is written is the style block that overwrites the
+        # dropzone's own line, which carries the figure from the same constant.
+        page = Path(main.__file__).with_name("app.py").read_text(encoding="utf-8")
+        self.assertIn("MB per file", page)
+        self.assertIn("stFileUploaderDropzoneInstructions", page)
+
+    def test_how_much_room_is_left_is_answered_in_one_place(self):
+        """The sidebar's bar is the readout. The conversion view had a second
+        one under the uploader, saying the same thing a scroll away."""
+        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        captions = " ".join(caption.value for caption in self.at.caption)
+        self.assertNotIn("left of", captions)
+
+        # AppTest has no accessor for `st.progress`, so the bar is found in the
+        # tree by its proto. There should be exactly one, and it should be the
+        # sidebar's.
+        def bars(node):
+            proto = getattr(node, "proto", None)
+            if type(proto).__name__ == "Progress":
+                yield proto
+            children = getattr(node, "children", None) or {}
+            for child in getattr(children, "values", lambda: children)():
+                yield from bars(child)
+
+        everywhere = list(bars(self.at._tree))
+        self.assertEqual(len(everywhere), 1)
+        self.assertIn("500 MB", everywhere[0].text)
+        self.assertEqual(list(bars(self.at.sidebar)), everywhere)
+
+    def test_a_book_over_the_per_file_limit_is_refused_and_not_written(self):
+        self.addCleanup(setattr, workspace, "MAX_UPLOAD_BYTES",
+                        workspace.MAX_UPLOAD_BYTES)
+        workspace.MAX_UPLOAD_BYTES = 100
+        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+
+        self.at.file_uploader(key="uploader-0").set_value(
+            ("Enormous.pdf", b"%PDF-1.4" + b"x" * 500, "application/pdf")
+        ).run()
+        self.assertFalse(self.at.exception, self.at.exception)
+
+        self.assertFalse((main.INPUT_DIR / "Enormous.pdf").exists())
+        errors = " ".join(e.value for e in self.at.error)
+        self.assertIn("Enormous.pdf", errors)
+        self.assertIn("over the", errors)
+
+    def test_a_book_that_fits_is_still_taken(self):
+        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.at.file_uploader(key="uploader-0").set_value(
+            ("Small.pdf", b"%PDF-1.4 small", "application/pdf")
+        ).run()
+        self.assertFalse(self.at.exception, self.at.exception)
+        self.assertTrue((main.INPUT_DIR / "Small.pdf").is_file())
+
+    def test_a_zip_that_is_not_ours_is_reported_and_changes_nothing(self):
+        keeper = main.INPUT_DIR / "Keep me.pdf"
+        keeper.write_bytes(b"%PDF-1.4 keep")
+
+        self.at.sidebar.file_uploader(key="workspace-zip-0").set_value(
+            self.zip_of({"holiday/beach.jpg": b"not a book"})
+        ).run()
+        self.at.button(key="workspace-load-go").click().run()
+        self.assertFalse(self.at.exception, self.at.exception)
+
+        self.assertTrue(keeper.is_file())
+        self.assertIn("Could not load that zip",
+                      " ".join(error.value for error in self.at.error))
 
 
 if __name__ == "__main__":

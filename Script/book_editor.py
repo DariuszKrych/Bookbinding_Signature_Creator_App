@@ -4,8 +4,8 @@ This is the second half of the app. The first half takes a PDF somebody else
 made and imposes it; this one lets the user type the book themselves — title,
 author, dedication, chapters, appendix — and then hands the result to exactly
 the same imposition. The bridge between the two is deliberately narrow: the
-editor builds an ordinary input PDF in `Input/`, and from that moment on a
-typed book is indistinguishable from any other.
+editor builds an ordinary input PDF, and from that moment on a typed book is
+indistinguishable from any other.
 
 Three rules shape everything below.
 
@@ -30,6 +30,7 @@ page is painted with every control disabled before a single page is typeset.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import streamlit as st
 
@@ -40,6 +41,7 @@ from Script.manuscript import (
     CHAPTER_START_NEW_PAGE,
     CHAPTER_START_RECTO,
     DESIGN_LIMITS,
+    DRAFT_SUFFIX,
     FRONT_KEYS,
     KINDS,
     LABEL_CHAPTER_NUMBER,
@@ -160,9 +162,14 @@ class Editor:
     # than worked out here so the path shown on screen is the same one the
     # build will actually use, sanitised in exactly the same way.
     build_path: object
-    # Show a folder in the desktop file manager. Only meaningful because this
-    # app runs on the machine looking at it; see `main.open_folder`.
-    open_folder: object
+    # One folder as the bytes of a zip, for a download. Nothing this app holds
+    # is stored, so handing a file to the browser is the only way out of it;
+    # see `Script.workspace.pack_folder`.
+    pack_folder: object
+    # True when the session has no room left to write anything. Building is the
+    # one thing this view does that makes a file, so it is the one thing that
+    # has to go dead when there is nowhere to put it.
+    full: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -489,26 +496,29 @@ def _draft_panel(editor, book, folder):
                 "Draft name", "draft-name", DRAFT_NAME_AUTO,
                 st.session_state.get(DRAFT_NAME) or book.title.strip(),
                 editor,
-                placeholder="What to call this draft on disk",
-                help="The file this draft is saved as, in the Manuscripts "
-                     "folder. It is only a file name; the book's own title is "
-                     "set below. Empty it to go back to using the title.",
+                placeholder="What to call this draft",
+                help="What this draft is called in the list below. It is only "
+                     "a name; the book's own title is set below it. Empty it "
+                     "to go back to using the title.",
             )
         # An empty box falls back to the book's title, so somebody who types a
         # title and presses Save never has to think about file names at all.
         save_name = clean_draft_name(typed_name or book.display_title)
 
+        # Gated on room like everything else that writes. A draft is a few
+        # kilobytes of JSON, so this only ever bites when the session is already
+        # full of PDFs — but "full" has to mean full, or the limit is decorative.
         if save_column.button(
             "💾 Save", key=f"{FIELD_PREFIX}save", type="primary",
-            use_container_width=True, disabled=editor.busy,
-            help="Writes this draft to the Manuscripts folder under the name "
-                 "on the left, replacing that draft if it is already there.",
+            use_container_width=True, disabled=editor.busy or editor.full,
+            help="Keeps this draft under the name on the left, replacing that "
+                 "draft if it is already there.",
         ):
             _save_now(editor, book, folder, save_name)
 
         if saveas_column.button(
             "Save a copy", key=f"{FIELD_PREFIX}save-as",
-            use_container_width=True, disabled=editor.busy,
+            use_container_width=True, disabled=editor.busy or editor.full,
             help="Saves under a free name (“My book 2”, “My book 3”) and "
                  "leaves the draft it came from as it was.",
         ):
@@ -518,7 +528,7 @@ def _draft_panel(editor, book, folder):
         if draft_path() and loaded_name and save_name != loaded_name:
             st.caption(
                 f"Saving now writes a **new** draft called “{save_name}”. "
-                f"“{loaded_name}” stays in the folder; delete it below if you "
+                f"“{loaded_name}” stays in the list; delete it below if you "
                 f"meant to rename."
             )
 
@@ -542,22 +552,20 @@ def _draft_panel(editor, book, folder):
                  help_text="A complete book that shows what every field does. "
                            "It opens as an unsaved draft, so it cannot "
                            "overwrite anything.")
-        # A draft is one plain JSON file, so moving a book between machines is
-        # copying a file — which the file manager already does better than any
-        # pair of upload and download buttons could.
-        if folder_column.button(
-            "📂 Open file location", key=f"{FIELD_PREFIX}open-folder",
+        # A draft is one plain JSON file, and this hands over the book as it
+        # stands on screen rather than the last version written — saved or not,
+        # what you see is what you get. `data` is the function, not its result,
+        # so the text is produced when the button is clicked and not on every
+        # keystroke that reruns this page.
+        folder_column.download_button(
+            "⬇️ Download this draft", key=f"{FIELD_PREFIX}download-draft",
+            data=lambda: book.to_json(),
+            file_name=f"{save_name}{DRAFT_SUFFIX}",
+            mime="application/json",
             type="primary", use_container_width=True, disabled=editor.busy,
-            help="Opens the Manuscripts folder, where every draft is saved as "
-                 "one JSON file. Copy one out to carry a book to another "
-                 "computer, or drop one in to add it.",
-        ):
-            try:
-                editor.open_folder(folder)
-            except Exception as error:
-                st.error(f"Could not open the folder: {error}")
-            else:
-                st.toast(f"Opened {folder.name}.", icon="📂")
+            help="This book as one JSON file, exactly as it is on screen. "
+                 "Keep it, or put it back later with **📥 Load my data**.",
+        )
         with autosave_column:
             # Sticky like the paper settings: a writer who turned autosave off
             # and then went to look at the conversion tab must not come back to
@@ -582,7 +590,7 @@ def _draft_panel(editor, book, folder):
 
 
 def _draft_list(editor, book, folder, drafts, actions):
-    st.caption(f"One JSON file each, in `{folder}`.")
+    st.caption("Kept for this session only. **📤 Save my data** takes them home.")
     if not drafts:
         st.info("No drafts saved yet. **💾 Save** puts this one here.")
         return
@@ -1299,12 +1307,12 @@ def _build_panel(editor, book, page_size_in, sheet_size_pt):
         file_name = _auto_box(
             "Build it as", "file-name", FILE_NAME_AUTO,
             book.title.strip() or "Untitled book", editor,
-            help="The PDF written into the Input folder. Building again "
-                 "replaces the PDF this editor wrote under that name, and never "
-                 "a PDF you put there yourself. Empty it to go back to using "
-                 "the book's title.",
+            help="What the built PDF is called. Building again replaces the "
+                 "PDF this editor wrote under that name, and never one you "
+                 "uploaded yourself. Empty it to go back to using the book's "
+                 "title.",
         )
-        st.caption(f"→ `{editor.build_path(file_name)}`")
+        st.caption(f"→ `{editor.build_path(file_name).name}`")
 
         pending = None
         empty = not book.has_content()
@@ -1313,15 +1321,22 @@ def _build_panel(editor, book, page_size_in, sheet_size_pt):
                 "Nothing to build yet. Give the book a title, or type something "
                 "into one of the sections."
             )
+        if editor.full:
+            st.warning(
+                "This session is full, so there is nowhere to put a built book. "
+                "Save your data and delete something, or start again with "
+                "🗑 Delete my data now.",
+                icon="🚫",
+            )
 
         building = job == ("typeset", "build")
         build_slot = st.empty()
         if build_slot.button(
             "Building…" if building else "📄 Create the book PDF",
             key=f"{FIELD_PREFIX}build", use_container_width=True,
-            disabled=empty or editor.busy,
-            help="Typesets the book into the Input folder, where it appears in "
-                 "“Available for conversion” like any other PDF.",
+            disabled=empty or editor.busy or editor.full,
+            help="Typesets the book into a PDF, where it appears in "
+                 "“Available for conversion” like any other.",
         ):
             editor.claim_job(("typeset", "build"))
         if building:
@@ -1339,7 +1354,7 @@ def _build_panel(editor, book, page_size_in, sheet_size_pt):
             # thing that stops a conversion. Building the PDF is still offered,
             # because that half would have worked.
             use_container_width=True,
-            disabled=empty or editor.busy or bool(problems),
+            disabled=empty or editor.busy or editor.full or bool(problems),
             help="Typesets the book and imposes it in one go, using the size in "
                  "**📐 Book design** and the folding settings in the sidebar.",
         ):
@@ -1353,11 +1368,11 @@ def _build_panel(editor, book, page_size_in, sheet_size_pt):
                        # only one of the two is ever on screen.
                        "sheet_size_pt": sheet_size_pt, "scale_mode": FIT}
 
-        _last_build_note()
+        _last_build_note(editor)
         return pending
 
 
-def _last_build_note():
+def _last_build_note(editor=None):
     built = st.session_state.get(LAST_BUILD)
     if not built:
         return
@@ -1366,13 +1381,21 @@ def _last_build_note():
         f"{built['source_pages']} sheet-sides, {built['words']:,} words.",
         icon="📖",
     )
-    # Where the signatures went, when this build made any. This view has no
+    # The signatures themselves, when this build made any. This view has no
     # “Ready to print” panel of its own, and a finished set of files nobody can
-    # find is not a finished job.
+    # get hold of is not a finished job.
     folder = built.get("output_folder")
-    if folder:
-        st.caption("The signature files for it are in:")
-        st.code(folder, language=None)
+    if folder and editor is not None and Path(folder).is_dir():
+        name = Path(folder).name
+        st.download_button(
+            "⬇️ Download the signatures", key=f"{FIELD_PREFIX}download-built",
+            data=lambda target=folder, label=name: editor.pack_folder(target, label),
+            file_name=f"{name}.zip",
+            mime="application/zip",
+            use_container_width=True, disabled=editor.busy,
+            help="Every signature file for this build, in print order, with "
+                 "its printing notes, as one zip.",
+        )
     for note in built.get("notes", ()):
         st.warning(note, icon="ℹ️")
 
@@ -1437,13 +1460,13 @@ def _finish_status(slot, editor, book, folder, autosave, save_name):
     if is_unsaved():
         with slot.container():
             st.caption(
-                "⚠️ Not saved yet. **💾 Save** keeps this book in the "
-                "Manuscripts folder, and autosave takes over from there."
+                "⚠️ Not saved yet. **💾 Save** keeps this book in the drafts "
+                "list, and autosave takes over from there."
             )
         return
 
     saved_name = st.session_state.get(DRAFT_NAME) or save_name
-    if is_dirty(book) and autosave and not editor.busy:
+    if is_dirty(book) and autosave and not editor.busy and not editor.full:
         try:
             path = save_draft(folder, book, saved_name)
         except Exception as error:

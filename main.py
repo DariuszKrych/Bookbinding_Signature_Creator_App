@@ -1,13 +1,18 @@
-"""Convert 2-column PDF books in Input/ into printable signatures in Output/.
+"""Turn 2-column PDF books into printable signature files.
 
 Usable headless (`python main.py`) or behind the Streamlit GUI (`streamlit run app.py`).
+
+The four folder names below are where the work happens. Behind the GUI they are
+not fixed: `Script/workspace.py` re-points them at a folder made for one browser
+session and destroyed when that session ends, so nothing a visitor uploads is
+kept. Every function here reads them at call time, and none of them assumes the
+folders are anywhere in particular.
 """
 
 import argparse
-import os
 import shutil
-import subprocess
 import sys
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -36,14 +41,18 @@ from Script.print_formatting import (
 )
 from Script.typesetting import is_generated_book, render_manuscript
 
+# Defaults for the headless CLI only, and made on demand rather than shipped:
+# `python main.py` is somebody working on their own files on their own machine.
+# The GUI never uses these. `Script/workspace.py` replaces all four before the
+# first panel is drawn, with folders it will delete again when the browser goes
+# away — so nothing anyone uploads through the web app is ever written here.
 ROOT_DIR = Path(__file__).resolve().parent
 INPUT_DIR = ROOT_DIR / "Input"
 OUTPUT_DIR = ROOT_DIR / "Output"
 PREVIOUS_DIR = ROOT_DIR / "Previously_Converted"
 # Books being written in the GUI's editor, one JSON file per draft. Nothing in
 # the conversion path reads this folder: a draft becomes an ordinary input PDF
-# in Input/ the moment it is built, and takes the same route as any other book
-# from there.
+# the moment it is built, and takes the same route as any other book from there.
 MANUSCRIPT_DIR = ROOT_DIR / "Manuscripts"
 
 DEFAULT_SHEETS_PER_SIGNATURE = 5
@@ -202,28 +211,6 @@ def delete_ready_book(folder):
     return target
 
 
-def open_folder(path):
-    """Show `path` in the desktop file manager.
-
-    Only meaningful because this is a local app: the GUI is a browser front end
-    onto a Streamlit process running on the user's own machine, so "the machine
-    that opens the window" and "the machine holding the files" are the same one.
-    A hosted deployment would open a folder on the server, where nobody is
-    looking, which is why this is a button and not a link.
-    """
-    path = Path(path)
-    if not path.is_dir():
-        raise FileNotFoundError(f"“{path}” is not a folder that exists.")
-    if sys.platform == "win32":
-        os.startfile(str(path))  # noqa: S606  (Explorer, on a path we just checked)
-    else:
-        opener = "open" if sys.platform == "darwin" else "xdg-open"
-        # check=True so a missing xdg-open surfaces as an error the GUI can show,
-        # rather than a button that silently does nothing.
-        subprocess.run([opener, str(path)], check=True)
-    return path
-
-
 # --------------------------------------------------------------------------
 # Books typed into the editor
 # --------------------------------------------------------------------------
@@ -255,20 +242,56 @@ def typeset_book(manuscript, file_name, progress=None, page_size_in=None):
     Rebuilding a book after an edit is the normal loop, so a PDF this editor
     wrote is replaced without asking. A PDF that came from anywhere else is
     never replaced: the editor's file name defaults to the book's title, and a
-    title that happens to match a book the user dropped into Input/ themselves
-    would otherwise overwrite it with no warning at all.
+    title that happens to match a book the user uploaded themselves would
+    otherwise overwrite it with no warning at all.
     """
     target = book_pdf_path(file_name)
     if target.exists() and not is_generated_book(target):
         raise FileExistsError(
-            f"“{target.name}” is already in Input, and this editor did not "
-            f"write it. Choose a different file name so the book already there "
-            f"is left alone."
+            f"“{target.name}” is already here, and this editor did not write "
+            f"it. Choose a different file name so the book already there is "
+            f"left alone."
         )
     target.parent.mkdir(parents=True, exist_ok=True)
     return render_manuscript(
         manuscript, target, progress=progress, page_size_in=page_size_in
     )
+
+
+def printing_steps(flip_on_long_edge):
+    """How to get a signature off the printer and folded, said once.
+
+    Read twice: the GUI renders these as a numbered list under "How to print and
+    fold", and `print_instructions` below strips the emphasis out of them for the
+    note that ships beside the signatures. They used to be written out separately
+    in each place — five steps in app.py, five differently-divided steps here —
+    so a correction to one silently left the other saying something else.
+
+    `**bold**` is the whole of the markup vocabulary, because the plain-text
+    rendering removes it with a single replace. Nothing here may refer to the GUI
+    by name: the same words go into a file the headless CLI writes.
+    """
+    edge = "long" if flip_on_long_edge else "short"
+    return [
+        'Print **one signature file at a time**, double-sided, at '
+        '**100% / "Actual size"**. Never "fit to page": the pages are already '
+        'the size of your paper, and letting the printer scale them again '
+        'shrinks the margins and moves the fold off centre.',
+
+        "Load the paper the book was made for, and check that the print dialog "
+        "agrees about its size; some drivers quietly fall back to their own "
+        "default.",
+
+        f"Set your printer's duplex option to **flip on the {edge} edge** — the "
+        f"setting this book was made for.",
+
+        "Fold **every sheet** of a signature in half, then **nest** them one "
+        "inside the other. The first sheet printed is the outermost.",
+
+        "Page numbers should run in order through the folded signature. If "
+        "every other page is upside down, switch the duplex setting and "
+        "reprint.",
+    ]
 
 
 def print_instructions(book_name, fit, plans, flip_on_long_edge, unit=INCHES):
@@ -281,7 +304,6 @@ def print_instructions(book_name, fit, plans, flip_on_long_edge, unit=INCHES):
     sheet_w, sheet_h = fit.sheet_size_in
     page_w, page_h = fit.book_page_size_in
     sheets = sum(plan.sheets for plan in plans)
-    edge = "long" if flip_on_long_edge else "short"
     lines = [
         f"{book_name}",
         f"Created {datetime.now():%Y-%m-%d %H:%M}",
@@ -294,17 +316,18 @@ def print_instructions(book_name, fit, plans, flip_on_long_edge, unit=INCHES):
         f"Sheets per signature {[plan.sheets for plan in plans]}",
         "",
         "How to print",
-        "  1. Print one signature file at a time, double-sided.",
-        "  2. Set the scale to 100% / 'Actual size'. Do not use 'Fit to page':",
-        "     the pages are already sized for this paper and scaling again would",
-        "     shrink the margins and move the fold off centre.",
-        f"  3. Set the printer's duplex option to flip on the {edge} edge.",
-        "  4. Fold every sheet of a signature in half, then nest them one inside",
-        "     the other. The first sheet printed is the outermost.",
-        "  5. Check that the page numbers run in order through the folded",
-        "     signature. If every other page is upside down, the duplex setting",
-        "     is the other one; switch it and reprint.",
     ]
+    # The same steps the GUI shows, with the emphasis taken out and wrapped to
+    # the width of the rest of this note. `textwrap` rather than hand-broken
+    # lines, so an edit to the wording in `printing_steps` cannot leave a ragged
+    # paragraph behind here.
+    for number, step in enumerate(printing_steps(flip_on_long_edge), 1):
+        lines.append(textwrap.fill(
+            step.replace("**", ""),
+            width=76,
+            initial_indent=f"  {number}. ",
+            subsequent_indent="     ",
+        ))
     return "\n".join(lines) + "\n"
 
 
