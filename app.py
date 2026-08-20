@@ -176,21 +176,38 @@ st.html(
     """
 )
 
-# The one upload limit Streamlit will print, corrected on the one uploader it is
-# wrong for.
+# The one upload limit Streamlit will print, corrected on both uploaders, because
+# under each of them it answers a question nobody asked.
 #
-# `server.maxUploadSize` is a single number for the whole app, and it has to be
-# the data zip's 500 MB or a full session could never be loaded back. The book
-# uploader's real limit is a fifth of that — see `MAX_UPLOAD_BYTES` — so the
-# "500MB per file • PDF" line the dropzone writes under it is not merely
-# unhelpful, it contradicts the refusal a 200 MB book would get.
+# `server.maxUploadSize` is a single number for the whole app: a ceiling on the
+# size of one uploaded *file*, set for the largest file the app must accept,
+# which is a data zip carrying a whole session. Under each dropzone Streamlit
+# prints it as though it were that uploader's rule, and under each it is wrong in
+# a different way:
 #
-# That line is not in any Python file and no config option reaches it: the
+# * Under the book uploader it is simply not the limit. A book may be a fifth of
+#   it — see `MAX_UPLOAD_BYTES` — so the printed line contradicts the refusal a
+#   200 MB book would actually get.
+# * Under the zip uploader it is a true statement about the wrong quantity. What
+#   decides whether a zip can be loaded is not how big the file is, it is what it
+#   unpacks to, measured against the session's own limit — `unpack` refuses on
+#   that and on nothing else. The two are not the same number and cannot be made
+#   the same number: a session is stored unpacked, and its bulk is PDF, which is
+#   already compressed, so a zip of a full session comes back at very nearly the
+#   size it went in at. `maxUploadSize` sits deliberately above the session limit
+#   so that such a zip is never refused by the browser (see the note in
+#   `.streamlit/config.toml`), which is exactly what makes it the wrong figure to
+#   print here: it would promise room the session does not have.
+#
+# So each line is replaced with the rule that uploader actually enforces, and
+# each is the *only* place that rule is written. How full the session is remains
+# a question about the session, answered once, by the bar below.
+#
+# The line is not in any Python file and no config option reaches it: the
 # frontend builds it from `maxUploadSize` (`static/js/FileUploader.*.js`,
-# `` `${C(t,T.Byte,0)} per file` ``). So it is overwritten here for the book
-# uploader only, through the `st-key-pdf-uploader` class `st.container(key=…)`
-# puts on the block. The zip uploader is untouched, because 500 MB is the truth
-# there.
+# `` `${C(t,T.Byte,0)} per file` `` followed by `` ` • ${types}` ``). It is
+# reached through the `st-key-…` class `st.container(key=…)` puts on a block, so
+# both uploaders sit in one.
 #
 # The text sits in a *span* inside the instructions element — not a `small`,
 # which is what the equivalent element is in some other Streamlit versions. If
@@ -198,24 +215,43 @@ st.html(
 # check; the selector is deliberately loose (`… span`) because the instructions
 # element holds nothing else.
 #
-# Hiding the original and drawing the replacement over it, rather than swapping
-# the text: CSS cannot edit a text node, and `display: none` on the original
-# would shift the dropzone's height away from the zip uploader's for no reason a
-# reader could see.
+# ► The replacement has to FLOW, not float. That span carries Streamlit's own
+# ► `overflow: hidden; text-overflow: ellipsis; white-space: nowrap`
+# ► (`FileUploader.*.js`, styled `span`, target `e3v525e4`), and it is the
+# ► element the text lives in. An earlier version of this block hid the original
+# ► with `visibility: hidden` and painted the replacement over it with
+# ► `position: absolute` — which made the span the pseudo-element's containing
+# ► block, so that `overflow: hidden` clipped the replacement to the span's own
+# ► width. In the main column nothing showed, because the line put there is the
+# ► same length as the line it replaces. In the sidebar, where the dropzone's
+# ► text column is about nineteen characters wide, a longer line was silently
+# ► cut off mid-sentence with no ellipsis to admit it.
+#
+# So: the original text node is collapsed with `font-size: 0` rather than hidden,
+# and the replacement is ordinary inline content of the same span. It inherits
+# the faded colour, it wraps instead of being cut, and the dropzone grows to hold
+# it. Collapsing the font is what costs the pseudo-element its size — it would
+# inherit the nought — so `fontSizes.sm` is restated on it, which is the one
+# number here copied out of Streamlit's theme rather than derived from this app.
 st.html(
     f"""
     <style>
-    .st-key-pdf-uploader [data-testid="stFileUploaderDropzoneInstructions"] span {{
-        visibility: hidden !important;
-        position: relative;
+    .st-key-pdf-uploader [data-testid="stFileUploaderDropzoneInstructions"] span,
+    .st-key-zip-uploader [data-testid="stFileUploaderDropzoneInstructions"] span {{
+        font-size: 0 !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        white-space: normal !important;
+    }}
+    .st-key-pdf-uploader [data-testid="stFileUploaderDropzoneInstructions"] span::after,
+    .st-key-zip-uploader [data-testid="stFileUploaderDropzoneInstructions"] span::after {{
+        font-size: 0.875rem;
     }}
     .st-key-pdf-uploader [data-testid="stFileUploaderDropzoneInstructions"] span::after {{
         content: "{workspace.MAX_UPLOAD_BYTES // (1024 * 1024)}MB per file • PDF";
-        visibility: visible;
-        position: absolute;
-        left: 0;
-        top: 0;
-        white-space: nowrap;
+    }}
+    .st-key-zip-uploader [data-testid="stFileUploaderDropzoneInstructions"] span::after {{
+        content: "Must fit the {workspace.human(workspace.LIMIT_BYTES)} after decompression";
     }}
     </style>
     """
@@ -496,15 +532,25 @@ with st.sidebar:
     # `file_uploader` hands back the same file on every rerun, so without this
     # the zip would be loaded again the moment anything else on the page moved.
     load_round = st.session_state.setdefault("workspace_round", 0)
-    incoming = st.file_uploader(
-        "📥 Load my data (.zip)",
-        type="zip",
-        key=f"workspace-zip-{load_round}",
-        disabled=busy,
-        help=f"A zip saved by the button below. Puts back every book, draft, "
-             f"archived PDF and finished signature it holds, up to "
-             f"{workspace.human(workspace.LIMIT_BYTES)}.",
-    )
+    # Keyed on the container rather than on the uploader, for the same reason the
+    # book uploader is: the style block at the top of this file reaches inside to
+    # correct the limit line the dropzone prints, and the uploader's own key
+    # changes on every load round, so a selector built from it would stop
+    # matching the moment a zip was loaded.
+    #
+    # The help says nothing about size. The rule is on the dropzone line, once,
+    # where the wrong one used to be — and it is a rule about what the zip holds
+    # rather than about the file, so a figure repeated here would be read as a
+    # second, different limit on the upload itself.
+    with st.container(key="zip-uploader"):
+        incoming = st.file_uploader(
+            "📥 Load my data (.zip)",
+            type="zip",
+            key=f"workspace-zip-{load_round}",
+            disabled=busy,
+            help="A zip saved by the button below. Puts back every book, draft, "
+                 "archived PDF and finished signature it holds.",
+        )
 
     # A second click before anything is deleted. A `file_uploader` fires the
     # moment a file is *picked* — no button involved — and this load replaces
@@ -1414,6 +1460,203 @@ with reference:
             f"{len(SHEET_SIZES)} sheet sizes, and {len(BOOK_PAGE_SIZES)} book sizes "
             f"across {len(BOOK_PAGE_FAMILIES)} categories."
         )
+
+# --------------------------------------------------------------------------
+# Data policy
+# --------------------------------------------------------------------------
+# Outside the `if view ==` above and last of everything drawn, so it stands under
+# both halves of the app: a notice that appears on one tab is a notice half the
+# visitors never see. The divider is the line it hangs under, run across the foot
+# of the page.
+#
+# On the page rather than behind an expander, and unfolded rather than in a
+# dialog, because the transparency this is written to satisfy is about a person
+# actually being told. A notice nobody can find is not a notice; the GDPR's own
+# word for what it has to be is "easily accessible".
+#
+# The figures are read out of `workspace` rather than typed in here, for the same
+# reason `TAGLINE` is said once at the top of this file and the folding steps
+# live in `main.printing_steps`. Every promise below is a claim about code in
+# this repository — a policy still promising a thirty-second erasure after the
+# sweeper has been changed to five minutes is worse than no policy at all, and
+# hand-kept copies of a number are exactly how that happens.
+#
+# What section 5 says is a disclosure rather than a promise, and it is there
+# because a policy is only worth anything if it describes the app that exists:
+# Hugging Face logs every visitor to every Space, and no line of this repository
+# can switch that off. It is named, with its own link, instead of being left to
+# be inferred from a sentence about how nothing is stored here.
+#
+# The framework's own telemetry used to be the second such disclosure. It is now
+# a promise instead — `gatherUsageStats = false` in `.streamlit/config.toml`
+# turns it off at the source — which is why section 4 states it as a flat "no
+# telemetry leaves" rather than section 5 conceding one. If that line is ever
+# removed from the config, this notice becomes untrue on the point a reader is
+# most likely to care about, so the two belong changed together.
+REPOSITORY = "https://github.com/DariuszKrych/Bookbinding_Signature_Creator_App"
+POLICY_UPDATED = "20 August 2026"
+
+# The four folder names as the policy says them, built here rather than inside
+# the f-string below: nesting a quoted separator inside a triple-quoted f-string
+# is legal and unreadable, and this is the one place in the notice where the
+# text has to be assembled rather than simply interpolated.
+SESSION_FOLDERS = ", ".join(f"`{name}/`" for name in workspace.DATA_FOLDERS)
+
+DATA_POLICY = f"""
+**Nothing you upload or type into this app is stored.** Your files exist on the
+server only while this tab is open, in a folder no other visitor can reach, and
+they are erased within about a minute of the tab closing. Nobody reads them, no
+copy is kept, nothing about them is logged, shared, sold, or used to train
+anything. The only lasting copy of anything is the zip you download yourself.
+
+**1. Who runs this.** A free, non-commercial hobby project, maintained by one
+private individual and published as a Hugging Face Space. The source is public
+under the GNU General Public License v2 at
+[github.com/DariuszKrych/Bookbinding_Signature_Creator_App]({REPOSITORY}), so
+every claim on this page can be checked against the code that makes it. For
+anything here — a question, a request, a copyright complaint — use the
+**Community** tab of this Space or open an issue on that repository. Where the
+GDPR or an equivalent law applies, the maintainer is the controller for the
+narrow technical processing described in section 2, and for nothing else.
+
+**2. What happens to a file you give it.** An upload is held in the Streamlit
+server's memory and written into a folder made for your session alone, named
+after your session id, under the host machine's temporary directory
+({SESSION_FOLDERS}). Books you type are kept as JSON drafts in the same place.
+Everything done to them is mechanical: pages are split down their
+own middle, re-ordered into signatures, stamped with page numbers, or typeset
+into a PDF. **No file is opened, read, indexed, scanned, analysed, sent anywhere,
+or looked at by a person.** There is no database, no object store, no backup, and
+no log of file names or of anything inside a file. A session may hold
+{workspace.human(workspace.LIMIT_BYTES)} in all, and a single uploaded PDF may be
+{workspace.human(workspace.MAX_UPLOAD_BYTES)}.
+
+**3. How long it lasts, and the legal basis for holding it at all.** Four ways it
+goes, three of them without you doing anything. A sweeper thread wakes every
+{workspace.SWEEP_SECONDS} seconds, asks which sessions still have a browser
+attached, and deletes the folder of every session that does not, after a
+{workspace.GRACE_SECONDS}-second grace period so a network blip cannot cost you a
+book. Everything the process created is removed when the process exits, so the
+Space going to sleep takes it all with it. A folder untouched for
+{workspace.ORPHAN_SECONDS // 60} minutes is removed anyway, in case neither of
+the first two can run. And **🗑 Delete my data now**, in the sidebar, erases the
+whole session immediately, at your word, with nothing to wait for. The lawful
+basis is Article 6(1)(b) — the processing *is* the service you asked for — there
+is no secondary purpose, and the retention period is the session and not one
+minute longer.
+
+**4. What is never collected.** No account, no sign-up, no name, no email
+address, no password, no payment details. No tracking, no advertising, no
+profiling, no behavioural analytics, and no automated decision-making of the kind
+Article 22 is about. This app sets no cookie of its own. The Streamlit framework
+sets one strictly necessary `_xsrf` cookie, which exists to stop another site
+forging requests to this one; a cookie strictly necessary to deliver a service
+the visitor has asked for requires no consent under the ePrivacy Directive, which
+is why there is no cookie banner and nothing here to consent to. Streamlit would
+otherwise send anonymous usage statistics of its own to Snowflake Inc. in the
+United States — that is its default, and it is **switched off here**
+(`gatherUsageStats = false` in `.streamlit/config.toml`), so no telemetry leaves
+this app about you or about anything you do in it.
+
+**5. What the maintainer does not control, and you should know about anyway.**
+Two things sit outside this app, and honesty about them is worth more than a
+clean-sounding promise:
+
+- **The host.** This runs as a Hugging Face Space, on Hugging Face's servers.
+  Independently of this app and under its own policy, Hugging Face records your
+  IP address, your session date and location, information about your device,
+  operating system and browser, and sets its own cookies. That data may be stored
+  and processed in the United States or any other country where Hugging Face or
+  its infrastructure providers keep facilities. It is theirs and not the
+  maintainer's: it cannot be read, corrected or deleted from inside this app, and
+  requests about it go to them. See the [Hugging Face Privacy
+  Policy](https://huggingface.co/privacy) and [Content
+  Policy](https://huggingface.co/content-policy). The maintainer can see the
+  aggregate visit count and the technical runtime logs the platform shows every
+  Space owner; neither carries anything out of your files.
+- **The network.** The page is served over HTTPS, but the connection between your
+  machine and the server crosses networks nobody here operates.
+
+**6. What you must not put into it.** By uploading or typing anything you confirm
+that it is yours or that you are otherwise entitled to use it this way. Do not
+put into this app: material you have no right to copy; personal data about other
+people, and in particular the special categories of Article 9 — health,
+biometrics, race, religion, politics, sex life, trade union membership — or data
+about criminal offences; anything confidential, classified or export-controlled;
+or anything unlawful. If you do put another person's personal data through it,
+**you** are the controller of that data and answerable for having a lawful basis
+for it. The maintainer acts only as your processor, only mechanically, only for
+the seconds the work takes, and keeps none of it.
+
+**7. Copyright.** Nothing is retained, so there is never a copy here to take
+down. If you believe this app has been used against your rights, tell the
+maintainer through the routes in section 1, or report the Space to Hugging Face
+under its content policy.
+
+**8. Your rights.** Where the GDPR or an equivalent law applies you have rights
+of access, rectification, erasure, restriction, portability and objection. In
+practice the maintainer holds no personal data about you whatsoever and has no
+way to identify you — Article 11 is explicit that a controller need not acquire
+extra information merely in order to identify someone. The two rights that do
+bite are on the
+page and take effect at once, with nobody to ask: **📤 Save my data** is
+portability, and **🗑 Delete my data now** is erasure. You may complain to the
+data protection authority of your own country. Rights over the data described in
+section 5 are exercised with Hugging Face, not here.
+
+**9. Given to nobody.** Nothing you provide is sold, rented, shared, disclosed or
+transferred to any third party, for any purpose, commercial or otherwise, and
+nothing is used to train any model. There is no analytics vendor, no advertiser
+and no processor beyond the host in section 5. Disclosure would arise only if a
+valid legal order compelled it, and by then there would be nothing left to
+disclose.
+
+**10. No warranty.** This app is provided free of charge, **as is and as
+available, without warranty of any kind**, express or implied, including any
+implied warranty of merchantability, fitness for a particular purpose and
+non-infringement — as set out in sections 11 and 12 of the GNU GPL v2 it is
+licensed under. It is a hobby tool for folding paper. It is not a professional,
+certified, archival or backup service, and must not be relied on as one.
+
+**11. Limitation of liability.** To the fullest extent permitted by law, the
+maintainer is not liable for any loss or damage arising out of or connected with
+this app, its output, or its unavailability: lost, corrupted or prematurely
+erased files, unsaved work, wrongly imposed or misprinted output, wasted paper,
+ink, materials or time, lost profits or business, or any indirect, incidental,
+special or consequential loss, whether or not the possibility of it was known.
+**Treat this as a tool that forgets everything, because it is one.** It may
+sleep, restart, be updated or be withdrawn at any moment, taking the session with
+it. Save your zip. Print one test signature before you print a whole book.
+Nothing in this notice excludes or limits any liability that cannot lawfully be
+excluded, including for death or personal injury caused by negligence, or for
+fraud.
+
+**12. Your responsibility.** You are responsible for your own use of this app and
+for whatever you put into it. To the extent the law allows, you will hold the
+maintainer harmless against any claim, demand, loss or cost brought by anyone
+else and arising from what you uploaded or typed, or from what you did with what
+came out.
+
+**13. Children.** This app is not directed at children, and nothing is knowingly
+collected from anyone, of any age.
+
+**14. Changes.** This notice changes as the app does. Whatever it says on the
+page in front of you is the version that governs the session you are in, and
+every earlier version is in the repository's history.
+
+**Using this app means accepting this notice.** If any of it does not suit you,
+run the app on your own machine instead — it behaves identically there, and the
+source is one clone away.
+"""
+
+st.divider()
+
+st.markdown("#### 🔒 Data policy")
+# Dated, because a policy without one cannot be told from the version it
+# replaced — and section 14 leans on the reader being able to see which they are
+# looking at. Update it when the words above change.
+st.caption(f"Last updated {POLICY_UPDATED}. Applies to both tabs.")
+st.markdown(DATA_POLICY)
 
 # --------------------------------------------------------------------------
 # Carrying the appearance choice out to the browser

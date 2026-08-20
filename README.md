@@ -185,15 +185,22 @@ spare.
 A per-file cap is not a cap either, because nothing stops the next file, so the total is
 enforced too — five places in all:
 
-- **Streamlit's own `maxUploadSize`** is 500 MB in `.streamlit/config.toml`. It is one number
-  for the whole app and it has to be the zip's, or a full session could never be loaded back.
-  It is a ceiling on one file, not the quota.
+- **Streamlit's own `maxUploadSize`** is 512 MB in `.streamlit/config.toml`. It is one number
+  for the whole app, it is a ceiling on one *file* rather than a quota, and it is set for the
+  largest file the app must accept: a data zip carrying a whole session. It sits 12 MB above
+  the session limit on purpose. Drafts are JSON and shrink to nothing, which is why a zip of a
+  lightly used session looks tiny beside the usage bar — but the bulk of a full session is PDF,
+  which is already compressed, so a zip of one comes back *larger* than the session, not
+  smaller: 500 MB of incompressible content measures 500.2 MB zipped in a few large files and
+  505.7 MB spread over four thousand small ones. At a ceiling of exactly 500 MB the browser
+  could refuse the zip the app had just written.
 - **The 100 MB book cap** is therefore enforced in `app.py`, on the bytes as they arrive,
   since no config option can scope Streamlit's ceiling to one uploader. For the same reason
-  the dropzone's own "Limit 500 MB per file" line would be wrong under the book uploader, so
-  that uploader sits in a keyed container and a style block replaces the line with the real
-  figure. The label, the help and a caption all name 100 MB as well — if that selector ever
-  stops matching, the true limit is still on the page three times.
+  the figure the dropzone prints ("500MB per file") is wrong under *both* uploaders — not the
+  limit at all under the book one, and a true statement about the wrong quantity under the zip
+  one, whose real rule is what the zip unpacks to. Each uploader sits in a keyed container and
+  a style block replaces its line with the rule that uploader actually enforces: `100MB per
+  file • PDF`, and `Must fit the 500 MB session • ZIP`.
 - **Before an upload**, where the sizes are known: the free space is counted down file by
   file as they are written, so three files that would each have fitted the space that was
   free before any of them was written do not all get written. What is refused is named in the
@@ -235,8 +242,9 @@ function that writes a file.
 One session may hold 500 MB and one book PDF may be 100 MB; see
 [How much one session may hold](#how-much-one-session-may-hold). Changing the session figure
 means changing `LIMIT_BYTES` in `Script/workspace.py` **and** `server.maxUploadSize` in
-`.streamlit/config.toml`, which must stay equal — the first is the quota, the second is what
-lets a full data zip through the browser. The per-book figure is `MAX_UPLOAD_BYTES` alone.
+`.streamlit/config.toml`, which must stay comfortably *above* it — the first is the quota,
+the second is what lets a full data zip back through the browser, and a zip of a full session
+is not smaller than the session. The per-book figure is `MAX_UPLOAD_BYTES` alone.
 
 ### The headless CLI
 

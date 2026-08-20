@@ -21,22 +21,69 @@
 [client]
 toolbarMode = "minimal"
 
+# --------------------------------------------------------------------------
+# No telemetry
+# --------------------------------------------------------------------------
+# Streamlit gathers anonymous usage statistics by default — `gatherUsageStats`
+# ships as `true` — and sends them to Snowflake, in the United States, through
+# Segment. It carries nothing out of an app's content: not the text, not the
+# files, not the books. It is the framework counting which of its own commands
+# get called, from an installation id it keeps in `~/.streamlit/machine_id_v4`.
+#
+# It goes anyway, and the reason is the same one the whole of
+# `Script/workspace.py` exists for. The data policy at the foot of the page says
+# that nothing leaves this app and that there is no analytics vendor in the
+# picture. A footnote conceding "except for the framework's own" would be an
+# accurate sentence and a worse promise: the point of the position is that a
+# visitor need not read a policy to work out what is being sent about them,
+# because the answer is nothing.
+#
+# This is the switch itself, not a request to be left alone. In streamlit 1.59
+# the option gates the collection at source (`runtime/metrics_util.py`: no
+# tracking without `ctx.gather_usage_stats`, and no `machine_id_v4` file
+# written at all) and is handed to the browser in the NewSession message
+# (`runtime/app_session.py`), which is what stops the frontend's own call. Setting
+# it here by hand also suppresses the "Collecting usage statistics. To
+# deactivate…" line and the email prompt Streamlit shows on a first run
+# (`runtime/credentials.py`).
+[browser]
+gatherUsageStats = false
+
 [server]
 # Streamlit has one upload ceiling for the whole app, and this app has two
-# uploads that want different ones: a data zip may be a whole session's 500 MB,
-# while a single book PDF is capped at 100 MB (`MAX_UPLOAD_BYTES` in
-# Script/workspace.py) so that uploading one book cannot fill the session it
-# then has to be converted inside.
+# uploads that want different ones: a data zip carrying a whole session, and a
+# single book PDF, capped at 100 MB (`MAX_UPLOAD_BYTES` in Script/workspace.py)
+# so that uploading one book cannot fill the session it then has to be converted
+# inside. So this is set for the larger of the two, and the PDF cap is enforced
+# in `app.py` instead, on the bytes as they arrive.
 #
-# So this is set to the larger of the two — it has to be, or the zip could not
-# be loaded — and the PDF cap is enforced in `app.py` instead, on the bytes as
-# they arrive. The dropzone's own "Limit …" line would read 500 MB for both, so
-# the PDF uploader is wrapped in a keyed container and that line is replaced
-# with the real figure; see the style block in app.py.
+# It is 12 MB above the session limit rather than equal to it, and that margin
+# is the whole point of the number.
+#
+# This is a ceiling on the size of one *file*. The session limit is 500 MB of
+# unpacked bytes on disk. Those are not the same quantity, and zipping does not
+# close the gap in the direction anyone expects. Drafts are JSON and shrink to
+# almost nothing, which is what makes a zip of a *lightly used* session look
+# tiny beside the usage bar — but the bulk of a full session is PDF, which is
+# already compressed internally, so deflate hands back what it was given and the
+# zip's own per-entry headers then add on top. Measured: 500 MB of
+# incompressible content packs to 500.2 MB in a handful of large files, and to
+# 505.7 MB spread over four thousand small ones (~119 bytes of headers each).
+#
+# So a full session zips to *more* than 500 MB, not less, and at a ceiling of
+# exactly 500 the browser would refuse the zip the app itself had just written,
+# with the visitor's whole session in it. That is the bug this margin closes.
+# 512 clears the measured worst case by 6 MB and is only reachable past roughly
+# a hundred thousand entries, which the 500 MB quota makes absurd.
+#
+# Nobody does see it. Streamlit prints this figure under both dropzones, and
+# under both it would be answering a question nobody asked — the book uploader's
+# real limit is 100 MB, and what decides a zip is not its size but what it
+# unpacks to. Both lines are replaced in the style block at the top of app.py.
 #
 # Neither number is a quota. What stops a hundred small files adding up to more
 # than one session may keep is `workspace.guard`.
-maxUploadSize = 500
+maxUploadSize = 512
 
 # No source-file watcher. Its only visible output is the "File change. Rerun /
 # Always rerun" prompt in the header — a developer's control, offered to someone
