@@ -3,10 +3,8 @@ title: Bookbinding Signature Creator
 emoji: 📖
 colorFrom: green
 colorTo: gray
-sdk: streamlit
-app_file: app.py
-pinned: false
-license: gpl-2.0
+sdk: docker
+app_port: 8501
 ---
 
 # Bookbinding_Signature_Creator
