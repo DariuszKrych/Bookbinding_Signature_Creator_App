@@ -25,7 +25,7 @@
 >
 > **Nothing is stored.** Your books exist on the server only while the tab is open. The one copy that lasts is the zip you download yourself.
 
-I built it because I wanted signatures for twelve books for a bookbinding hobby, and writing the tool looked like more fun than folding by trial and error. It ended up saving me the time too.
+I built it because I wanted to print signatures for a series of nine books for a bookbinding hobby, and writing the tool looked like more enjoyable than manually setting up the signature format for the mountain of pages which those nine books come to. It was fun and ended up saving me the time too.
 
 ---
 
@@ -80,7 +80,7 @@ flowchart LR
         M --> S["Streamlit :8501"]
         S --> W["Per-session temp workspace<br/><i>swept when the tab closes</i>"]
     end
-    K["⏱ cron-job.org<br/>every 14 min"] -->|"GET /_stcore/health"| S
+    K["⏱ cron-job.org<br/>every 10 min"] -->|"GET /_stcore/health"| S
     V["🌐 Visitor"] -->|HTTPS| S
 ```
 
@@ -115,7 +115,7 @@ Streamlit defaults to port **8501**, and the Render environment variable `PORT=8
 
 Render spins free Docker instances down after **15 minutes** of inactivity, which means the next visitor waits through a cold start. To keep the app instantly responsive:
 
-- An automated **cron job (cron-job.org)** sends an HTTP `GET` every **14 minutes**.
+- An automated **cron job (cron-job.org)** sends an HTTP `GET` every **10 minutes**.
 - **The optimization:** the ping targets Streamlit's hidden diagnostic endpoint **`/_stcore/health`** rather than the main URL. That registers as active web traffic to Render *without* forcing Streamlit to execute the Python script or render the UI — which conserves the container's **512 MB RAM** limit.
 - **Quota management:** the strategy consumes **~744 instance-hours per month**, fitting inside Render's **750 free monthly hours** with deliberate headroom.
 
