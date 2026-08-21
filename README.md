@@ -39,7 +39,7 @@ I built it because I wanted to print signatures for a series of nine books for a
 
 Upload a 2-column book PDF. Pick the paper you'll actually load in the printer. Get back one PDF per signature plus a `print_instructions.txt` recording the paper size, scaling and duplex setting used — all as a single zip, in print order.
 
-Books that aren't numbered yet can be **page-numbered first**, as a separate step that leaves the original untouched.
+Books that aren't numbered yet can be **page-numbered first**, as a separate step that leaves the original untouched. 
 
 </td>
 <td width="50%" valign="top">
