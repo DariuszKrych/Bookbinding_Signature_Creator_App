@@ -5,10 +5,10 @@ FROM mambaorg/micromamba:1.5.8
 WORKDIR /app
 
 # Copy the lock file and ensure the correct user owns it
-COPY --chown=$MAMBA_USER:$MAMBA_USER conda-linux-64.lock .
+COPY --chown=$MAMBA_USER:$MAMBA_USER conda-lock.yml .
 
 # Install the exact environment and clean up cache to save space
-RUN micromamba install -y -n base -f conda-linux-64.lock && \
+RUN micromamba install --name base --yes --file conda-lock.yml && \
     micromamba clean --all --yes
 
 # Copy the rest of your app code and give ownership to mambauser
