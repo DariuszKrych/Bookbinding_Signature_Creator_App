@@ -25,7 +25,7 @@
 >
 > **Nothing is stored.** Your books exist on the server only while the tab is open. The one copy that lasts is the zip you download yourself.
 
-I built it because I wanted to print signatures for a series of nine books for a bookbinding hobby, and writing the tool looked like more enjoyable than manually setting up the signature format for the mountain of pages which those nine books come to. It was fun and ended up saving me the time too.
+I built it because I wanted to print signatures for a series of nine books for a bookbinding hobby, and writing the tool is more enjoyable than manually setting up the signature format for the mountain of pages which those nine books come to. It was fun and ended up saving me some time too.
 
 ---
 
