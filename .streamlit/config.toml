@@ -21,6 +21,24 @@
 [client]
 toolbarMode = "minimal"
 
+# No traceback is ever drawn on the page.
+#
+# Streamlit's default is to print an uncaught exception, with its source lines,
+# straight into the browser. That is the right default for somebody debugging on
+# their own machine and the wrong one for a public URL: this app now holds an
+# OpenRouter key in its environment, and a traceback is exactly the kind of thing
+# that carries request context out of a process by accident.
+#
+# `Script/ai_book.py` scrubs anything key-shaped out of the messages it raises,
+# and never lets the client's own exception escape, so this is the second of two
+# locks rather than the only one. It costs nothing that matters: every failure a
+# visitor is meant to see is written by `finish()` as an ordinary `st.error`, and
+# those are unaffected.
+#
+# Set this back to "full" while working on the app itself, the same way
+# `fileWatcherType` below wants setting back to "auto".
+showErrorDetails = "none"
+
 # --------------------------------------------------------------------------
 # No telemetry
 # --------------------------------------------------------------------------

@@ -135,14 +135,34 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+#
+# The OpenRouter API key lives in `.env` and must never reach this repository,
+# which is public. The bare `.env` that ships with GitHub's Python template is
+# not enough on its own: it matches that one exact name, so an ordinary
+# `cp .env .env.local` while debugging would be a committed key. Everything that
+# looks like an environment file is ignored below, and `.env.example` — which
+# holds names and no values — is the single deliberate exception.
+#
+# Nothing here is what keeps the key safe in production. The deployed app never
+# has a `.env` at all: Render injects the key as an environment variable at run
+# time, separately from the git pull. See `.env.example` and `Script/ai_config.py`.
 .env
+.env.*
+*.env
+!.env.example
 .envrc
+.envrc.local
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Streamlit's own secrets file. Unused here — the key comes from the
+# environment — but a stray one would be just as public as a `.env`.
+.streamlit/secrets.toml
+secrets.toml
 
 # Spyder project settings
 .spyderproject

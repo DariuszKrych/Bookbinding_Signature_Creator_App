@@ -93,6 +93,9 @@ ARMED_ACTION = "book_armed_action"
 # See `_auto_box`; these hold "still following" for each.
 FILE_NAME_AUTO = "book_file_name_follows"
 DRAFT_NAME_AUTO = "book_draft_name_follows"
+# A book the AI wrote, waiting for the next run to put it on screen. See
+# `hand_over` and `collect`.
+GENERATED = "book_generated"
 
 FIELD_PREFIX = "bk-"
 LENGTH_PREFIX = "bk-len-"
@@ -230,6 +233,62 @@ def mark_saved(book, path, name):
     st.session_state[DRAFT_PATH] = str(path)
     st.session_state[DRAFT_NAME] = name
     st.session_state[SAVED_JSON] = book.to_json()
+
+
+def keep_current_as_draft(folder):
+    """Write whatever is in the editor to a draft of its own. Returns its name.
+
+    Called before something replaces the book on screen — at present, the AI
+    writer. Returns `""` only when there was genuinely nothing there: an empty
+    book. A book already on disk and unchanged needs no writing, but its name
+    comes back anyway, because the caller uses this to tell the user where the
+    book they were looking at has gone — and "it is already in the drafts list
+    as X" is the answer in that case too.
+
+    It never writes over an existing draft, because `unique_draft_name` walks the
+    name on to "My book 2" first, and `save_draft` writes through a temporary
+    file and a rename — so this is safe to do immediately before an operation
+    that might fail half way. A saved book with unsaved edits therefore lands
+    beside its saved copy rather than on top of it.
+
+    `mark_saved` is deliberately *not* called: the book being kept is about to
+    stop being the book on screen, so recording it as the open draft would leave
+    the editor pointing at a file the next thing to arrive has nothing to do with.
+    """
+    book = manuscript()
+    if not book.has_content():
+        return ""
+    if not is_unsaved() and not is_dirty(book):
+        return draft_name_of(draft_path())
+    wanted = st.session_state.get(DRAFT_NAME) or book.display_title
+    return draft_name_of(save_draft(folder, book, unique_draft_name(folder, wanted)))
+
+
+def hand_over(book):
+    """Leave a freshly written book for the next run to put on screen.
+
+    The job runner cannot call `adopt` itself. By the time it runs, every `bk-`
+    widget for the book being replaced has already been drawn this run, and
+    `adopt` deletes exactly those keys — changing a widget's state after it has
+    been instantiated is the one thing Streamlit will not have. So the runner
+    leaves the book here, `finish()` reruns, and `collect()` installs it at the
+    top of the next run, before a single box exists.
+    """
+    st.session_state[GENERATED] = book
+
+
+def collect():
+    """Put a handed-over book on screen. Returns whether there was one.
+
+    Must be called before anything draws a `bk-` widget.
+    """
+    book = st.session_state.pop(GENERATED, None)
+    if book is None:
+        return False
+    # `path=None`: the book arrives having never been saved, so autosave cannot
+    # write it over the draft that was just kept for the user.
+    adopt(book, path=None, name=book.title.strip())
+    return True
 
 
 # --------------------------------------------------------------------------

@@ -1,0 +1,56 @@
+# What must never be built into the image.
+#
+# The Dockerfile ends in `COPY . .`, so without this file every secret sitting in
+# the working directory becomes a layer of a public image — and a layer survives
+# deleting the file in a later one. The key is the reason this file exists.
+#
+# The deployed app does not need `.env`: Render supplies OPENROUTER_API_KEY as an
+# environment variable at run time. Nothing below is required for the app to run.
+
+# Secrets. First, and the whole point.
+.env
+.env.*
+*.env
+!.env.example
+.envrc
+.envrc.local
+.streamlit/secrets.toml
+secrets.toml
+
+# History, which can hold a secret even when the working tree does not.
+.git
+.gitignore
+.gitattributes
+
+# Local environments and caches — big, and never the ones the image installs.
+.venv
+venv/
+ENV/
+__pycache__/
+**/__pycache__/
+*.py[codz]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editor and tooling state.
+.idea/
+.vscode/
+.claude/
+*.log
+
+# Tests do not run in the container, and neither does the headless CLI's scratch
+# space. The four working folders are made per session under the system temp
+# directory (see Script/workspace.py), so any copy of them here is stale.
+Script/test_*.py
+Input/
+Output/
+Previously_Converted/
+Manuscripts/
+*.book.json
+
+# Documentation and packaging that the running app never reads.
+README.md
+LICENSE
+Dockerfile
+.dockerignore

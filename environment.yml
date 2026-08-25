@@ -12,3 +12,8 @@ dependencies:
     - pillow==12.3.0
     - reportlab==5.0.0
     - watchdog==6.0.0
+    # Writing a book with a model. Both are optional at run time: with neither
+    # installed the app starts and the AI button is drawn switched off, because
+    # Script/ai_book.py imports langchain only inside the call that needs it.
+    - langchain-openai==1.6.0
+    - python-dotenv==1.2.3

@@ -12,7 +12,7 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.59-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![Docker](https://img.shields.io/badge/Docker-micromamba-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Render](https://img.shields.io/badge/Render-deployed-46E3B7?logo=render&logoColor=black)](https://render.com/)
-[![Tests](https://img.shields.io/badge/tests-247-brightgreen)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-355-brightgreen)](#-testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 **[▶ Open the live app](https://bookbinding-signature-creator.onrender.com)** · [What it does](#-what-it-does) · [Architecture](#-deployment--architecture) · [Engineering notes](#-engineering-highlights) · [Run it locally](#-run-it-yourself)
@@ -23,7 +23,7 @@
 
 > **The short version.** Hand-binding a book means printing it as *signatures* — small stacks of sheets, each printed double-sided, folded once and nested inside one another. Getting the page order right by hand is tedious and easy to ruin. This app does the imposition for you, on any paper a printer will accept, and hands back one zip per book in print order.
 >
-> **Nothing is stored.** Your books exist on the server only while the tab is open. The one copy that lasts is the zip you download yourself.
+> **Nothing is stored.** Your books exist on the server only while the tab is open. The one copy that lasts is the zip you download yourself. The single thing that ever leaves the server is the description you type into the AI box, and only when you press that button — [what that involves](#-the-ai-writer-and-where-its-key-lives).
 
 I built it because I wanted to print signatures for a series of nine books for a bookbinding hobby, and writing the tool is more enjoyable than manually setting up the signature format for the mountain of pages which those nine books come to. It was fun and ended up saving me some time too.
 
@@ -54,14 +54,22 @@ Type a book straight into the browser — title, author, dedication, chapters, a
 </tr>
 </table>
 
+### 🤖 Or have one written
+
+A one-line description — *"a warm, plain-English beginner's guide to hand bookbinding, eight short chapters"* — fills the editor in with a whole book, which you then edit like anything else you typed. Optional, off unless a key is configured, and it writes the **words only**: your page size, type and margins are left exactly as you set them. [How it works, and where its key lives.](#-the-ai-writer-and-where-its-key-lives)
+
 ```mermaid
 flowchart LR
-    A["📤 Upload a<br/>2-column PDF"] --> C
     B["✍️ Type a book<br/>in the editor"] --> T["typesetting.py<br/><i>sets the type at final size</i>"]
+    G["🤖 Describe a book"] --> AI["ai_book.py<br/><i>outline, then chapters</i>"]
+    AI --> B
+    A["📤 Upload a<br/>2-column PDF"] --> C
     T --> C["print_formatting.py<br/><b>imposition</b>"]
     C --> D["📄 One PDF per signature<br/>+ print_instructions.txt"]
     D --> E["⬇️ One zip,<br/>in print order"]
 ```
+
+The AI writer joins at the *editor*, not at the pipeline: it produces a `Manuscript`, the same object the editor already holds, so everything downstream of it is code that was already there and already tested.
 
 The bridge between the two halves is deliberately narrow: the editor writes an **ordinary input PDF**, and from that moment a typed book is indistinguishable from one that came from anywhere else. There is no second pipeline to keep in step with the first.
 
@@ -93,6 +101,8 @@ flowchart LR
 | **Dependency locking** | [`conda-lock.yml`](./conda-lock.yml) | Targeted at **`linux-64`** for exact cross-platform reproducibility — and to pin Streamlit, so an unpinned upgrade cannot break the custom GUI CSS classes the interface relies on. |
 | **Container** | [`mambaorg/micromamba:1.5.8`](./Dockerfile) | A specific, locked base image rather than a floating tag. |
 | **Host** | Render (free tier, Docker) | 24/7 public URL from a container built straight out of the repo. |
+| **AI writing** | LangChain → OpenRouter (`openrouter/free`) | Optional and off without a key. A router rather than a named model, so a retired free model needs no code change. [Details below.](#-the-ai-writer-and-where-its-key-lives) |
+| **Secrets** | Render environment variables | The key is never in the repo and never in the image; `.env` is for local use only. |
 
 ### Docker configuration
 
@@ -121,6 +131,93 @@ Render spins free Docker instances down after **15 minutes** of inactivity, whic
 
 > The app behaves identically wherever it runs. There is no "local mode" and no "hosted mode", because a rule that only applies when deployed is a rule nobody has tested — `streamlit run app.py` on your own machine gives you the same ephemeral session folder that the container does.
 
+### 🤖 The AI writer, and where its key lives
+
+**🤖 Generate book for printing with AI** takes a one-line description and fills the writing view in with a whole book: title, author, dedication and every chapter. It asks for an outline first, then one chapter at a time — a whole book in a single request runs past a free model's output cap and comes back as truncated JSON, which is not a short book but a broken one.
+
+All of it is in [`Script/ai_book.py`](./Script/ai_book.py), which imports LangChain and nothing from Streamlit, and [`Script/ai_config.py`](./Script/ai_config.py).
+
+**It is optional.** With no key set, the button is drawn switched off with a line explaining why, and the rest of the app is untouched. The LangChain import happens *inside* the call that needs it, so a machine without `langchain-openai` installed still runs the whole app — the test suite is proof, since it never installs it.
+
+**The model is `openrouter/free`, and that is not a model.** It is OpenRouter's free-model router: it costs nothing, and it filters the free pool down to models that support what the request needs — here, structured JSON output. Naming one model instead would mean editing this repo every time a free model is retired. It selects at random per request, so the outline and the style note are sent with *every* chapter to hold the voice together.
+
+#### Setting the key on Render
+
+**The key is not part of the deploy.** This is the thing worth getting straight: Render pulls the code from GitHub, but it reads the key from its *own* settings, which live in Render and never touch the repository. The two are entirely separate paths into the container. You set the key once, by hand, and every future `git push` picks it up without you doing anything.
+
+```mermaid
+flowchart LR
+    D["💻 Your machine<br/><code>.env</code><br/><i>git-ignored</i>"] -.->|"never pushed"| G
+    G["📦 GitHub<br/><i>public repo</i>"] -->|"auto-deploy on push"| R
+    K["🔑 Render → Environment<br/><code>OPENROUTER_API_KEY</code><br/><i>set once, by hand</i>"] -->|"injected at run time"| R
+    R["🐳 Render container<br/><code>os.environ</code>"]
+```
+
+**Do this once:**
+
+1. Get a key at **[openrouter.ai/keys](https://openrouter.ai/keys)**. Make it a key used by nothing else, and **set a credit limit on it** while you are there.
+2. Open your service in the **[Render dashboard](https://dashboard.render.com)** → **Environment** in the left-hand menu.
+3. **Add Environment Variable**:
+   - **Key:** `OPENROUTER_API_KEY`
+   - **Value:** your key
+4. **Save Changes.** Render redeploys on its own — the variable change *is* a deploy trigger, so you do not need to push anything to activate it.
+
+That is the whole setup. `OPENROUTER_MODEL` and the rest have working defaults; add them only to override. Environment variables persist across deploys, so pushing to GitHub afterwards never clears or re-asks for the key.
+
+> **Use "Environment Variables", never "Secret Files" or a Docker build argument.** A build argument is recorded in the image history and can be read straight back out of the image. `.env` is for your own machine only and is both git-ignored and Docker-ignored.
+
+**Nothing about `[skip render]` changes any of this.** That only tells Render not to rebuild for a given commit; it has no bearing on the key, which is already sitting in the environment either way.
+
+#### Checking it worked
+
+Open the app after the deploy finishes. The button under the title tells you which state you are in, without needing the logs:
+
+| What you see | What it means |
+| --- | --- |
+| **🤖 Generate book for printing with AI** is clickable once you type a description | The key arrived. Done. |
+| Button greyed out, caption reads *"…No `OPENROUTER_API_KEY` is set…"* | The variable is missing or misnamed. Check the spelling in Render — it is case-sensitive. |
+| Button greyed out, caption mentions **langchain-openai** | The key is fine but the image is stale. Redeploy with **Clear build cache**, since `conda-lock.yml` changed. |
+| *"…is not a free model, and this copy is set to free models only"* | You set `OPENROUTER_MODEL` to something paid. Remove it, or use a `:free` model. |
+
+#### Every setting
+
+All optional except the key, all read from the environment, all documented in [`.env.example`](./.env.example). A bad number falls back to its default rather than taking the app down.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `OPENROUTER_API_KEY` | *(none)* | The key. Empty or unset switches the button off; everything else still works. |
+| `OPENROUTER_MODEL` | `openrouter/free` | The free-model router. A specific `:free` model works too. |
+| `OPENROUTER_FREE_ONLY` | `1` | Refuse anything that could be charged for, before any request is made. Leave this on. |
+| `OPENROUTER_APP_TITLE` | `Bookbinding Signature Creator` | The `X-Title` header — how OpenRouter's dashboard labels this app's traffic. Identifies the app, never the visitor. |
+| `AI_CALL_TIMEOUT_SECONDS` | `90` | How long one request may take. |
+| `AI_TOTAL_BUDGET_SECONDS` | `420` | How long a whole book may take before it gives up, keeping the chapters already written. |
+| `AI_MAX_CHAPTERS` | `10` | The most chapters asked for, whatever the description says. Each is one more request against a rationed free tier. |
+
+#### Why it cannot leak
+
+The repository is public and so is the deployed URL, so the key is never in either. `load_dotenv(..., override=False)` means that even if a `.env` somehow reached a server, it could not shadow the key that server was configured with — there is a test for exactly that.
+
+What stops it leaking, in order of how much each one matters:
+
+1. **[`.dockerignore`](./.dockerignore)** — the `Dockerfile` ends in `COPY . .`, so without it a local `.env` would be baked into a layer of a public image, and a layer survives being deleted in a later one.
+2. **[`.gitignore`](./.gitignore)** covers `.env`, `.env.*` and `*.env`, not just the one exact name the GitHub template ships with — a routine `cp .env .env.local` while debugging is otherwise a committed key.
+3. The key is **read from the environment, used and dropped**. Never in `st.session_state`, never on a module global, never on a `Manuscript` — that last one matters because **📤 Save my data** zips the drafts folder and hands it to the browser.
+4. Every error is re-raised **scrubbed**, matching both the configured key and the `sk-or-v1-…` shape, and raised outside the `except` block so the original is not even reachable as `__context__`.
+5. `showErrorDetails = "none"` — no traceback is ever drawn on a public page.
+6. **Free models only.** A model that is not `openrouter/free` or `:free` is refused *before the client is constructed*, so a typo in a Render environment variable is a sentence on the page rather than a charge on the account.
+
+**Do these two things on openrouter.ai, because no code here can:** use a key dedicated to this app, and **set a credit limit on it**. With `:free` models and a limit, the worst a stranger clicking the button repeatedly can achieve is exhausting a rate limit.
+
+To confirm the key was never committed, and that it is not in the image:
+
+```bash
+git check-ignore -v .env          # must print the .gitignore rule that catches it
+git log --all --oneline -- .env   # must print nothing at all
+docker build -t bsc . && docker run --rm bsc ls -a /app   # must not list .env
+```
+
+If it ever *did* reach a commit, rotate the key rather than trying to rewrite history — a pushed secret should be treated as burned.
+
 ---
 
 ## 🧠 Engineering highlights
@@ -146,7 +243,7 @@ A sheet is folded across its width, so one sheet of *W × H* gives four book pag
 
 **🧪 Tests that refuse to mark their own homework**
 
-247 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, and derive expected coordinates by hand rather than importing them from the code under test. [Details below.](#-testing)
+355 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, derive expected coordinates by hand rather than importing them from the code under test, and feed the AI writer the malformed JSON free models really send. [Details below.](#-testing)
 
 </td></tr>
 <tr><td>
@@ -193,6 +290,12 @@ docker run -p 8501:8501 bookbinding
 conda env create -f environment.yml     # or: micromamba create -f environment.yml
 conda activate BookBinding
 streamlit run app.py
+```
+
+To use the AI writer locally, add a key. Skip this and everything else still works — the button is simply drawn switched off.
+
+```bash
+cp .env.example .env      # then put your OpenRouter key in it
 ```
 
 <details>
@@ -332,6 +435,20 @@ The copyright page is printed only once one of the **Publication details** (publ
 
 Five typefaces are available: Times, Helvetica, Courier, Bitstream Vera, and the app's own Baskervville, which comes in one weight, so bold and italic are set in the regular face. Characters no typeface here can set (Greek, Cyrillic, CJK) are reported rather than silently dropped.
 
+#### Having one written for you
+
+The **🤖 Generate book for printing with AI** button sits above both tabs, so it is there whichever one you are on. Describe the book in the box beside it — subject, length, voice, who it is for — and press it. It moves you to the writing tab, writes a title, an author, a dedication and every chapter, and fills the boxes in. From that moment it is an ordinary unsaved draft: edit it, save it, build it, convert it.
+
+Three things worth knowing:
+
+- **Whatever was in the editor is kept first.** If it was already saved, it stays where it is; if it had unsaved words, they go to a draft of their own beside it. The banner afterwards tells you which draft to look for. Nothing you typed is the price of pressing the button.
+- **It writes the words only.** Page size, typeface, margins, spacing and every other design choice are left exactly as you set them.
+- **Treat the description box as public**, because it is the one thing on the page that leaves the server. It goes to a free model, and providers of free models may keep and train on what they are sent. Describe a book in it and nothing else — [the data policy](#-your-data-in-and-out-as-one-zip) is explicit about this.
+
+What comes back is a **draft, not a finished book**. A model invents: it can be confidently wrong, and it can land close to something it was trained on. Read it before you print it, and read it properly before you publish it.
+
+If the button is greyed out, this copy has no key configured — see [the AI writer](#-the-ai-writer-and-where-its-key-lives). Everything else works exactly the same without it.
+
 #### Keeping your progress
 
 Drafts are one JSON file each, named after the draft, and kept for the session only. Save as many as you like and switch between them; **Autosave** keeps writing to the open draft as you type once it has been saved once. Saving goes through a temporary file and a rename, so a crash part way cannot leave a half-written draft on top of the one it replaced. Anything that would throw away unsaved words asks first.
@@ -382,6 +499,8 @@ One Streamlit reflex survives all of this: pressing **R** outside a text field r
 
 That is a position, not an accident of hosting. Whatever somebody uploads is theirs, and the way not to be answerable for it is not to keep it.
 
+**The one exception, stated plainly:** pressing **🤖 Generate book for printing with AI** sends the sentence you typed in its box — and nothing else from your session — to OpenRouter. Never press it and nothing you do here ever leaves the server. The app's own data policy, rendered at the foot of every page, says the same thing in more detail and is worth reading before you use that button.
+
 At the very top of the sidebar sit the controls that make that workable:
 
 | Control | What it does |
@@ -412,7 +531,9 @@ Three overlapping guarantees take it away again, because one would be a single p
 - **Shutdown.** Everything the process created is removed when it exits, so an instance going to sleep takes the files with it.
 - **The orphan sweep.** If the runtime cannot be read at all, a folder untouched for an hour is removed anyway. Not being able to tell which sessions are live never means "delete everything" — that would erase somebody mid-sentence — so it falls back to age instead.
 
-Uploaded bytes themselves live in Streamlit's in-memory uploaded-file manager and go with the session. Nothing is logged, copied elsewhere, or sent anywhere. Streamlit's own anonymous usage statistics are switched off (`gatherUsageStats = false`), so no telemetry leaves the app either.
+Uploaded bytes themselves live in Streamlit's in-memory uploaded-file manager and go with the session. Nothing is logged or copied elsewhere. Streamlit's own anonymous usage statistics are switched off (`gatherUsageStats = false`), so no telemetry leaves the app either.
+
+Nothing in a session is sent anywhere, with exactly one exception, which is opt-in by being a button: the description typed into the AI box. **No file, no draft, no manuscript and no file name is ever part of that request** — `ai_book.write_book` takes a string and a `Design`, so there is no argument through which a book could be passed to it. That is a property of the signature rather than a promise in a comment.
 
 </details>
 
@@ -473,10 +594,11 @@ Books rarely divide evenly into signatures. The last signature shrinks to the fe
 ## 🧪 Testing
 
 ```bash
-python -m unittest Script.test_imposition Script.test_manuscript Script.test_editor -v
+python -m unittest Script.test_imposition Script.test_manuscript Script.test_editor \
+                   Script.test_ai_book Script.test_ai_editor -v
 ```
 
-**247 tests across three modules**, and they go out of their way not to mark their own homework:
+**355 tests across five modules**, and they go out of their way not to mark their own homework:
 
 - The sheet layout is derived by **simulating the physical fold**, independently of the production formula.
 - The page-size tests build a real PDF, run the real conversion, and then **read back out of the finished file where the ink actually landed** — including a small PDF interpreter that tracks the clipping path, because "did this column reach the paper" is a question text extraction cannot answer.
@@ -492,6 +614,10 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
 - The erasure rules are tested **as rules, not as timings**: a session still on screen survives a sweep, one whose browser has gone does not, and a runtime that cannot be read must never delete a live session — not knowing has to fall back to age, or a bug there would take somebody's book mid-sentence.
 - The size limit is driven through the real app against a real conversion: a job is allowed to start and then refused part way, and what has to be true afterwards is that the staging folder is gone, the half-made book is not offered as something to print, and the input PDF was not archived as if it had converted.
 - The command line is driven for real too, `main.main([...])` against a redirected set of folders, because it is the half of the app with no interface to notice a break.
+- The AI writer is tested **against a model that lies**. No test touches the network: `ai_book._make_chat` is the one place a client is built, so replacing it replaces the outside world. The replies it is fed are the ones free models really send — a JSON object wrapped in a code fence, prefaced with "Certainly!", containing a `}` inside a sentence, or with a real newline in the middle of a paragraph — and each has a test named after it.
+- The key is treated as the thing most worth losing. It must not survive a trip through an error message, must not appear in any session-state value, and must not be reachable as an exception's `__context__` — `raise ... from None` only stops Python *printing* the original, so the scrubbed error is raised outside the `except` block instead. A final test sweeps every committable file in the repository for anything key-shaped, which is why the fake keys in the tests are assembled at runtime rather than written out.
+- Refusing to spend money is asserted at the point before it could be spent: a paid model raises **and the client is never even constructed**.
+- The data policy is tested like code. It has to name OpenRouter, say the sending happens only on that button, admit that free-model providers may train on what is sent, warn that the writing is invented, and name the host the app actually runs on — that last one caught two stale "Hugging Face" references left over from an earlier deployment.
 
 ---
 
@@ -505,21 +631,27 @@ Bookbinding_Signature_Creator_App/
 ├── conda-lock.yml               Pinned linux-64 environment (the deploy source of truth)
 ├── environment.yml              Human-facing env spec
 ├── requirements.txt             Fully resolved pip pins
-├── .streamlit/config.toml       Theme, toolbar mode, upload ceiling, telemetry off
+├── .env.example                 AI settings, with no key in it — copy to .env locally
+├── .dockerignore                Keeps .env and .git out of the image
+├── .streamlit/config.toml       Theme, toolbar mode, upload ceiling, telemetry off, no tracebacks
 └── Script/
     ├── print_formatting.py      Imposition: source pages → signatures, folios
     ├── typesetting.py           Manuscript → 2-column PDF, at final size
     ├── manuscript.py            Book model, section kinds, drafts (JSON)
     ├── book_editor.py           The writing tab
+    ├── ai_book.py               The only file that knows what a language model is
+    ├── ai_config.py             Where the AI settings and the key come from
     ├── paper_sizes.py           Sheet and book-page catalogues, unit parsing
     ├── workspace.py             Per-session temp workspace, sweeper, quotas
     ├── Baskervville-Regular.ttf The app's own typeface
     ├── test_imposition.py       ~1,400 lines
     ├── test_manuscript.py       ~840 lines
-    └── test_editor.py           ~1,320 lines
+    ├── test_editor.py           ~1,320 lines
+    ├── test_ai_book.py          ~530 lines
+    └── test_ai_editor.py        ~330 lines
 ```
 
-Roughly **6,800 lines of application code** and **3,600 lines of tests**.
+Roughly **7,700 lines of application code** and **4,400 lines of tests**.
 
 ---
 

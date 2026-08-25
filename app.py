@@ -29,7 +29,7 @@ from main import (
     printing_steps,
     typeset_book,
 )
-from Script import book_editor, workspace
+from Script import ai_book, book_editor, workspace
 from Script.paper_sizes import (
     BOOK_PAGE_FAMILIES,
     BOOK_PAGE_SIZES,
@@ -502,6 +502,87 @@ st.caption(TAGLINE)
 job = busy_job()
 busy = job is not None
 pending_job = None
+# The AI job is kept apart from `pending_job` until below the two views, and
+# that is not tidiness. `pending_job = book_editor.render(...)` further down is
+# an unconditional assignment: anything claimed up here would be overwritten and
+# silently never run. See where the two are joined again.
+ai_job = None
+
+# --------------------------------------------------------------------------
+# Writing a book with a model
+# --------------------------------------------------------------------------
+# Above the view radio for two reasons. It is offered whichever half of the app
+# somebody is looking at, and — the load-bearing one — `st.session_state["view"]`
+# may only be assigned before the radio below has been instantiated. Pressing the
+# button has to move the user to the writing view, so the button has to be here.
+#
+# A book that has already been written into the editor is kept as a draft before
+# anything replaces it. That happens in the job runner at the foot of this file,
+# not on the click: a click claims, and only the runner does work.
+AI_PROMPT_KEY = "ai-prompt"
+ai_ready = ai_book.available()
+ai_writing = job == ("ai", "write")
+
+with st.container(border=True):
+    ai_button_column, ai_prompt_column = st.columns(
+        [1, 2.5], vertical_alignment="center"
+    )
+    ai_slot = ai_button_column.empty()
+    ai_prompt = ai_prompt_column.text_input(
+        "Describe the book you want",
+        key=AI_PROMPT_KEY,
+        max_chars=ai_book.MAX_PROMPT_CHARS,
+        placeholder=(
+            "Describe the book to write — what it is about, who it is for, the "
+            "voice, and how long. For example: a warm, plain-English beginner's "
+            "guide to hand bookbinding, eight short chapters."
+        ),
+        disabled=busy or not ai_ready,
+        label_visibility="collapsed",
+    )
+    # The slot holds the button, and the runner replaces it with a progress bar,
+    # so starting a book does not move anything else on the page.
+    if ai_slot.button(
+        "✍️ Writing…" if ai_writing else "🤖 Generate book for printing with AI",
+        key="ai-write",
+        type="primary",
+        use_container_width=True,
+        disabled=busy or full or not ai_ready or not ai_prompt.strip(),
+        help=(
+            "Writes a whole book from that description and puts it straight into "
+            "the writing view. Anything already in the editor is kept as a draft "
+            "first. Your description — and nothing else from this session — is "
+            "sent to OpenRouter; see the data policy at the foot of the page."
+        ),
+    ):
+        # The one moment this assignment is legal: the radio below has not been
+        # instantiated yet on this run, so this is the value it will take when it
+        # is. `claim_job` reruns immediately and the next run draws the writing
+        # view, locked, with the progress bar in the slot above.
+        st.session_state["view"] = WRITE_VIEW
+        claim_job(("ai", "write"))
+    if ai_writing:
+        ai_job = {
+            "kind": "ai_write",
+            "slot": ai_slot,
+            "prompt": st.session_state.get(AI_PROMPT_KEY, ""),
+        }
+    if not ai_ready:
+        st.caption(
+            f"Writing with AI is switched off on this copy. "
+            f"{ai_book.why_unavailable()} Everything else works as usual."
+        )
+    else:
+        st.caption(
+            "Writes the words only — your page size, type and margins are left "
+            "exactly as you set them. The description you type is sent to "
+            "OpenRouter to be written; nothing else from this session is."
+        )
+
+# A book handed over by a finished AI job, put on screen before any box is drawn.
+# It cannot be done in the runner: by the time that runs, every box belonging to
+# the book being replaced has already been drawn.
+book_editor.collect()
 
 # Which half of the app is on screen. A radio rather than tabs or a segmented
 # control: it cannot be deselected into showing nothing, it keeps its choice in
@@ -1369,6 +1450,14 @@ else:
         folder=MANUSCRIPT_DIR,
     )
 
+# The AI job rejoins the others here, below both views, because the assignment
+# just above is unconditional and would otherwise throw it away. Nothing is lost
+# the other way either: while an AI job is in flight `busy` is true, so every
+# build button in the editor is drawn disabled and `render` cannot have returned
+# a job of its own.
+if ai_job is not None:
+    pending_job = ai_job
+
 st.divider()
 
 how_to, choosing, reference = st.columns(3, gap="large")
@@ -1483,9 +1572,18 @@ with reference:
 #
 # What section 5 says is a disclosure rather than a promise, and it is there
 # because a policy is only worth anything if it describes the app that exists:
-# Hugging Face logs every visitor to every Space, and no line of this repository
-# can switch that off. It is named, with its own link, instead of being left to
-# be inferred from a sentence about how nothing is stored here.
+# Render logs every visitor to every service, and no line of this repository can
+# switch that off. It is named, with its own link, instead of being left to be
+# inferred from a sentence about how nothing is stored here.
+#
+# The AI service is the second such disclosure, and the more serious one, because
+# it is the only thing in this app that sends a visitor's words off this machine.
+# It is stated three times over — in the opening paragraph, in section 5 and in
+# section 9 — because a reader who skims will see the first, and because the
+# thing being disclosed is the one thing the rest of the notice spends fourteen
+# sections promising does not happen. If `Script/ai_book.py` is ever removed, or
+# the button taken off the page, those three passages and section 12's paragraph
+# about invented text come out with it.
 #
 # The framework's own telemetry used to be the second such disclosure. It is now
 # a promise instead — `gatherUsageStats = false` in `.streamlit/config.toml`
@@ -1494,7 +1592,7 @@ with reference:
 # removed from the config, this notice becomes untrue on the point a reader is
 # most likely to care about, so the two belong changed together.
 REPOSITORY = "https://github.com/DariuszKrych/Bookbinding_Signature_Creator_App"
-POLICY_UPDATED = "20 August 2026"
+POLICY_UPDATED = "24 August 2026"
 
 # The four folder names as the policy says them, built here rather than inside
 # the f-string below: nesting a quoted separator inside a triple-quoted f-string
@@ -1509,15 +1607,22 @@ they are erased within about a minute of the tab closing. Nobody reads them, no
 copy is kept, nothing about them is logged, shared, sold, or used to train
 anything. The only lasting copy of anything is the zip you download yourself.
 
+**One thing leaves this server, and only if you press the button that does it.**
+**🤖 Generate book for printing with AI** sends the sentence you type in its box
+to an AI service, which writes a book back. Nothing else from your session goes
+with it — not your manuscript, not your drafts, not your uploads, not their
+names. Never press it, and nothing you do here ever leaves. Section 5 says
+exactly what that involves, and it is worth reading before you use it.
+
 **1. Who runs this.** A free, non-commercial hobby project, maintained by one
-private individual and published as a Hugging Face Space. The source is public
-under the GNU General Public License v2 at
+private individual and published as a Docker web service on Render. The source is
+public under the MIT License at
 [github.com/DariuszKrych/Bookbinding_Signature_Creator_App]({REPOSITORY}), so
 every claim on this page can be checked against the code that makes it. For
-anything here — a question, a request, a copyright complaint — use the
-**Community** tab of this Space or open an issue on that repository. Where the
-GDPR or an equivalent law applies, the maintainer is the controller for the
-narrow technical processing described in section 2, and for nothing else.
+anything here — a question, a request, a copyright complaint — open an issue on
+that repository. Where the GDPR or an equivalent law applies, the maintainer is
+the controller for the narrow technical processing described in sections 2 and 5,
+and for nothing else.
 
 **2. What happens to a file you give it.** An upload is held in the Streamlit
 server's memory and written into a folder made for your session alone, named
@@ -1525,8 +1630,10 @@ after your session id, under the host machine's temporary directory
 ({SESSION_FOLDERS}). Books you type are kept as JSON drafts in the same place.
 Everything done to them is mechanical: pages are split down their
 own middle, re-ordered into signatures, stamped with page numbers, or typeset
-into a PDF. **No file is opened, read, indexed, scanned, analysed, sent anywhere,
-or looked at by a person.** There is no database, no object store, no backup, and
+into a PDF. **No file is opened, read, indexed, scanned, analysed, or looked at by
+a person, and nothing in your session is sent anywhere — with the single
+exception in section 5, which happens only when you press the button that does
+it.** There is no database, no object store, no backup, and
 no log of file names or of anything inside a file. A session may hold
 {workspace.human(workspace.LIMIT_BYTES)} in all, and a single uploaded PDF may be
 {workspace.human(workspace.MAX_UPLOAD_BYTES)}.
@@ -1537,18 +1644,26 @@ goes, three of them without you doing anything. A sweeper thread wakes every
 attached, and deletes the folder of every session that does not, after a
 {workspace.GRACE_SECONDS}-second grace period so a network blip cannot cost you a
 book. Everything the process created is removed when the process exits, so the
-Space going to sleep takes it all with it. A folder untouched for
+service going to sleep takes it all with it. A folder untouched for
 {workspace.ORPHAN_SECONDS // 60} minutes is removed anyway, in case neither of
 the first two can run. And **🗑 Delete my data now**, in the sidebar, erases the
 whole session immediately, at your word, with nothing to wait for. The lawful
 basis is Article 6(1)(b) — the processing *is* the service you asked for — there
 is no secondary purpose, and the retention period is the session and not one
-minute longer.
+minute longer. The same basis covers the AI request in section 5 — it is the
+thing you asked for by pressing the button, it happens on that press and at no
+other time, and this app keeps no copy of what was sent. Where that request
+leaves the UK or EEA, it does so because you instructed it: Article 49(1)(b)
+covers a transfer necessary to perform the service you requested. It is not
+relied on for anything else here, and it is a further reason the box asks for a
+description of a book and not for anything about a person.
 
 **4. What is never collected.** No account, no sign-up, no name, no email
 address, no password, no payment details. No tracking, no advertising, no
 profiling, no behavioural analytics, and no automated decision-making of the kind
-Article 22 is about. This app sets no cookie of its own. The Streamlit framework
+Article 22 is about — the AI in section 5 writes a chapter of a book when asked
+to, and makes no decision about you, produces no assessment of you, and never
+sees anything about you to make one from. This app sets no cookie of its own. The Streamlit framework
 sets one strictly necessary `_xsrf` cookie, which exists to stop another site
 forging requests to this one; a cookie strictly necessary to deliver a service
 the visitor has asked for requires no consent under the ePrivacy Directive, which
@@ -1559,21 +1674,36 @@ United States — that is its default, and it is **switched off here**
 this app about you or about anything you do in it.
 
 **5. What the maintainer does not control, and you should know about anyway.**
-Two things sit outside this app, and honesty about them is worth more than a
+Three things sit outside this app, and honesty about them is worth more than a
 clean-sounding promise:
 
-- **The host.** This runs as a Hugging Face Space, on Hugging Face's servers.
-  Independently of this app and under its own policy, Hugging Face records your
-  IP address, your session date and location, information about your device,
-  operating system and browser, and sets its own cookies. That data may be stored
-  and processed in the United States or any other country where Hugging Face or
-  its infrastructure providers keep facilities. It is theirs and not the
-  maintainer's: it cannot be read, corrected or deleted from inside this app, and
-  requests about it go to them. See the [Hugging Face Privacy
-  Policy](https://huggingface.co/privacy) and [Content
-  Policy](https://huggingface.co/content-policy). The maintainer can see the
-  aggregate visit count and the technical runtime logs the platform shows every
-  Space owner; neither carries anything out of your files.
+- **The host.** This runs as a Docker web service on Render, on Render's servers.
+  Independently of this app and under its own policy, Render records your IP
+  address, request metadata, information about your device and browser, and the
+  service's technical logs. That data may be stored and processed in the United
+  States or any other country where Render or its infrastructure providers keep
+  facilities. It is theirs and not the maintainer's: it cannot be read, corrected
+  or deleted from inside this app, and requests about it go to them. See the
+  [Render Privacy Policy](https://render.com/privacy) and
+  [Terms of Service](https://render.com/terms). The maintainer can see the
+  technical runtime logs the platform shows every service owner; they carry
+  nothing out of your files.
+- **The AI service, if and only if you press the AI button.** Pressing
+  **🤖 Generate book for printing with AI** sends the description you typed, plus
+  this app's own fixed writing instructions, to
+  [OpenRouter](https://openrouter.ai). **Nothing else goes with it** — not your
+  manuscript, not your drafts, not your uploaded PDFs, not any file name, and no
+  identifier of you: the request is made by this server, under this copy's own
+  key, and your IP address is never part of it. OpenRouter passes it on to
+  whichever free model provider is serving the request, which may be in the
+  United States or anywhere else. **Providers of free models may keep what is
+  sent to them, and may train on it.** So treat that box as public: do not type
+  anything into it you would not be willing to publish. What comes back is
+  written into the editor and stored nowhere but your own session, exactly like a
+  book you typed yourself. See the [OpenRouter Privacy
+  Policy](https://openrouter.ai/privacy) and
+  [Terms](https://openrouter.ai/terms). Leave the button alone and none of this
+  applies to you.
 - **The network.** The page is served over HTTPS, but the connection between your
   machine and the server crosses networks nobody here operates.
 
@@ -1588,10 +1718,27 @@ or anything unlawful. If you do put another person's personal data through it,
 for it. The maintainer acts only as your processor, only mechanically, only for
 the seconds the work takes, and keeps none of it.
 
-**7. Copyright.** Nothing is retained, so there is never a copy here to take
-down. If you believe this app has been used against your rights, tell the
-maintainer through the routes in section 1, or report the Space to Hugging Face
-under its content policy.
+That goes double for the AI description box, and for a different reason: it is
+the only box whose contents leave this server. **Treat it as public.** Put a
+description of a book in it — subject, length, voice, who it is for — and nothing
+else. No personal data about yourself or anybody else, nothing confidential, and
+nothing you would mind a third party keeping. Section 5 explains why: what is
+sent may be retained and trained on by whichever provider answers, which is not
+something this app can undo or promise against.
+
+**7. Copyright, and who owns what the AI wrote.** Nothing is retained, so there is
+never a copy here to take down. If you believe this app has been used against your
+rights, tell the maintainer through the routes in section 1, or report the service
+to Render under its acceptable use policy.
+
+**The maintainer claims nothing over anything you make here**, typed or generated.
+What the AI writes is handed to you and kept nowhere. But note two things honestly,
+because neither is this app's to settle: whether text produced by a model attracts
+copyright at all, and who would own it if it does, differ between countries and are
+still being argued over — in several, work with no human author does not qualify.
+And a model can reproduce something close to what it was trained on without either
+of you knowing. So the text arrives as a draft, not as a cleared asset. If you mean
+to sell or publish it, that is yours to check, and section 12 says so again.
 
 **8. Your rights.** Where the GDPR or an equivalent law applies you have rights
 of access, rectification, erasure, restriction, portability and objection. In
@@ -1602,21 +1749,27 @@ bite are on the
 page and take effect at once, with nobody to ask: **📤 Save my data** is
 portability, and **🗑 Delete my data now** is erasure. You may complain to the
 data protection authority of your own country. Rights over the data described in
-section 5 are exercised with Hugging Face, not here.
+section 5 are exercised with Render, or with OpenRouter, and not here.
 
-**9. Given to nobody.** Nothing you provide is sold, rented, shared, disclosed or
-transferred to any third party, for any purpose, commercial or otherwise, and
-nothing is used to train any model. There is no analytics vendor, no advertiser
-and no processor beyond the host in section 5. Disclosure would arise only if a
-valid legal order compelled it, and by then there would be nothing left to
-disclose.
+**9. Given to nobody, with one exception you choose.** Nothing you provide is
+sold, rented, shared, disclosed or transferred to any third party, for any
+purpose, commercial or otherwise. There is no analytics vendor and no advertiser.
+The only processors are the host in section 5 and — solely when you press the AI
+button, and solely for the sentence you typed into its box — the AI service in
+that same section. **Everything else you upload or type stays on this server and
+is used to train nothing.** The description you send to the AI service is the one
+thing this cannot promise for, because that is not the maintainer's to promise;
+section 5 says so plainly rather than hiding it here. Disclosure beyond that
+would arise only if a valid legal order compelled it, and by then there would be
+nothing left to disclose.
 
 **10. No warranty.** This app is provided free of charge, **as is and as
 available, without warranty of any kind**, express or implied, including any
 implied warranty of merchantability, fitness for a particular purpose and
-non-infringement — as set out in sections 11 and 12 of the GNU GPL v2 it is
-licensed under. It is a hobby tool for folding paper. It is not a professional,
-certified, archival or backup service, and must not be relied on as one.
+non-infringement — in the words of the [MIT License]({REPOSITORY}/blob/main/LICENSE)
+it is released under. It is a hobby tool for folding paper. It is not a
+professional, certified, archival or backup service, and must not be relied on as
+one.
 
 **11. Limitation of liability.** To the fullest extent permitted by law, the
 maintainer is not liable for any loss or damage arising out of or connected with
@@ -1635,7 +1788,11 @@ fraud.
 for whatever you put into it. To the extent the law allows, you will hold the
 maintainer harmless against any claim, demand, loss or cost brought by anyone
 else and arising from what you uploaded or typed, or from what you did with what
-came out.
+came out. **This includes anything the AI button writes.** A model invents: it
+can be wrong about plain facts, it can produce something that resembles work
+somebody else already owns, and it has no idea which it is doing. What it writes
+arrives as a draft for you to read, edit and decide about — check it before you
+print it, and check it properly before you publish or sell it.
 
 **13. Children.** This app is not directed at children, and nothing is knowingly
 collected from anyone, of any age.
@@ -1768,6 +1925,7 @@ FAILURE_LABELS = {
     "number": "Numbering failed",
     "typeset": "Could not build the book",
     "typeset_convert": "Could not build the book",
+    "ai_write": "The AI could not write the book",
 }
 
 if pending_job is not None:
@@ -1838,6 +1996,30 @@ if pending_job is not None:
                 pending_job["path"], pending_job["layout"], progress=report
             )
             done = f"Wrote “{numbered.name}”. The original is still here."
+        elif kind == "ai_write":
+            # Whatever is in the editor goes to a draft of its own first, so a
+            # book somebody typed is never the price of pressing this button.
+            # Atomic, and done before a single word is sent anywhere.
+            kept = book_editor.keep_current_as_draft(MANUSCRIPT_DIR)
+            if kept:
+                report(0.02, f"Kept your book as the draft “{kept}”.")
+            written = ai_book.write_book(
+                pending_job["prompt"],
+                # The design the editor already had, carried across untouched:
+                # the model writes the words, not the page size or the type.
+                design=book_editor.manuscript().design,
+                progress=lambda f, m: report(0.03 + f * 0.96, m),
+            )
+            # Left for the next run rather than adopted here. Every box for the
+            # book being replaced was drawn long before this line, and adopting
+            # deletes exactly those keys. See `book_editor.hand_over`.
+            book_editor.hand_over(written)
+            done = (
+                f"Wrote “{written.display_title}” — {len(written.chapters)} "
+                f"chapters, {written.words:,} words. Nothing is saved yet: press "
+                "💾 Save to keep it."
+                + (f" Your previous book is in the drafts list as “{kept}”." if kept else "")
+            )
         else:
             # Typesetting takes the first part of the bar and, when signatures
             # were asked for, imposition takes the rest — one bar for what the
