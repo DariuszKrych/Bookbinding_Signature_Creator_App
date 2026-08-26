@@ -12,7 +12,7 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.59-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![Docker](https://img.shields.io/badge/Docker-micromamba-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Render](https://img.shields.io/badge/Render-deployed-46E3B7?logo=render&logoColor=black)](https://render.com/)
-[![Tests](https://img.shields.io/badge/tests-355-brightgreen)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-385-brightgreen)](#-testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 **[▶ Open the live app](https://bookbinding-signature-creator.onrender.com)** · [What it does](#-what-it-does) · [Architecture](#-deployment--architecture) · [Engineering notes](#-engineering-highlights) · [Run it locally](#-run-it-yourself)
@@ -56,7 +56,7 @@ Type a book straight into the browser — title, author, dedication, chapters, a
 
 ### 🤖 Or have one written
 
-A one-line description — *"a warm, plain-English beginner's guide to hand bookbinding, eight short chapters"* — fills the editor in with a whole book, which you then edit like anything else you typed. Optional, off unless a key is configured, and it writes the **words only**: your page size, type and margins are left exactly as you set them. [How it works, and where its key lives.](#-the-ai-writer-and-where-its-key-lives)
+A one-line description — *"a warm, plain-English beginner's guide to hand bookbinding"* — fills the editor in with a five-chapter book, which you then edit like anything else you typed. Optional, off unless a key is configured, and it writes the **words only**: your page size, type and margins are left exactly as you set them. [How it works, and where its key lives.](#-the-ai-writer-and-where-its-key-lives)
 
 ```mermaid
 flowchart LR
@@ -133,9 +133,39 @@ Render spins free Docker instances down after **15 minutes** of inactivity, whic
 
 ### 🤖 The AI writer, and where its key lives
 
-**🤖 Generate book for printing with AI** takes a one-line description and fills the writing view in with a whole book: title, author, dedication and every chapter. It asks for an outline first, then one chapter at a time — a whole book in a single request runs past a free model's output cap and comes back as truncated JSON, which is not a short book but a broken one.
+**🤖 Generate 5 chapter book for printing with AI** takes a one-line description and fills the writing view in with a whole book: title, author, dedication and every chapter.
 
 All of it is in [`Script/ai_book.py`](./Script/ai_book.py), which imports LangChain and nothing from Streamlit, and [`Script/ai_config.py`](./Script/ai_config.py).
+
+**Five chapters, every time, and three requests to write them.** Both numbers are budgets rather than preferences, and each fixes something that went wrong in practice.
+
+*The chapter count* is fixed because a model will not treat it as a number. A description asking for "a short novel" came back with twice the chapters of one that had asked for a full-length novel — length words read as tone, not as instructions. So the count goes into the JSON schema as `minItems` and `maxItems`, is trimmed or padded again after the reply, and is printed on the button. A description that asks for something sprawling gets that story told in five chapters instead of a longer book.
+
+*The request count* is fixed because OpenRouter's free tier is rationed at roughly **50 requests a day**, shared by everyone using the app. A request per chapter cost six for a five-chapter book — eight books a day. Batching the chapters into the requests left after the outline brings that to three, so about sixteen. `_Budget` counts every attempt, retries and format probes included, and refuses rather than overspending.
+
+```text
+request 1   outline      title, author, dedication, 5 headings + summaries
+request 2   chapters 1-3
+request 3   chapters 4-5
+```
+
+Batching is only safe because of `salvage_chapters`. A reply that runs past the model's output limit is truncated JSON — but the chapters that *did* finish are complete objects inside it, so they are mined out and kept. Recovering three good chapters costs nothing; asking again costs a request the book does not have.
+
+Raising `AI_MAX_CALLS_PER_BOOK` gives more, smaller batches — better prose, fewer books per day. Lowering it to 2 puts all five chapters in one reply, which free models will often cut short.
+
+**Two things make the wait bearable, and neither is a faster model.**
+
+*The book is streamed.* The reply arrives token by token, and the words go onto the page as they are written — headings, paragraphs, a sentence still half-finished — into a box under the button. It costs nothing and changes no request; the same complete reply is parsed by the same code when the stream ends. What it changes is a two-minute stare at a progress bar, which is what "slow" actually meant here.
+
+Reading a book out of a reply that has not arrived yet is the interesting part, because a part-arrived JSON object is not JSON and `json.loads` will never take it. `_json_strings` reads the strings straight out of the fragment instead, telling a key from a value by tracking the containers it is inside, and returning the final unfinished string as well — a half-written sentence is exactly what somebody watching wants to see. `stream_prose` lays those out; `_Live` keeps the chapters that have finished so the next batch appears *under* them rather than over them.
+
+*The fastest provider is asked for.* The same free model is usually served by several providers, and they are not equally quick. Every request carries an OpenRouter `provider` block:
+
+```json
+{ "provider": { "sort": "throughput" } }
+```
+
+which asks for whichever is producing the most tokens per second right now. It rides in `extra_body` — `model_kwargs` is for OpenAI's own parameters, and `provider` is not one of them. `OPENROUTER_PROVIDER_SORT` changes it to `latency` (first word soonest), `price`, or `off`.
 
 **It is optional.** With no key set, the button is drawn switched off with a line explaining why, and the rest of the app is untouched. The LangChain import happens *inside* the call that needs it, so a machine without `langchain-openai` installed still runs the whole app — the test suite is proof, since it never installs it.
 
@@ -174,7 +204,7 @@ Open the app after the deploy finishes. The button under the title tells you whi
 
 | What you see | What it means |
 | --- | --- |
-| **🤖 Generate book for printing with AI** is clickable once you type a description | The key arrived. Done. |
+| **🤖 Generate 5 chapter book for printing with AI** is clickable once you type a description | The key arrived. Done. |
 | Button greyed out, caption reads *"…No `OPENROUTER_API_KEY` is set…"* | The variable is missing or misnamed. Check the spelling in Render — it is case-sensitive. |
 | Button greyed out, caption mentions **langchain-openai** | The key is fine but the image is stale. Redeploy with **Clear build cache**, since `conda-lock.yml` changed. |
 | *"…is not a free model, and this copy is set to free models only"* | You set `OPENROUTER_MODEL` to something paid. Remove it, or use a `:free` model. |
@@ -189,9 +219,12 @@ All optional except the key, all read from the environment, all documented in [`
 | `OPENROUTER_MODEL` | `openrouter/free` | The free-model router. A specific `:free` model works too. |
 | `OPENROUTER_FREE_ONLY` | `1` | Refuse anything that could be charged for, before any request is made. Leave this on. |
 | `OPENROUTER_APP_TITLE` | `Bookbinding Signature Creator` | The `X-Title` header — how OpenRouter's dashboard labels this app's traffic. Identifies the app, never the visitor. |
+| `OPENROUTER_PROVIDER_SORT` | `throughput` | Which provider OpenRouter picks when several serve the model. `throughput` is the fastest to finish; `latency`, `price` and `off` are the others. An unrecognised value falls back to the default. |
+| `AI_STREAM` | `1` | Show the book as it is written instead of all at once at the end. `0` waits for the whole reply. |
 | `AI_CALL_TIMEOUT_SECONDS` | `90` | How long one request may take. |
-| `AI_TOTAL_BUDGET_SECONDS` | `420` | How long a whole book may take before it gives up, keeping the chapters already written. |
-| `AI_MAX_CHAPTERS` | `10` | The most chapters asked for, whatever the description says. Each is one more request against a rationed free tier. |
+| `AI_TOTAL_BUDGET_SECONDS` | `420` | How long a whole book may take before it gives up. |
+| `AI_CHAPTERS` | `5` | How many chapters every book has. Exactly this many — see below. |
+| `AI_MAX_CALLS_PER_BOOK` | `3` | The most requests one book may cost, counting retries. The free tier allows about 50 a day. |
 
 #### Why it cannot leak
 
@@ -243,7 +276,7 @@ A sheet is folded across its width, so one sheet of *W × H* gives four book pag
 
 **🧪 Tests that refuse to mark their own homework**
 
-355 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, derive expected coordinates by hand rather than importing them from the code under test, and feed the AI writer the malformed JSON free models really send. [Details below.](#-testing)
+385 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, derive expected coordinates by hand rather than importing them from the code under test, and feed the AI writer the malformed JSON free models really send. [Details below.](#-testing)
 
 </td></tr>
 <tr><td>
@@ -437,9 +470,11 @@ Five typefaces are available: Times, Helvetica, Courier, Bitstream Vera, and the
 
 #### Having one written for you
 
-The **🤖 Generate book for printing with AI** button sits above both tabs, so it is there whichever one you are on. Describe the book in the box beside it — subject, length, voice, who it is for — and press it. It moves you to the writing tab, writes a title, an author, a dedication and every chapter, and fills the boxes in. From that moment it is an ordinary unsaved draft: edit it, save it, build it, convert it.
+The **🤖 Generate 5 chapter book for printing with AI** button sits above both tabs, so it is there whichever one you are on. Describe the book in the box beside it — subject, voice, who it is for, what should happen — and press it. It moves you to the writing tab, writes a title, an author, a dedication and five chapters, and fills the boxes in. From that moment it is an ordinary unsaved draft: edit it, save it, build it, convert it.
 
-Three things worth knowing:
+**It is always five chapters**, whatever the description says, so describe *what happens* rather than how long it should be. Asking for "a short novel" or "an epic" changes the voice and the pacing, not the count.
+
+Three more things worth knowing:
 
 - **Whatever was in the editor is kept first.** If it was already saved, it stays where it is; if it had unsaved words, they go to a draft of their own beside it. The banner afterwards tells you which draft to look for. Nothing you typed is the price of pressing the button.
 - **It writes the words only.** Page size, typeface, margins, spacing and every other design choice are left exactly as you set them.
@@ -499,7 +534,7 @@ One Streamlit reflex survives all of this: pressing **R** outside a text field r
 
 That is a position, not an accident of hosting. Whatever somebody uploads is theirs, and the way not to be answerable for it is not to keep it.
 
-**The one exception, stated plainly:** pressing **🤖 Generate book for printing with AI** sends the sentence you typed in its box — and nothing else from your session — to OpenRouter. Never press it and nothing you do here ever leaves the server. The app's own data policy, rendered at the foot of every page, says the same thing in more detail and is worth reading before you use that button.
+**The one exception, stated plainly:** pressing **🤖 Generate 5 chapter book for printing with AI** sends the sentence you typed in its box — and nothing else from your session — to OpenRouter. Never press it and nothing you do here ever leaves the server. The app's own data policy, rendered at the foot of every page, says the same thing in more detail and is worth reading before you use that button.
 
 At the very top of the sidebar sit the controls that make that workable:
 
@@ -598,7 +633,7 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
                    Script.test_ai_book Script.test_ai_editor -v
 ```
 
-**355 tests across five modules**, and they go out of their way not to mark their own homework:
+**385 tests across five modules**, and they go out of their way not to mark their own homework:
 
 - The sheet layout is derived by **simulating the physical fold**, independently of the production formula.
 - The page-size tests build a real PDF, run the real conversion, and then **read back out of the finished file where the ink actually landed** — including a small PDF interpreter that tracks the clipping path, because "did this column reach the paper" is a question text extraction cannot answer.
@@ -615,6 +650,8 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
 - The size limit is driven through the real app against a real conversion: a job is allowed to start and then refused part way, and what has to be true afterwards is that the staging folder is gone, the half-made book is not offered as something to print, and the input PDF was not archived as if it had converted.
 - The command line is driven for real too, `main.main([...])` against a redirected set of folders, because it is the half of the app with no interface to notice a break.
 - The AI writer is tested **against a model that lies**. No test touches the network: `ai_book._make_chat` is the one place a client is built, so replacing it replaces the outside world. The replies it is fed are the ones free models really send — a JSON object wrapped in a code fence, prefaced with "Certainly!", containing a `}` inside a sentence, or with a real newline in the middle of a paragraph — and each has a test named after it.
+- The two budgets are asserted as budgets. A five-chapter book must cost **exactly three requests**; the chapters must arrive split 3 then 2; a repair must *not* be attempted when the allowance is gone. And the chapter count is pinned from both ends — a model that plans twelve is trimmed to five, one that plans two is padded to five, and the count in the button's label has to equal the `minItems` in the schema.
+- Truncation is tested by actually truncating: a valid two-chapter reply is cut off mid-string, and both chapters have to survive without spending another request.
 - The key is treated as the thing most worth losing. It must not survive a trip through an error message, must not appear in any session-state value, and must not be reachable as an exception's `__context__` — `raise ... from None` only stops Python *printing* the original, so the scrubbed error is raised outside the `except` block instead. A final test sweeps every committable file in the repository for anything key-shaped, which is why the fake keys in the tests are assembled at runtime rather than written out.
 - Refusing to spend money is asserted at the point before it could be spent: a paid model raises **and the client is never even constructed**.
 - The data policy is tested like code. It has to name OpenRouter, say the sending happens only on that button, admit that free-model providers may train on what is sent, warn that the writing is invented, and name the host the app actually runs on — that last one caught two stale "Hugging Face" references left over from an earlier deployment.
@@ -644,14 +681,14 @@ Bookbinding_Signature_Creator_App/
     ├── paper_sizes.py           Sheet and book-page catalogues, unit parsing
     ├── workspace.py             Per-session temp workspace, sweeper, quotas
     ├── Baskervville-Regular.ttf The app's own typeface
-    ├── test_imposition.py       ~1,400 lines
-    ├── test_manuscript.py       ~840 lines
-    ├── test_editor.py           ~1,320 lines
-    ├── test_ai_book.py          ~530 lines
-    └── test_ai_editor.py        ~330 lines
+    ├── test_imposition.py       ~1,660 lines
+    ├── test_manuscript.py       ~980 lines
+    ├── test_editor.py           ~1,610 lines
+    ├── test_ai_book.py          ~820 lines
+    └── test_ai_editor.py        ~450 lines
 ```
 
-Roughly **7,700 lines of application code** and **4,400 lines of tests**.
+Roughly **9,300 lines of application code** and **5,500 lines of tests**.
 
 ---
 

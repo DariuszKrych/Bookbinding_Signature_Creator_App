@@ -55,14 +55,50 @@ KEY_VAR = "OPENROUTER_API_KEY"
 MODEL_VAR = "OPENROUTER_MODEL"
 FREE_ONLY_VAR = "OPENROUTER_FREE_ONLY"
 TITLE_VAR = "OPENROUTER_APP_TITLE"
+SORT_VAR = "OPENROUTER_PROVIDER_SORT"
 TIMEOUT_VAR = "AI_CALL_TIMEOUT_SECONDS"
 BUDGET_VAR = "AI_TOTAL_BUDGET_SECONDS"
-MAX_CHAPTERS_VAR = "AI_MAX_CHAPTERS"
+CHAPTERS_VAR = "AI_CHAPTERS"
+MAX_CALLS_VAR = "AI_MAX_CALLS_PER_BOOK"
+STREAM_VAR = "AI_STREAM"
 
 DEFAULT_TITLE = "Bookbinding Signature Creator"
 DEFAULT_TIMEOUT = 90.0
 DEFAULT_BUDGET = 420.0
-DEFAULT_MAX_CHAPTERS = 10
+
+# Which provider OpenRouter should route to, when several of them serve the same
+# model.
+#
+# The same free model is usually hosted by more than one provider, and they are
+# not equally quick — the slow one can take several times as long for the same
+# reply. Left alone, OpenRouter balances by its own default order; `throughput`
+# tells it to pick whichever provider is currently producing the most tokens per
+# second, which is the one that finishes a chapter first.
+#
+# The three OpenRouter accepts. Anything else here would be sent to the API only
+# to be refused, so an unrecognised value falls back to the default the way a
+# mistyped number does.
+DEFAULT_SORT = "throughput"
+SORTS = ("throughput", "latency", "price")
+# Written in the environment to send no `provider` block at all, i.e. to leave
+# the routing entirely to OpenRouter.
+SORT_OFF = ("off", "none", "default")
+
+# Exactly this many chapters, every time, whatever the description asks for.
+#
+# Not a maximum. Letting the model choose meant a description saying "a short
+# novel" came back with twice the chapters of one that asked for a full novel —
+# models read length words as flavour, not as instructions. A fixed number is
+# also what makes the request budget below predictable.
+DEFAULT_CHAPTERS = 5
+
+# The most requests one book may cost, counting every retry and repair.
+#
+# OpenRouter's free tier allows about 50 requests a day, shared across the whole
+# app. A chapter-per-request book spent one plus one per chapter — six for five
+# chapters, so eight books a day. Batching the chapters into the calls that are
+# left brings that to three, and the cap is enforced rather than hoped for.
+DEFAULT_MAX_CALLS = 3
 
 # The repository root, i.e. the folder holding `app.py`.
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -85,7 +121,29 @@ class Settings:
     app_title: str
     timeout: float
     budget: float
-    max_chapters: int
+    chapters: int
+    max_calls: int
+    # Both have defaults so that the two speed settings could be added without
+    # touching every place a `Settings` is built by hand.
+    sort: str = DEFAULT_SORT
+    stream: bool = True
+
+    @property
+    def batches(self):
+        """How many requests are left for chapters once the outline has had one."""
+        return max(1, self.max_calls - 1)
+
+    @property
+    def provider(self):
+        """The `provider` block to send with the request, or `None` for none.
+
+        OpenRouter reads this out of the request body and uses it to choose
+        between the providers serving the model. `{"sort": "throughput"}` asks
+        for the fastest one by tokens per second — the whole reason this exists,
+        since a book is three replies and the difference between the quickest
+        provider and the slowest is felt on every one of them.
+        """
+        return {"sort": self.sort} if self.sort else None
 
     @property
     def is_free(self):
@@ -147,6 +205,21 @@ def _flag(name, default=True):
     return raw not in {"0", "false", "no", "off"}
 
 
+def _sort(name=SORT_VAR):
+    """Which provider ordering to ask OpenRouter for. `""` means ask for none.
+
+    Unrecognised values fall back to the default rather than being forwarded:
+    OpenRouter refuses a sort rule it does not know, and a typo in a Render
+    environment variable should not turn every request into a 400.
+    """
+    raw = _text(name).lower()
+    if not raw:
+        return DEFAULT_SORT
+    if raw in SORT_OFF:
+        return ""
+    return raw if raw in SORTS else DEFAULT_SORT
+
+
 def settings():
     """The current settings, read fresh from the environment."""
     return Settings(
@@ -157,7 +230,10 @@ def settings():
         app_title=_text(TITLE_VAR, DEFAULT_TITLE),
         timeout=_number(TIMEOUT_VAR, DEFAULT_TIMEOUT, float),
         budget=_number(BUDGET_VAR, DEFAULT_BUDGET, float),
-        max_chapters=int(_number(MAX_CHAPTERS_VAR, DEFAULT_MAX_CHAPTERS, int)),
+        chapters=int(_number(CHAPTERS_VAR, DEFAULT_CHAPTERS, int)),
+        max_calls=int(_number(MAX_CALLS_VAR, DEFAULT_MAX_CALLS, int)),
+        sort=_sort(),
+        stream=_flag(STREAM_VAR, True),
     )
 
 

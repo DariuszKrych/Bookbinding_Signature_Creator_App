@@ -8,11 +8,43 @@ It does not import Streamlit. That keeps it testable with plain `unittest`, and
 it means nothing here can reach into session state by accident — including the
 API key, which must never end up there.
 
-**Two calls, not one.** A whole book will not survive a single request. Free
-models cap their output, and a reply that runs out half way through chapter nine
-is not a short book, it is broken JSON. So: one request for an outline, then one
-request per chapter. Each is small enough to finish, a failure loses one chapter
-rather than the book, and there is something honest to put in the progress bar.
+**Three requests, and a fixed number of chapters.** Both are budgets, not
+preferences.
+
+OpenRouter's free tier is rationed at roughly fifty requests a day, shared by
+everyone using the app. A request per chapter spent six on a five-chapter book,
+so the chapters are batched into the requests that are left after the outline —
+three in all, counted by `_Budget` and enforced rather than hoped for.
+
+The chapter count is fixed for a different reason. Left to choose, a model reads
+"a short novel" as tone and not as a number: one such description came back with
+twice the chapters of a request that had asked for a full-length one. So the
+count is set in the schema, checked again after the reply, and printed on the
+button, and a description that asks for something long gets that story told in
+the same five chapters.
+
+A whole book still will not survive one request — free models cap their output,
+and a reply that runs out mid-chapter is not a short book but broken JSON. What
+makes batching safe is `salvage_chapters`: a truncated reply is mined for the
+chapters that did finish, which costs nothing and is worth more than a retry the
+budget cannot afford.
+
+**Why it streams, and why it asks for the fastest provider.** A free model
+writing five chapters is not quick, and for most of that time the old version of
+this file had nothing to show: one request went out, and two minutes later a book
+appeared. Two things changed that, neither of which makes the model itself any
+faster.
+
+The reply is *streamed*, so the words arrive as they are written rather than all
+at once at the end, and `write_book` hands them to its caller through `on_text`
+as readable prose — see `_Live` and `stream_prose`, which read the paragraphs out
+of a JSON object that is still only half-arrived. Nothing downstream changes: the
+same complete text is parsed by the same `extract_json` when the stream ends.
+
+And the request carries a `provider` block asking OpenRouter to sort by
+throughput. One model is usually served by several providers at very different
+speeds; that one line picks whichever is currently fastest in tokens per second.
+It is set in `ai_config` and sent by `_make_chat`.
 
 **Why the JSON handling looks paranoid.** Free models are a moving target. Some
 honour a strict JSON schema, some only understand "reply with JSON", some will
@@ -38,6 +70,7 @@ import importlib.util
 import json
 import re
 import time
+from copy import deepcopy
 from dataclasses import replace
 
 from Script import ai_config
@@ -67,8 +100,15 @@ class AIError(RuntimeError):
 # through somebody else's account.
 MAX_PROMPT_CHARS = 1000
 
-MIN_CHAPTERS = 3
-MAX_PARAGRAPHS = 40
+# Paragraphs asked for per chapter, and the hard ceiling validation applies.
+#
+# Lower than they were when a chapter had a request to itself. Several chapters
+# now share one reply, so the whole reply has to fit inside the model's output
+# limit — and a reply that runs out half way is truncated JSON, which is the one
+# failure that costs a whole batch. Asking for fewer, shorter chapters is what
+# buys the request budget.
+WANTED_PARAGRAPHS = (6, 10)
+MAX_PARAGRAPHS = 20
 
 TEMPERATURE = 0.8
 
@@ -108,6 +148,15 @@ def available():
     this app — everything else works.
     """
     return ai_config.configured() and _has_langchain()
+
+
+def chapter_count():
+    """How many chapters a book will have. For the button's own label.
+
+    Read from the settings rather than hard-coded, so the number the button
+    promises and the number the schema demands cannot drift apart.
+    """
+    return ai_config.settings().chapters
 
 
 def why_unavailable():
@@ -219,6 +268,60 @@ def _first_object(text):
     return text[start:]
 
 
+def _every_object(text):
+    """Every balanced `{...}` in `text`, at any depth, in the order they close.
+
+    Used to rescue a reply that ran out of room. Several chapters now share one
+    answer, so a truncated reply is not nonsense — it is three good chapters and
+    the beginning of a fourth, and throwing that away would cost a request the
+    book does not have to spare.
+
+    The starts are kept on a stack rather than only at depth zero, which matters
+    precisely in the case this exists for: when the reply is cut off, the outer
+    `{"chapters": [` never closes, so the only objects that ever balance are the
+    chapters nested inside it.
+    """
+    found = []
+    starts = []
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            starts.append(index)
+        elif char == "}" and starts:
+            found.append(text[starts.pop() : index + 1])
+    return found
+
+
+def salvage_chapters(text):
+    """`{"chapters": [...]}` rebuilt from whatever whole chapters survived.
+
+    Returns `None` when there is nothing to rescue, so the caller can fall back
+    to asking again.
+    """
+    rescued = []
+    for chunk in _every_object(text):
+        for attempt in (chunk, _TRAILING_COMMA.sub(r"\1", chunk)):
+            try:
+                data = json.loads(attempt, strict=False)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(data, dict) and isinstance(data.get("paragraphs"), list):
+                rescued.append(data)
+            break
+    return {"chapters": rescued} if rescued else None
+
+
 def extract_json(text):
     """The JSON object in `text`, however it has been wrapped up.
 
@@ -255,6 +358,169 @@ def extract_json(text):
 
 
 # --------------------------------------------------------------------------
+# Reading the book out of a reply that has not finished arriving
+# --------------------------------------------------------------------------
+# The reply is streamed, so at any moment there is a piece of a JSON object in
+# hand — `{"chapters": [{"number": 1, "heading": "Bent Wire", "paragraphs":
+# ["It begins`. That is not parseable and never will be until the last token, so
+# `json.loads` is no use here at all; what follows reads the strings straight out
+# of the fragment instead.
+#
+# This is only ever used to put words on the screen. The finished reply still
+# goes through `extract_json` exactly as before, so nothing that reaches a
+# `Manuscript` has come through this code.
+
+
+def _json_strings(fragment):
+    """Every string *value* in a JSON fragment, as `(key, text)` pairs.
+
+    `key` is the object key the value was given under — "paragraphs" for the
+    prose, "heading" for a chapter title — so the caller can lay them out
+    differently. Keys themselves are not returned as values, which is the whole
+    difficulty: telling one from the other means knowing whether the fragment is
+    inside an object and whether an object is at the point of taking a key. Hence
+    the container stack.
+
+    The last string is very often unfinished, because a stream is cut wherever
+    the last token landed. It is returned too — a half-written sentence is
+    exactly what somebody watching wants to see.
+    """
+    values = []
+    stack = []  # "{" or "[", innermost last
+    wants_key = False
+    in_string = False
+    escaped = False
+    is_key = False
+    start = 0
+    key = ""
+
+    for index, char in enumerate(fragment):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+                if is_key:
+                    key = _unescape(fragment[start:index])
+                else:
+                    values.append((key, _unescape(fragment[start:index])))
+            continue
+        if char == '"':
+            in_string = True
+            escaped = False
+            start = index + 1
+            is_key = wants_key
+        elif char in "{[":
+            stack.append(char)
+            wants_key = char == "{"
+        elif char in "}]":
+            if stack:
+                stack.pop()
+            wants_key = bool(stack) and stack[-1] == "{"
+        elif char == ":":
+            wants_key = False
+        elif char == ",":
+            # Back to a key inside an object; still a value inside an array.
+            wants_key = bool(stack) and stack[-1] == "{"
+
+    if in_string and not is_key:
+        values.append((key, _unescape(fragment[start:])))
+    return values
+
+
+def _unescape(raw):
+    """One JSON string body, with its escapes undone.
+
+    The end of it may be half an escape — `\\` on its own, or `\\u12` — because
+    the stream stopped mid-character. Rather than write an unescaper, the tail is
+    shortened a character at a time until `json` will take it: the longest escape
+    is six characters, so this gives up long before it could eat a word.
+    """
+    for cut in range(7):
+        piece = raw[: len(raw) - cut] if cut else raw
+        try:
+            return json.loads(f'"{piece}"')
+        except ValueError:
+            continue
+    return ""
+
+
+# Sent with the outline and used to write with, never printed in the book. It
+# would only be noise on the screen.
+_NOT_SHOWN = {"style_note", "number"}
+
+
+def stream_prose(fragment):
+    """The words in a part-arrived reply, laid out to be read.
+
+    Works for both questions without being told which it is looking at, because
+    both answer with string values and the interesting ones are the long ones. An
+    outline shows as its title and chapter summaries; a batch of chapters shows
+    as headings and paragraphs.
+    """
+    lines = []
+    for key, value in _json_strings(fragment):
+        if key in _NOT_SHOWN:
+            continue
+        value = " ".join(str(value).split())
+        if not value:
+            continue
+        lines.append(f"**{value}**" if key in ("title", "heading") else value)
+    return "\n\n".join(lines)
+
+
+class _Live:
+    """The book as it is being written, kept for whoever is watching it.
+
+    One request is one reply, but a book is three of them, and a reader should
+    not watch chapter four wipe chapters one to three off the screen. So the
+    prose of a request that finished is `keep`-ed and everything after it is
+    added on the end.
+
+    `sink` is only ever a display. It must not be where a limit is enforced —
+    that is `progress`'s job, and `_say` deliberately lets it raise — because a
+    display that throws here switches itself off and lets the book carry on
+    rather than losing four written chapters to a drawing failure.
+    """
+
+    def __init__(self, sink=None):
+        self.sink = sink
+        self.kept = []
+        self.here = ""
+
+    def __bool__(self):
+        """Whether anybody is watching, i.e. whether to stream at all."""
+        return self.sink is not None
+
+    def feed(self, fragment):
+        """What has arrived of the reply in flight.
+
+        It replaces the reply before it rather than being added to it, which is
+        what makes a retry, a repair and the move from the outline to the first
+        chapter all look the same on screen: the old words stay up until there
+        are new ones to put in their place, and then they are gone.
+        """
+        self.here = stream_prose(fragment)
+        self._show()
+
+    def keep(self):
+        """That reply is finished and is part of the book. Hold on to it."""
+        if self.here:
+            self.kept.append(self.here)
+        self.here = ""
+
+    def _show(self):
+        if self.sink is None:
+            return
+        try:
+            self.sink("\n\n".join(part for part in self.kept + [self.here] if part))
+        except Exception:  # pragma: no cover - a broken display is not a broken book
+            self.sink = None
+
+
+# --------------------------------------------------------------------------
 # Making the request
 # --------------------------------------------------------------------------
 
@@ -270,6 +536,16 @@ def _make_chat(config):
     """
     from langchain_openai import ChatOpenAI
 
+    # OpenRouter's own additions to the OpenAI request body, `provider` being the
+    # one that matters here: it asks for the fastest provider serving this model
+    # rather than whichever the router would have picked. It goes in `extra_body`
+    # and not in `model_kwargs` because the two are not the same place —
+    # `model_kwargs` sets top-level OpenAI parameters, while `extra_body` is the
+    # documented way to send fields the OpenAI schema knows nothing about.
+    extra_body = {}
+    if config.provider:
+        extra_body["provider"] = config.provider
+
     return ChatOpenAI(
         model=config.model,
         api_key=config.api_key,
@@ -278,6 +554,7 @@ def _make_chat(config):
         timeout=config.timeout,
         max_retries=1,
         default_headers={"X-Title": config.app_title},
+        extra_body=extra_body or None,
     )
 
 
@@ -340,16 +617,41 @@ def _content(reply):
     return content if isinstance(content, str) else str(content)
 
 
-def _invoke(chat, config, messages, schema_name, schema):
+def _read_stream(runnable, messages, live):
+    """One request, read a piece at a time, reported as it goes.
+
+    The pieces are joined and handed back as one string, so everything after this
+    line — `extract_json`, `salvage_chapters`, the repair — sees precisely what it
+    would have seen from `.invoke()`. Streaming is a way of watching the reply
+    arrive, not a different kind of reply.
+    """
+    parts = []
+    for chunk in runnable.stream(messages):
+        piece = _content(chunk)
+        if not piece:
+            continue
+        parts.append(piece)
+        live.feed("".join(parts))
+    return "".join(parts)
+
+
+def _invoke(chat, config, messages, schema_name, schema, budget, live=None):
     """One request, starting at the strongest format this model has accepted."""
+    live = live or _Live()
     start = _RUNG.get(config.model, RUNGS[0])
     rungs = RUNGS[RUNGS.index(start) :]
     for index, rung in enumerate(rungs):
         failure = None
+        budget.take()
         try:
-            reply = _bind(chat, rung, schema_name, schema).invoke(messages)
+            runnable = _bind(chat, rung, schema_name, schema)
+            if live and config.stream:
+                reply = _read_stream(runnable, messages, live)
+            else:
+                reply = runnable.invoke(messages)
         except Exception as error:
             if index < len(rungs) - 1 and _is_format_problem(error, config):
+                budget.probed = True
                 continue
             failure = _readable(error, config)
         # Raised out here rather than inside the `except`, which matters more
@@ -365,28 +667,86 @@ def _invoke(chat, config, messages, schema_name, schema):
     raise AIError("The model would not answer in JSON.")
 
 
-def _asker(chat, config):
-    """A function that asks one question and gets one dictionary back.
+class _Budget:
+    """The requests one book is allowed, counted rather than assumed.
 
-    One repair is allowed, and exactly one. A model that has produced prose twice
-    is not going to produce JSON on the third attempt, and every extra attempt is
-    another request against a free tier that counts them.
+    OpenRouter's free tier is rationed by request, not by token, and the ration
+    is shared by everyone using this app that day. So the limit has to be a
+    limit: every attempt costs one, including a rung downgrade and including a
+    repair, and when there is nothing left the answer is a sentence rather than
+    one more request.
     """
 
-    def ask(system, user, schema_name, schema):
-        messages = [("system", system), ("human", user)]
-        reply = _invoke(chat, config, messages, schema_name, schema)
-        try:
-            return extract_json(reply)
-        except AIError:
-            repaired = _invoke(
-                chat,
-                config,
-                messages + [("ai", reply), ("human", _REPAIR)],
-                schema_name,
-                schema,
+    def __init__(self, allowed):
+        self.allowed = max(1, allowed)
+        self.spent = 0
+        # Set when a request was spent discovering which JSON format this model
+        # accepts. That happens at most once per model per restart, and it is
+        # worth saying so rather than letting the book look simply broken.
+        self.probed = False
+
+    @property
+    def left(self):
+        return self.allowed - self.spent
+
+    def take(self):
+        if self.left <= 0:
+            if self.probed:
+                raise AIError(
+                    "One request went on working out which reply format this "
+                    "model accepts, which left too few for the whole book. That "
+                    "is remembered now — press the button again and it will not "
+                    "happen a second time."
+                )
+            raise AIError(
+                f"This book has used its {self.allowed} requests. Free models "
+                "are rationed by the request, so that limit is a real one — try "
+                "again with a shorter, plainer description."
             )
-            return extract_json(repaired)
+        self.spent += 1
+
+
+def _asker(chat, config, budget, live=None):
+    """A function that asks one question and gets one dictionary back.
+
+    A repair is allowed only when the budget can pay for it. A model that has
+    produced prose once will often produce JSON when told so plainly, but not at
+    the cost of the chapters that have not been written yet.
+
+    `keep` says whether the answer is part of the book being read on screen. The
+    chapters are; the outline is shown while it arrives and then makes way for
+    them, because a plan is not the book.
+    """
+    live = live or _Live()
+
+    def ask(system, user, schema_name, schema, salvage=None, keep=False):
+        messages = [("system", system), ("human", user)]
+        reply = _invoke(chat, config, messages, schema_name, schema, budget, live)
+        try:
+            data = extract_json(reply)
+        except AIError:
+            # A truncated reply is not nonsense, it is a reply that ran out.
+            # Whatever whole objects are in it are worth more than a retry,
+            # and cost nothing.
+            data = None
+            if salvage is not None:
+                data = salvage(reply) or None
+            if data is None:
+                if budget.left <= 0:
+                    raise
+                repaired = _invoke(
+                    chat,
+                    config,
+                    messages + [("ai", reply), ("human", _REPAIR)],
+                    schema_name,
+                    schema,
+                    budget,
+                    live,
+                )
+                data = extract_json(repaired)
+        if keep:
+            live.keep()
+        return data
 
     return ask
 
@@ -435,15 +795,53 @@ OUTLINE_SCHEMA = {
     },
 }
 
-CHAPTER_SCHEMA = {
+
+def outline_schema(chapters):
+    """The outline schema, pinned to exactly `chapters` entries.
+
+    `minItems` and `maxItems` are set to the same number on purpose. Asking in
+    the prompt alone does not hold: a description saying "a short novel" came
+    back with ten chapters where one asking for a full novel got five, because a
+    model reads a word like "short" as tone rather than as a count. The schema is
+    the only part of the request the model cannot interpret.
+    """
+    schema = deepcopy(OUTLINE_SCHEMA)
+    schema["properties"]["chapters"]["minItems"] = chapters
+    schema["properties"]["chapters"]["maxItems"] = chapters
+    return schema
+
+
+BATCH_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["paragraphs"],
+    "required": ["chapters"],
     "properties": {
-        "heading": {"type": "string"},
-        "paragraphs": {"type": "array", "items": {"type": "string"}},
+        "chapters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["number", "paragraphs"],
+                "properties": {
+                    # The number is asked for so a short reply can still be
+                    # matched to the chapters it holds rather than guessed at
+                    # by position.
+                    "number": {"type": "integer"},
+                    "heading": {"type": "string"},
+                    "paragraphs": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
     },
 }
+
+
+def batch_schema(count):
+    schema = deepcopy(BATCH_SCHEMA)
+    schema["properties"]["chapters"]["minItems"] = count
+    schema["properties"]["chapters"]["maxItems"] = count
+    return schema
+
 
 _OUTLINE_SYSTEM = """\
 You plan books that will be printed and sewn by hand. You are given a short
@@ -453,24 +851,35 @@ Reply with one JSON object and nothing else, in this shape:
 {{"title": "", "subtitle": "", "author": "", "series": "", "dedication": "",
   "style_note": "", "chapters": [{{"heading": "", "summary": ""}}]}}
 
+- "chapters" holds **exactly {chapters} entries. Not more, not fewer.** This is
+  fixed and is not yours to choose. If the description asks for something long,
+  fit it into {chapters} chapters; if it asks for something short, still use
+  {chapters}. Words like "short", "brief", "epic" or "full-length" describe the
+  tone wanted, never the number of chapters.
+- "summary" is one or two sentences saying what happens in that chapter. Plan
+  them so the {chapters} together tell the whole story the description asks for,
+  beginning to end.
 - "author" is an invented author's name suited to the book. Never a real person.
 - "dedication" is one short line, or "" for none.
 - "style_note" is one sentence describing the voice, tense and register, so that
   every chapter is written the same way. It is not printed.
-- "chapters" holds between {low} and {high} entries. "summary" is one or two
-  sentences saying what happens in that chapter.
 """
 
-_CHAPTER_SYSTEM = """\
-You are writing one chapter of a book that will be printed and sewn by hand.
+_BATCH_SYSTEM = """\
+You are writing a book that will be printed and sewn by hand. You are given the
+plan for the whole book and asked for some of its chapters.
 
 Reply with one JSON object and nothing else, in this shape:
-{{"heading": "", "paragraphs": ["", ""]}}
+{{"chapters": [{{"number": 1, "heading": "", "paragraphs": ["", ""]}}]}}
 
-Write between 6 and {most} paragraphs of real prose. Continue the voice of the
-book exactly; do not summarise, do not explain what you are doing, and do not
-write a preface to the chapter. Do not repeat the chapter heading in the
-paragraphs.
+- Return **exactly the chapters you are asked for, in order**, each with its
+  "number" as given in the plan.
+- Each chapter is {low} to {high} paragraphs of real prose. Keep to that: the
+  whole reply must fit in one answer, and a reply that runs out mid-sentence is
+  lost entirely.
+- Continue the voice of the book exactly. Do not summarise, do not explain what
+  you are doing, do not write a preface, and do not repeat the chapter heading
+  inside the paragraphs.
 
 {rules}"""
 
@@ -536,16 +945,26 @@ def clean_text(paragraph):
 
 
 def build_outline(prompt, ask, config):
-    """Ask for the plan of the book, and check what comes back is usable."""
-    system = _OUTLINE_SYSTEM.format(low=MIN_CHAPTERS, high=config.max_chapters)
-    data = ask(system, prompt, "book_outline", OUTLINE_SCHEMA)
+    """Ask for the plan of the book, and make what comes back exactly right.
+
+    The chapter count is forced twice over — once in the schema and once here.
+    The schema is what a model that honours it obeys; this is what happens when
+    one does not, and it is why the count is a promise the button can make in its
+    own label rather than a hope.
+    """
+    wanted = config.chapters
+    system = _OUTLINE_SYSTEM.format(chapters=wanted)
+    data = ask(system, prompt, "book_outline", outline_schema(wanted))
 
     raw = data.get("chapters")
     if not isinstance(raw, list) or not raw:
-        raise AIError("The model did not plan any chapters. Try describing the book differently.")
+        raise AIError(
+            "The model did not plan any chapters. Try describing the book "
+            "differently."
+        )
 
     chapters = []
-    for entry in raw[: config.max_chapters]:
+    for entry in raw:
         if not isinstance(entry, dict):
             continue
         chapters.append(
@@ -556,6 +975,14 @@ def build_outline(prompt, ask, config):
         )
     if not chapters:
         raise AIError("The model's chapter list did not hold any chapters.")
+
+    # Too many: keep the first `wanted`, which are the ones the rest of the plan
+    # was built around. Too few: pad, so the book is the length the button says
+    # it is. A padded chapter still gets the whole outline and the premise when
+    # it is written, so it is short of a summary rather than short of context.
+    chapters = chapters[:wanted]
+    while len(chapters) < wanted:
+        chapters.append({"heading": "", "summary": ""})
 
     for number, chapter in enumerate(chapters, start=1):
         if not chapter["heading"]:
@@ -568,55 +995,109 @@ def build_outline(prompt, ask, config):
         "series": clean_line(data.get("series")),
         "dedication": clean_line(data.get("dedication")),
         "style_note": clean_line(data.get("style_note")),
+        # The description as typed, carried along so that the second batch of
+        # chapters is written against what was actually asked for and not only
+        # against the outline the first batch was written from.
+        "premise": prompt,
         "chapters": chapters,
     }
 
 
-def write_chapter(plan, index, ask, config):
-    """Ask for one chapter's prose. `index` is 1-based.
+def split_batches(count, batches):
+    """`count` chapters shared over `batches` requests, biggest first.
 
-    The request carries the whole outline so the model knows where in the arc it
-    is, and the previous chapter's *summary* — never its text. That keeps every
-    chapter roughly the same size to ask for; sending the story so far would make
-    a ten-chapter book cost several times what a three-chapter one does, on a
-    tier that is rationed by request and by token.
+    Five chapters over two requests is [3, 2]. Front-loading rather than
+    trailing means the batch most likely to be cut short is the smaller one,
+    and the smaller one is the one asked for last.
+    """
+    batches = max(1, min(batches, count))
+    size, extra = divmod(count, batches)
+    return [size + (1 if index < extra else 0) for index in range(batches)]
+
+
+def _prose(entry, fallback_heading, number):
+    """One chapter object from a reply, tidied into what the editor stores."""
+    raw = entry.get("paragraphs")
+    if isinstance(raw, str):
+        # Some models send the blob after all. Split it the way the editor would.
+        raw = raw.split("\n\n")
+    if not isinstance(raw, list):
+        return None
+    paragraphs = [clean_text(piece) for piece in raw[:MAX_PARAGRAPHS]]
+    paragraphs = [piece for piece in paragraphs if piece]
+    if not paragraphs:
+        return None
+    return {
+        "number": number,
+        "heading": clean_line(entry.get("heading")) or fallback_heading,
+        "text": "\n\n".join(paragraphs),
+    }
+
+
+def write_batch(plan, numbers, ask, config):
+    """Ask for several chapters at once. `numbers` are 1-based, in order.
+
+    Every request carries the whole outline, so the model always knows where in
+    the arc it is, but never the text of a chapter already written. Sending the
+    story so far would grow every request after the first and spend the token
+    budget on repetition — the outline is what holds the book together, and it
+    is small.
     """
     chapters = plan["chapters"]
-    this = chapters[index - 1]
     outline = "\n".join(
-        f"{number}. {chapter['heading']} — {chapter['summary']}"
+        f"{number}. {chapter['heading']} — {chapter['summary'] or '(no summary; follow the book)'}"
         for number, chapter in enumerate(chapters, start=1)
     )
-    previous = chapters[index - 2]["summary"] if index > 1 else ""
+    asked = "\n".join(
+        f"{number}. {chapters[number - 1]['heading']} — "
+        f"{chapters[number - 1]['summary'] or '(carry the story on from the chapter before)'}"
+        for number in numbers
+    )
 
     user = (
         f"Book: {plan['title']}\n"
         f"By: {plan['author']}\n"
-        f"Voice: {plan['style_note']}\n\n"
-        f"The whole book:\n{outline}\n\n"
-        + (f"What just happened: {previous}\n\n" if previous else "")
-        + f"Write chapter {index} of {len(chapters)}: {this['heading']}\n"
-        f"It should cover: {this['summary']}"
+        f"Voice: {plan['style_note']}\n"
+        f"What the book is: {plan['premise']}\n\n"
+        f"The whole book, all {len(chapters)} chapters:\n{outline}\n\n"
+        f"Write these {len(numbers)} of them now, in this order:\n{asked}"
     )
-    system = _CHAPTER_SYSTEM.format(most=MAX_PARAGRAPHS, rules=STYLE_RULES)
-    data = ask(system, user, "book_chapter", CHAPTER_SCHEMA)
+    system = _BATCH_SYSTEM.format(
+        low=WANTED_PARAGRAPHS[0], high=WANTED_PARAGRAPHS[1], rules=STYLE_RULES
+    )
+    data = ask(
+        system,
+        user,
+        "book_chapters",
+        batch_schema(len(numbers)),
+        salvage_chapters,
+        # Chapters stay on screen once they have arrived; the next batch is added
+        # under them rather than replacing them.
+        keep=True,
+    )
 
-    raw = data.get("paragraphs")
-    if isinstance(raw, str):
-        # Some models send the blob after all. Split it the way the editor would.
-        raw = [piece for piece in raw.split("\n\n")]
+    raw = data.get("chapters")
+    if isinstance(raw, dict):
+        raw = [raw]
     if not isinstance(raw, list):
-        raise AIError(f"Chapter {index} came back in a shape that could not be read.")
+        raise AIError("The chapters came back in a shape that could not be read.")
 
-    paragraphs = [clean_text(piece) for piece in raw[:MAX_PARAGRAPHS]]
-    paragraphs = [piece for piece in paragraphs if piece]
-    if not paragraphs:
-        raise AIError(f"Chapter {index} came back empty.")
-
-    return {
-        "heading": clean_line(data.get("heading")) or this["heading"],
-        "text": "\n\n".join(paragraphs),
-    }
+    # Matched by the number the model was given, falling back to position for a
+    # model that dropped the field. Either way a chapter lands where it belongs
+    # rather than wherever it happened to appear.
+    written = {}
+    for position, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        number = entry.get("number")
+        if not isinstance(number, int) or number not in numbers:
+            number = numbers[position] if position < len(numbers) else None
+        if number is None or number in written:
+            continue
+        prose = _prose(entry, chapters[number - 1]["heading"], number)
+        if prose:
+            written[number] = prose
+    return [written[number] for number in numbers if number in written]
 
 
 def to_manuscript(plan, chapters, design=None):
@@ -695,7 +1176,7 @@ def _check_allowed(config):
         )
 
 
-def write_book(prompt, *, design=None, progress=None, config=None):
+def write_book(prompt, *, design=None, progress=None, on_text=None, config=None):
     """Write a whole book from one description.
 
     `prompt` is the sentence the visitor typed and `design` is the page setup the
@@ -703,34 +1184,55 @@ def write_book(prompt, *, design=None, progress=None, config=None):
     screen nor anything else from the session is passed in, and that is the point:
     there is no argument here through which somebody's manuscript could be sent
     to a third party.
+
+    `progress` is told how far along the book is; `on_text` is given the book
+    itself, in words, over and over as it is written — every few tokens, from the
+    first one. It is what turns a two-minute blank wait into something being read
+    while it is written, and it is a display only: it is called often, it may be
+    called with the same text twice, and it must not be where a limit is
+    enforced. Passing nothing asks for the whole book at the end, as before.
     """
     config = config or ai_config.settings()
     _check_allowed(config)
     prompt = clean_prompt(prompt)
 
     started = time.monotonic()
+    budget = _Budget(config.max_calls)
     chat = _make_chat(config)
-    ask = _asker(chat, config)
+    live = _Live(on_text)
+    ask = _asker(chat, config, budget, live)
 
-    _say(progress, 0.0, "Planning the book…")
+    total = config.chapters
+    _say(progress, 0.0, f"Planning {total} chapters…")
     plan = build_outline(prompt, ask, config)
-    total = len(plan["chapters"])
+
+    # One request for the outline, and the rest shared out between the chapters.
+    sizes = split_batches(total, budget.left)
     _say(progress, 0.12, f"{total} chapters planned. Writing them now.")
 
     chapters = []
-    for number, chapter in enumerate(plan["chapters"], start=1):
+    done = 0
+    for size in sizes:
+        numbers = list(range(done + 1, done + size + 1))
         if time.monotonic() - started > config.budget:
             raise AIError(
-                f"This took too long and was stopped after {number - 1} of "
+                f"This took too long and was stopped after {len(chapters)} of "
                 f"{total} chapters. Free models can be slow when they are busy — "
-                "try again, or ask for a shorter book."
+                "try again in a few minutes."
             )
+        first, last = numbers[0], numbers[-1]
         _say(
             progress,
-            0.12 + 0.85 * (number - 1) / total,
-            f"Writing chapter {number} of {total}: {chapter['heading']}",
+            0.12 + 0.85 * done / total,
+            f"Writing chapter{'s' if size > 1 else ''} {first}"
+            + (f"–{last}" if size > 1 else "")
+            + f" of {total}…",
         )
-        chapters.append(write_chapter(plan, number, ask, config))
+        chapters.extend(write_batch(plan, numbers, ask, config))
+        done += size
+
+    if not chapters:
+        raise AIError("The model returned no usable chapters. Try again.")
 
     _say(progress, 0.98, "Putting the book together…")
     book = to_manuscript(plan, chapters, design)

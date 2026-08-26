@@ -1,4 +1,4 @@
-"""Tests for the "Generate book for printing with AI" button.
+"""Tests for the "Generate 5 chapter book for printing with AI" button.
 
 Run with:  python -m unittest Script.test_ai_editor -v
 
@@ -40,6 +40,12 @@ from Script.test_editor import (  # noqa: E402
 FAKE_KEY = "sk-or-" + "v1-" + "0123456789abcdef" * 2
 
 
+# What the fake writer sends to `on_text`, i.e. what a half-written book looks
+# like on screen. Deliberately not a phrase from the finished book, so a test can
+# tell the live text apart from the book that replaces it.
+STREAMED_MARKER = "A sentence still being writ"
+
+
 def written_book():
     """What the fake writer hands back — a small but complete book."""
     return Manuscript(
@@ -76,10 +82,17 @@ class AiEditorTestCase(EditorTestCase):
 
         super().setUp()
 
-    def fake_write(self, prompt, *, design=None, progress=None, config=None):
-        self.asked.append({"prompt": prompt, "design": design})
+    def fake_write(
+        self, prompt, *, design=None, progress=None, on_text=None, config=None
+    ):
+        self.asked.append({"prompt": prompt, "design": design, "on_text": on_text})
         if progress:
             progress(0.5, "Writing chapter 1 of 2: Bent Wire")
+        # The real writer calls this from the first token onwards. Called here
+        # too, so the box the words go into is exercised by every test that
+        # presses the button rather than by one test that remembers to.
+        if on_text:
+            on_text(STREAMED_MARKER)
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -116,6 +129,17 @@ class TestTheButton(AiEditorTestCase):
         # `widget_named` does not look at buttons, so this asks for it directly.
         self.assertIn("AI", self.at.button(key="ai-write").label)
         self.assertIsNotNone(self.widget_named("ai-prompt"))
+
+    def test_the_button_says_how_many_chapters_it_will_write(self):
+        """The count is fixed, so the button says it rather than leaving the
+        reader to find out by counting what arrives."""
+        self.assertIn(
+            f"{ai_book.chapter_count()} chapter", self.at.button(key="ai-write").label
+        )
+
+    def test_the_box_tells_you_length_is_not_yours_to_ask_for(self):
+        box = self.widget_named("ai-prompt")
+        self.assertIn(f"always {ai_book.chapter_count()} chapters", box.proto.placeholder)
 
     def test_the_button_does_nothing_without_a_description(self):
         self.assertTrue(self.at.button(key="ai-write").disabled)
@@ -169,6 +193,30 @@ class TestSwitchedOff(EditorTestCase):
 # --------------------------------------------------------------------------
 # What pressing it does
 # --------------------------------------------------------------------------
+
+
+class TestWatchingItBeWritten(AiEditorTestCase):
+    """The book appears while it is being written, not only once it is done.
+
+    A free model takes minutes over five chapters. What it does with those
+    minutes used to be nothing at all — a progress bar and a blank page — and the
+    fix is not a faster model but showing the words as they arrive.
+    """
+
+    def test_the_writer_is_given_somewhere_to_put_the_words(self):
+        self.generate()
+        self.assertIsNotNone(self.asked[-1]["on_text"])
+
+    def test_the_live_text_makes_way_for_the_finished_book(self):
+        """It belongs to the run that is writing, and to no run after it."""
+        self.generate()
+        self.assertNotIn(STREAMED_MARKER, self.page_text())
+
+    def test_drawing_the_words_does_not_upset_the_page(self):
+        """The whole book still arrives, through a real `st.empty()` and all."""
+        self.generate()
+        self.assertFalse(self.at.exception, self.at.exception)
+        self.assertIn("The Paperclip", self.state("bk-title"))
 
 
 class TestMovingToTheWritingView(AiEditorTestCase):

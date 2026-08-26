@@ -3,6 +3,7 @@
 Run with:  streamlit run app.py
 """
 
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -522,6 +523,10 @@ ai_job = None
 AI_PROMPT_KEY = "ai-prompt"
 ai_ready = ai_book.available()
 ai_writing = job == ("ai", "write")
+# Said on the button, because it is fixed and a reader should not have to find
+# out by counting. It comes from the same setting the request is built from, so
+# the promise and the schema cannot drift apart.
+ai_chapters = ai_book.chapter_count()
 
 with st.container(border=True):
     ai_button_column, ai_prompt_column = st.columns(
@@ -533,9 +538,9 @@ with st.container(border=True):
         key=AI_PROMPT_KEY,
         max_chars=ai_book.MAX_PROMPT_CHARS,
         placeholder=(
-            "Describe the book to write — what it is about, who it is for, the "
-            "voice, and how long. For example: a warm, plain-English beginner's "
-            "guide to hand bookbinding, eight short chapters."
+            f"Describe the book to write — what it is about, who it is for and "
+            f"the voice. It is always {ai_chapters} chapters, so say what should "
+            f"happen in it rather than how long it should be."
         ),
         disabled=busy or not ai_ready,
         label_visibility="collapsed",
@@ -543,16 +548,19 @@ with st.container(border=True):
     # The slot holds the button, and the runner replaces it with a progress bar,
     # so starting a book does not move anything else on the page.
     if ai_slot.button(
-        "✍️ Writing…" if ai_writing else "🤖 Generate book for printing with AI",
+        "✍️ Writing…"
+        if ai_writing
+        else f"🤖 Generate {ai_chapters} chapter book for printing with AI",
         key="ai-write",
         type="primary",
         use_container_width=True,
         disabled=busy or full or not ai_ready or not ai_prompt.strip(),
         help=(
-            "Writes a whole book from that description and puts it straight into "
-            "the writing view. Anything already in the editor is kept as a draft "
-            "first. Your description — and nothing else from this session — is "
-            "sent to OpenRouter; see the data policy at the foot of the page."
+            f"Writes a {ai_chapters}-chapter book from that description and puts "
+            "it straight into the writing view, where you can edit it like "
+            "anything you typed. Anything already in the editor is kept as a "
+            "draft first. Your description — and nothing else from this session "
+            "— is sent to OpenRouter; see the data policy at the foot of the page."
         ),
     ):
         # The one moment this assignment is legal: the radio below has not been
@@ -562,9 +570,18 @@ with st.container(border=True):
         st.session_state["view"] = WRITE_VIEW
         claim_job(("ai", "write"))
     if ai_writing:
+        # Where the book appears while it is being written. Drawn only while the
+        # job is running, and inside the same bordered box as the button it
+        # belongs to, so nothing below it moves when the words start arriving.
+        #
+        # It is created here rather than in the runner at the foot of the file for
+        # the reason everything else on this page is: elements land where the
+        # script produces them, and the runner produces its elements last of all.
+        ai_stream = st.empty()
         ai_job = {
             "kind": "ai_write",
             "slot": ai_slot,
+            "stream": ai_stream,
             "prompt": st.session_state.get(AI_PROMPT_KEY, ""),
         }
     if not ai_ready:
@@ -1608,8 +1625,8 @@ copy is kept, nothing about them is logged, shared, sold, or used to train
 anything. The only lasting copy of anything is the zip you download yourself.
 
 **One thing leaves this server, and only if you press the button that does it.**
-**🤖 Generate book for printing with AI** sends the sentence you type in its box
-to an AI service, which writes a book back. Nothing else from your session goes
+**🤖 Generate 5 chapter book for printing with AI** sends the sentence you type in
+its box to an AI service, which writes a book back. Nothing else from your session goes
 with it — not your manuscript, not your drafts, not your uploads, not their
 names. Never press it, and nothing you do here ever leaves. Section 5 says
 exactly what that involves, and it is worth reading before you use it.
@@ -1689,7 +1706,7 @@ clean-sounding promise:
   technical runtime logs the platform shows every service owner; they carry
   nothing out of your files.
 - **The AI service, if and only if you press the AI button.** Pressing
-  **🤖 Generate book for printing with AI** sends the description you typed, plus
+  **🤖 Generate 5 chapter book for printing with AI** sends the description you typed, plus
   this app's own fixed writing instructions, to
   [OpenRouter](https://openrouter.ai). **Nothing else goes with it** — not your
   manuscript, not your drafts, not your uploaded PDFs, not any file name, and no
@@ -1920,6 +1937,20 @@ st.iframe(
 #
 # The progress bar goes into the slot the button was occupying, so starting and
 # finishing a job moves nothing on the page.
+#
+# The AI job also fills a box with the book as the model writes it. Two numbers
+# govern that, and both are about the browser rather than about the model:
+#
+# * A reply arrives as hundreds of tiny pieces, and redrawing on every one would
+#   put hundreds of messages down the websocket for text nobody could read that
+#   fast. Ten times a second still looks like typing.
+# * Only the last part of the book is shown. The box is a fixed height so that
+#   the page cannot grow under the reader's cursor, and it does not scroll itself,
+#   so a window of roughly a box-full keeps the newest words in view.
+STREAM_EVERY_SECONDS = 0.1
+STREAM_TAIL_CHARS = 900
+STREAM_BOX_HEIGHT = 260
+
 FAILURE_LABELS = {
     "convert": "Conversion failed",
     "number": "Numbering failed",
@@ -1957,6 +1988,35 @@ if pending_job is not None:
     def report(fraction, message):
         over_limit()
         bar.progress(min(max(fraction, 0.0), 1.0), text=message)
+
+    def live_writer(slot):
+        """A function that puts the book on screen as it is being written.
+
+        Returns something that does nothing at all when there is no slot to draw
+        into, so the caller has no branch to write. The quota is deliberately not
+        checked in here: `report` is called between chapters and is where a job
+        gets stopped, and a limit enforced from a display would stop a book for
+        being long to look at.
+        """
+        if slot is None:
+            return None
+        last_drawn = [0.0]
+
+        def show(text):
+            now = time.monotonic()
+            if now - last_drawn[0] < STREAM_EVERY_SECONDS:
+                return
+            last_drawn[0] = now
+            tail = text[-STREAM_TAIL_CHARS:]
+            if len(tail) < len(text):
+                # Cut at a paragraph rather than mid-word, and say that the
+                # beginning is missing rather than looking like a book that
+                # starts in the middle of a sentence.
+                broken = tail.find("\n\n")
+                tail = "…\n\n" + (tail[broken + 2 :] if broken >= 0 else tail)
+            slot.container(height=STREAM_BOX_HEIGHT, border=True).markdown(tail)
+
+        return show
 
     def impose(pdf_path, layout, report=report):
         """The conversion, shared by the button on a PDF and the one on a book.
@@ -2009,6 +2069,9 @@ if pending_job is not None:
                 # the model writes the words, not the page size or the type.
                 design=book_editor.manuscript().design,
                 progress=lambda f, m: report(0.03 + f * 0.96, m),
+                # The words as they are written, into the box under the button.
+                # A book takes minutes; this is what fills them.
+                on_text=live_writer(pending_job.get("stream")),
             )
             # Left for the next run rather than adopted here. Every box for the
             # book being replaced was drawn long before this line, and adopting
