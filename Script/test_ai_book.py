@@ -101,6 +101,59 @@ class FakeChat:
             yield SimpleNamespace(content=reply[start : start + self.chunk])
 
 
+def cut_off_error(text="", total=0, name="LengthFinishReasonError"):
+    """What `openai` raises instead of handing over a reply that filled its cap.
+
+    Built here rather than imported, for the same reason `ai_book` recognises one
+    by class name and by message instead of catching it: neither the module nor
+    these tests may depend on the client being installed.
+
+    The shape is the real one — the completion it would not parse hangs off the
+    exception, with the words in `choices[0].message.content` and the service's
+    own count in `usage` — because that shape is the only reason the chapters can
+    be got back at all.
+    """
+    usage = SimpleNamespace(total_tokens=total) if total else None
+    completion = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+        usage=usage,
+    )
+    error = type(name, (Exception,), {})(
+        "Could not parse response content as the length limit was reached"
+        + (f" - CompletionUsage(total_tokens={total})" if total else "")
+    )
+    error.completion = completion
+    return error
+
+
+class CutShort(str):
+    """A reply that arrives in full and then runs out at the end of it.
+
+    A plain `str`, so `FakeChat` sends it like any other reply. The marker is
+    only there to tell `StreamCutOffChat` to raise once it has been said.
+    """
+
+    total = 0
+
+
+class StreamCutOffChat(FakeChat):
+    """A model that streams every word and then refuses to hand the reply over.
+
+    Which is precisely what happens in the app. The client reads the stream to
+    the end, parses the finished completion only then, finds `finish_reason` is
+    "length", and raises — so the words have already arrived and already been
+    shown by the time the exception lands on top of them.
+    """
+
+    def stream(self, messages, **kwargs):
+        self.streamed += 1
+        reply = self._next(messages)
+        for start in range(0, len(reply), self.chunk):
+            yield SimpleNamespace(content=reply[start : start + self.chunk])
+        if isinstance(reply, CutShort):
+            raise cut_off_error(reply, total=reply.total)
+
+
 def outline_reply(count=5, **extra):
     data = {
         "title": "The Folded Sheet",
@@ -748,6 +801,116 @@ class TestRescuingATruncatedBatch(AiTestCase):
     def test_a_brace_inside_a_string_does_not_confuse_it(self):
         found = ai_book._every_object('{"a": "not } a brace"}')
         self.assertEqual(found, ['{"a": "not } a brace"}'])
+
+
+class TestAReplyThatFilledItsCap(AiTestCase):
+    """The failure the token limit made ordinary.
+
+    Every request carries a `max_tokens` now, so a model writing right up to it is
+    not a rare mishap but the expected end of a batch that had plenty to say. The
+    client marks that by raising and throwing the reply away, and a book that had
+    been streaming happily for a minute became a red banner reading “The AI
+    service could not be reached: Could not parse response content as the length
+    limit was reached”. A limit meant to shorten a book was breaking one.
+
+    So a cut-off reply is turned back into the text it is carrying, and every
+    test below is about it going on to be treated as what it is: a truncated
+    reply, which this app has always known how to read.
+    """
+
+    def cut_batch(self):
+        """Two whole chapters and the start of a third, as the cut left them."""
+        good = json.dumps({"chapters": [one_chapter(1), one_chapter(2)]})
+        return good[: good.rindex("]")] + ', {"number": 3, "paragraphs": ["Ha'
+
+    def test_a_cut_off_reply_is_read_rather_than_raised(self):
+        chat = FakeChat(
+            outline_reply(5), cut_off_error(self.cut_batch()), batch_reply(4, 5)
+        )
+        book = self.run_book(chat)
+        self.assertEqual(len(book.chapters), 5)
+        self.assertEqual(book.chapters[0].text.split("\n")[0], "Chapter 1, first.")
+        self.assertEqual(book.chapters[1].text.split("\n")[0], "Chapter 2, first.")
+        # Three went with the cut, so it comes from its own summary instead.
+        self.assertEqual(book.chapters[2].text, "What happens in 3.")
+        self.assertEqual(book.chapters[3].text.split("\n")[0], "Chapter 4, first.")
+
+    def test_a_reply_that_was_whole_after_all_is_used_whole(self):
+        """The cap can land exactly on the last brace. Nothing is lost then."""
+        chat = FakeChat(outline_reply(1), cut_off_error(batch_reply(1)))
+        book = self.run_book(chat, config=settings(chapters=1))
+        self.assertEqual(book.chapters[0].text.split("\n")[0], "Chapter 1, first.")
+
+    def test_the_words_that_had_already_arrived_are_kept(self):
+        """A streamed reply raises after its last piece, not instead of it."""
+        chat = StreamCutOffChat(
+            outline_reply(5), CutShort(self.cut_batch()), batch_reply(4, 5)
+        )
+        seen = []
+        book = self.run_book(chat, on_text=seen.append)
+        self.assertEqual(len(book.chapters), 5)
+        self.assertEqual(book.chapters[0].text.split("\n")[0], "Chapter 1, first.")
+        # Read while it was written, and still on screen at the end.
+        self.assertIn("Chapter 1, first.", seen[-1])
+
+    def test_a_cut_off_reply_does_not_cost_a_repair(self):
+        """A repair would carry the same cap and run out in the same place.
+
+        The request it would spend is one the chapters after it need, so this cut
+        is deliberately made before the first chapter closes — nothing to
+        salvage, and still no repair.
+        """
+        chat = FakeChat(
+            outline_reply(5),
+            cut_off_error('{"chapters": [{"number": 1, "paragraphs": ["Ha'),
+            batch_reply(4, 5),
+        )
+        book = self.run_book(chat)
+        self.assertEqual(len(chat.calls), 3)
+        # A repair is three messages; a batch is two. The third request went on
+        # chapters four and five, which is what proves it was not squandered.
+        self.assertEqual(len(chat.calls[2]), 2)
+        self.assertEqual(book.chapters[3].text.split("\n")[0], "Chapter 4, first.")
+        self.assertEqual(len(book.chapters), 5)
+
+    def test_an_unreadable_reply_is_still_repaired(self):
+        """Only a reply that ran out skips the repair. Prose still earns one."""
+        chat = FakeChat(outline_reply(1), "I am afraid I cannot.", batch_reply(1))
+        book = self.run_book(chat, config=settings(chapters=1))
+        self.assertEqual(len(chat.calls), 3)
+        self.assertEqual(book.chapters[0].text.split("\n")[0], "Chapter 1, first.")
+
+    def test_a_cut_off_outline_still_gives_a_book(self):
+        chat = FakeChat(
+            cut_off_error(outline_reply(5)[:60]),
+            batch_reply(1, 2, 3),
+            batch_reply(4, 5),
+        )
+        book = self.run_book(chat)
+        self.assertEqual(len(book.chapters), 5)
+        self.assertEqual(len(chat.calls), 3)
+
+    def test_what_the_service_counted_is_what_is_charged(self):
+        """The exception carries the usage, and an exact count beats a guess."""
+        said, counted = ai_book._cut_off_reply(cut_off_error(batch_reply(1), 1234))
+        self.assertEqual(said, batch_reply(1))
+        self.assertEqual(counted, 1234)
+
+    def test_nothing_on_the_exception_is_no_words_rather_than_a_crash(self):
+        """It is somebody else's object and its shape is theirs to change."""
+        self.assertEqual(ai_book._cut_off_reply(RuntimeError("nothing here")), ("", None))
+
+    def test_it_is_recognised_by_its_message_as_well_as_its_class(self):
+        self.assertTrue(ai_book._is_cut_off(cut_off_error()))
+        self.assertTrue(ai_book._is_cut_off(cut_off_error(name="SomethingElse")))
+        self.assertFalse(ai_book._is_cut_off(RuntimeError("429 rate limit exceeded")))
+
+    def test_a_real_failure_still_reaches_the_reader(self):
+        """The catch is for one exception, not for every exception."""
+        chat = FakeChat(outline_reply(1), RuntimeError("429 rate limit exceeded"))
+        with self.assertRaises(ai_book.AIError) as caught:
+            self.run_book(chat, config=settings(chapters=1))
+        self.assertIn("too much at once", str(caught.exception))
 
 
 class TestReadingAHalfArrivedReply(AiTestCase):

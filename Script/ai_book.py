@@ -31,6 +31,15 @@ makes batching safe is `salvage_chapters`: a truncated reply is mined for the
 chapters that did finish, which costs nothing and is worth more than a retry the
 budget cannot afford.
 
+A reply that ran out does not arrive as a reply, though, and that is worth
+knowing before reading `_invoke`. The OpenAI client refuses to hand over a
+completion whose `finish_reason` is "length" — it raises instead, and throws the
+words away with it. Since the ledger sends a `max_tokens` with every request,
+filling the cap is the *ordinary* way a full batch ends rather than a rare
+mishap. So `_is_cut_off` recognises that exception and `_cut_off_reply` takes the
+chapters back out of it, before anything downstream can mistake a short book for
+a broken one.
+
 **Why it streams.** A model writing five chapters is not quick, and for most of
 that time the old version of this file had nothing to show: one request went out,
 and two minutes later a book appeared.
@@ -632,6 +641,53 @@ def _content(reply):
     return content if isinstance(content, str) else str(content)
 
 
+# The sentence the OpenAI client puts on a reply it would not hand over, and the
+# class it raises. Either one is enough to recognise it.
+_CUT_OFF = "length limit was reached"
+_CUT_OFF_CLASS = "LengthFinishReasonError"
+
+
+def _is_cut_off(error):
+    """Whether this is the client throwing away a reply that filled its cap.
+
+    Not a failure, however firmly the client puts it. `openai` raises
+    `LengthFinishReasonError` whenever a reply ends because it ran out of
+    `max_tokens` *and* the request carried a `response_format` — which is every
+    request this app makes at its top two rungs, and every request carries a
+    `max_tokens` now that the ledger sets one. So the ordinary end of a batch
+    asked for exactly as many tokens as the budget could spare arrives here as an
+    exception, carrying the chapters it managed to write.
+
+    That is the whole of the bug this exists for: the app has always treated a
+    cut-off reply as a short book (`salvage_chapters`, `from_plan`), and the
+    client turned it into a red banner instead.
+
+    Matched by class name and by message rather than caught as `openai.…`,
+    because nothing in this module may import the client — see `_make_chat`.
+    """
+    if type(error).__name__ == _CUT_OFF_CLASS:
+        return True
+    return _CUT_OFF in str(error).lower()
+
+
+def _cut_off_reply(error):
+    """`(text, usage)` taken back out of a cut-off reply. Either may be missing.
+
+    The exception carries the completion it refused to parse, so the words are
+    right there for the asking. Read defensively at every step: this is somebody
+    else's object, its shape is theirs to change, and the only thing worse than a
+    short book here would be a second exception on top of the first.
+    """
+    completion = getattr(error, "completion", None)
+    parts = []
+    for choice in getattr(completion, "choices", None) or []:
+        said = getattr(getattr(choice, "message", None), "content", None)
+        if isinstance(said, str):
+            parts.append(said)
+    total = getattr(getattr(completion, "usage", None), "total_tokens", None)
+    return "".join(parts), total if isinstance(total, int) and total > 0 else None
+
+
 def _read_stream(runnable, messages, live):
     """One request, read a piece at a time, reported as it goes.
 
@@ -639,16 +695,35 @@ def _read_stream(runnable, messages, live):
     line — `extract_json`, `salvage_chapters`, the repair — sees precisely what it
     would have seen from `.invoke()`. Streaming is a way of watching the reply
     arrive, not a different kind of reply.
+
+    That holds for a reply that fills its cap too, and it takes this `try` to
+    make it hold. Such a reply streams to the very last piece and then raises,
+    because the client parses the finished completion once the stream has run
+    out — so every word is already in `parts` and on screen by the time the
+    exception arrives. Losing them to it would be losing chapters that had been
+    written, read, and paid for.
     """
     parts = []
     usage = None
-    for chunk in runnable.stream(messages):
-        usage = _usage(chunk) or usage
-        piece = _content(chunk)
-        if not piece:
-            continue
-        parts.append(piece)
-        live.feed("".join(parts))
+    try:
+        for chunk in runnable.stream(messages):
+            usage = _usage(chunk) or usage
+            piece = _content(chunk)
+            if not piece:
+                continue
+            parts.append(piece)
+            live.feed("".join(parts))
+    except Exception as error:
+        if not _is_cut_off(error):
+            raise
+        # The completion on the exception should say the same as the pieces
+        # already gathered. Preferred when it says more, since a stream that
+        # failed early is the one case where it can.
+        said, counted = _cut_off_reply(error)
+        usage = counted or usage
+        if len(said) > len("".join(parts)):
+            parts = [said]
+            live.feed(said)
     return "".join(parts), usage
 
 
@@ -675,9 +750,14 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
     charge: a downgrade is another request, and the point of the ledger is that
     nothing goes out uncounted.
 
-    Returns `None` when there were no requests left to make one with — which the
-    caller turns into chapters written from the outline, not into an error. A
-    service that answered badly still raises; only a budget goes quiet.
+    Returns `(reply, cut_off)`, where `cut_off` says the reply stops mid-sentence
+    because it reached that cap. The caller wants to know: a cut-off reply is
+    worth salvaging and is not worth repairing, since a repair would be sent with
+    a cap no bigger and cut off in the same place.
+
+    Returns `(None, False)` when there were no requests left to make one with —
+    which the caller turns into chapters written from the outline, not into an
+    error. A service that answered badly still raises; only a budget goes quiet.
     """
     live = live or _Live()
     start = _RUNG.get(config.model, RUNGS[0])
@@ -693,8 +773,9 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
         # that refuses two rungs could walk the total past the limit.
         allowed = min(cap, ledger.left - cost - TOKEN_RESERVE)
         if allowed < MIN_OUTPUT_TOKENS or not budget.take():
-            return None
+            return None, False
         charge = ledger.take(cost, allowed)
+        cut_off = False
         try:
             runnable = _bind(chat, rung, schema_name, schema, allowed)
             if live and config.stream:
@@ -703,10 +784,19 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
                 answered = runnable.invoke(messages)
                 reply, usage = _content(answered), _usage(answered)
         except Exception as error:
-            charge.failed()
-            if index < len(rungs) - 1 and _is_format_problem(error, config):
-                continue
-            failure = _readable(error, config)
+            if _is_cut_off(error):
+                # Not a failure. The reply reached the cap this very request
+                # sent with it, the rung it was sent at plainly worked, and the
+                # words are on the exception. So this goes on down the ordinary
+                # path with a reply that happens to stop mid-sentence — which is
+                # the thing `salvage_chapters` was written for.
+                cut_off = True
+                reply, usage = _cut_off_reply(error)
+            else:
+                charge.failed()
+                if index < len(rungs) - 1 and _is_format_problem(error, config):
+                    continue
+                failure = _readable(error, config)
         # Raised out here rather than inside the `except`, which matters more
         # than it looks. `raise ... from None` only stops Python *printing* the
         # original; the exception object stays reachable as `__context__`, and
@@ -718,7 +808,7 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
         reply = _content(reply)
         charge.settle(reply, usage)
         _RUNG[config.model] = rung
-        return reply
+        return reply, cut_off
     raise AIError("The model would not answer in JSON.")
 
 
@@ -1000,7 +1090,7 @@ def _asker(chat, config, budget, live=None, ledger=None):
             cap = afford(again)
             if not cap:
                 return None
-            mended = _invoke(
+            mended, _ = _invoke(
                 chat, config, again, schema_name, schema,
                 budget, live, ledger, cap,
             )
@@ -1017,7 +1107,7 @@ def _asker(chat, config, budget, live=None, ledger=None):
         if not cap:
             return None
 
-        reply = _invoke(
+        reply, cut_off = _invoke(
             chat, config, messages, schema_name, schema, budget, live, ledger, cap
         )
         if reply is None:
@@ -1031,7 +1121,12 @@ def _asker(chat, config, budget, live=None, ledger=None):
             data = None
             if salvage is not None:
                 data = salvage(reply) or None
-            if data is None:
+            # A reply that ran out of room is not repaired. A repair is another
+            # request, sent with a cap no bigger than the one this reply had
+            # just filled, so it would run out in the same place — and the
+            # request it spent is one the chapters after this one needed. What
+            # could not be salvaged is written from the plan instead.
+            if data is None and not cut_off:
                 data = repair(reply)
         if keep and data is not None:
             live.keep()
