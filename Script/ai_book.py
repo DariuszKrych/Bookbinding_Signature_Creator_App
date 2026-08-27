@@ -24,6 +24,19 @@ count is set in the schema, checked again after the reply, and printed on the
 button, and a description that asks for something long gets that story told in
 the same five chapters.
 
+**Every chapter gets the same room.** Which is a third budget, and the one that
+took a lopsided book to find. The tokens left after the outline are divided by
+the chapters that have to share them, once, before any of them is asked for —
+`chapter_allowance` — and the length the prompt asks for is cut to what that
+buys — `paragraph_plan`. Neither was true before: a batch took a *share of what
+was left when it was sent*, so an early batch that came back with nothing handed
+its whole allowance to the next one, and the prompt asked every batch for the
+same 320-word chapters however little it could afford. A book came back with
+chapters of 28, 27, 22, 322 and 224 words. Both of those functions exist to stop
+that, and the second is the load-bearing one: a chapter asked for three times
+what it can pay for is not a short chapter, it is a chapter chopped mid-word and
+salvaged into nothing.
+
 A whole book still will not survive one request — models cap their output, small
 ones especially, and a reply that runs out mid-chapter is not a short book but
 broken JSON. What
@@ -120,16 +133,45 @@ MAX_PROMPT_CHARS = 1000
 # batch is the first line or two of it, for flavour, and the plan does the work.
 PREMISE_TOKENS = 60
 
-# Paragraphs asked for per chapter, and the hard ceiling validation applies.
+# The longest a chapter is ever asked to be, and the shortest that is still
+# prose rather than a note. `paragraph_plan` picks a length between the two, and
+# picks it from what the chapter can actually pay for.
 #
-# A mini-novel, and sized to the token budget rather than to taste. Five chapters
-# of three or four paragraphs at about eighty words comes to roughly fourteen
-# hundred words, which is comfortably inside what `_Ledger` can allow for output
-# — the point being that the model is asked for less than its cap, so the cap is
-# a backstop and not a guillotine.
+# The pair used to be the whole story: every chapter was asked for three or four
+# paragraphs of eighty words however many tokens its batch had been given. That
+# is the bug the floor and `paragraph_plan` exist to fix — see there.
 WANTED_PARAGRAPHS = (3, 4)
 WANTED_WORDS = 80
+FEWEST_PARAGRAPHS = 1
+FEWEST_WORDS = 25
+
+# The hard ceiling validation applies, whatever was asked for.
 MAX_PARAGRAPHS = 20
+
+# What one word of finished prose costs in output tokens. Measured against a
+# real tokenizer over ordinary English: about 1.35, and it barely moves.
+TOKENS_PER_WORD = 1.35
+
+# What the JSON around one chapter costs before a word of it is written — the
+# number, the heading, the brackets, the quotes and the commas between the
+# paragraphs. Subtracted before the words are counted rather than folded into
+# the rate, because it is a fixed cost: on a chapter of eighty words it is
+# noise, and on a chapter of forty it is a fifth of the bill.
+CHAPTER_FRAMING = 25
+
+# How much of a chapter's allowance the prompt actually asks for. The rest is
+# the margin that lets a model which runs long still close its braces — and a
+# chapter that closes is worth more than a chapter that was nearly longer.
+ASK_FOR = 0.75
+
+# The allowance at which a chapter is asked for its full length. There is no use
+# giving one more than this: `paragraph_plan` stops growing here, so the tokens
+# above it would only be a cap no reply comes near. Capping the allowance is
+# also what stops a batch that had a windfall from writing chapters twice the
+# length of the ones before it.
+FULL_ALLOWANCE = CHAPTER_FRAMING + int(
+    WANTED_PARAGRAPHS[1] * WANTED_WORDS * TOKENS_PER_WORD / ASK_FOR
+)
 
 TEMPERATURE = 0.8
 
@@ -794,8 +836,18 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
                 reply, usage = _cut_off_reply(error)
             else:
                 charge.failed()
-                if index < len(rungs) - 1 and _is_format_problem(error, config):
+                if _is_format_problem(error, config):
+                    # Down a rung — or, when this was the last one, out of the
+                    # loop and back with nothing. A model that will not answer in
+                    # JSON at any of the three is not something the reader can
+                    # act on, and the chapters it did not write can be written
+                    # from the plan for nothing. This used to raise, and raising
+                    # is what turned a stubborn model into a broken book; a
+                    # bigger token budget only made it easier to reach, because
+                    # a request that used to be priced out now gets sent.
                     continue
+                # Everything else is a bad key, a rate limit, a service that is
+                # not answering. Those the reader has to be told about.
                 failure = _readable(error, config)
         # Raised out here rather than inside the `except`, which matters more
         # than it looks. `raise ... from None` only stops Python *printing* the
@@ -809,13 +861,18 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
         charge.settle(reply, usage)
         _RUNG[config.model] = rung
         return reply, cut_off
-    raise AIError("The model would not answer in JSON.")
+    # Every rung refused. `None` here means what it means everywhere else in
+    # this file: this could not be asked for, so it will be written from the
+    # plan instead.
+    return None, False
 
 
 # --------------------------------------------------------------------------
 # The token budget
 # --------------------------------------------------------------------------
-# A book may cost 5,000 tokens, input and output, start to finish. Not on
+# A book may cost `AI_TOKEN_LIMIT` tokens, input and output, start to finish —
+# 8,000 by default, and the number lives in `ai_config` so it can be read in one
+# place and changed in one place. Not on
 # average — ever. That is a hard number, and the way it is kept is worth stating
 # plainly, because "we ask nicely and hope" is the usual way and it is not this.
 #
@@ -849,6 +906,20 @@ TOKEN_RESERVE = 400
 # Below this an output cap is not worth sending: the reply would be cut off
 # mid-chapter and salvaged into nothing.
 MIN_OUTPUT_TOKENS = 160
+
+# What a chapter's allowance actually comes to on the ledger's books, per token
+# of that allowance. Two corrections that pull opposite ways:
+#
+# * A reply is measured by `estimate_tokens` when the service sends no `usage`,
+#   which is the ordinary case for a streamed one — and that reads about half
+#   again high. So the ledger records a batch spending more than its cap.
+# * But the reply is only ever as long as `paragraph_plan` asked for, which is
+#   `ASK_FOR` of the allowance rather than all of it.
+#
+# Planning at the cap ignores the second and starves the last batch; planning at
+# the words asked for ignores the first and does the same. Both were ways a book
+# came back with three chapters of one sentence and two of three hundred words.
+SETTLE_FACTOR = 1.5 * ASK_FOR
 
 # The most the outline may have. It is a page of headings, not prose, and every
 # token it does not take is a token of the book itself.
@@ -1070,7 +1141,15 @@ def _asker(chat, config, budget, live=None, ledger=None):
         later=0,
         ceiling=None,
     ):
-        messages = [("system", system), ("human", user)]
+        # `system` may be a function of the output cap rather than a string. A
+        # chapter request tells the model how long to make a chapter, and a
+        # length the cap cannot hold is a reply chopped mid-chapter — so the two
+        # have to be settled together. The cap is worked out from the nominal
+        # wording, since every wording `length_asked` produces is within a token
+        # or two of every other, and the request is then built with the wording
+        # that matches the cap actually granted.
+        sized = system if callable(system) else None
+        messages = [("system", sized(None) if sized else system), ("human", user)]
         # `share` is this request's portion of what is left — two chapters out of
         # the five still to write is two fifths of it — and `later` holds back
         # what the requests after this one will need simply to be sent.
@@ -1106,6 +1185,8 @@ def _asker(chat, config, budget, live=None, ledger=None):
         cap = afford(messages)
         if not cap:
             return None
+        if sized:
+            messages = [("system", sized(cap)), ("human", user)]
 
         reply, cut_off = _invoke(
             chat, config, messages, schema_name, schema, budget, live, ledger, cap
@@ -1251,12 +1332,60 @@ and nothing else:
 {{"chapters":[{{"number":1,"heading":"","paragraphs":["",""]}}]}}
 
 - Exactly the chapters asked for, in order, each keeping its "number".
-- {low} to {high} paragraphs each, about {words} words a paragraph. Keep to it:
-  a reply that runs out mid-sentence loses the chapter it was in.
+- {length} Keep to it: a reply that runs out mid-sentence loses the chapter it
+  was in, and every chapter here has the same room as every other.
 - Continue the book's voice. No preface, no summary, no explaining, and do not
   repeat the heading inside the paragraphs.
 
 {rules}"""
+
+
+def paragraph_plan(allowance):
+    """`(fewest, most, words)` — the chapter that `allowance` tokens can buy.
+
+    This is the answer to a book whose chapters came back 28, 27, 22, 322 and 224
+    words long, and the reason it happened is worth stating: the prompt used to
+    ask for three or four paragraphs of eighty words *whatever* the batch could
+    afford. That is about 430 tokens of chapter, against an allowance that is
+    often half of it. A model does what the prompt says, so the reply ran past
+    its cap and was chopped — and a chapter chopped before its closing brace is
+    not a short chapter, it is no chapter at all. The batch holding chapters one
+    to three was asked for three times what it could pay for and lost all three;
+    the batch after it inherited their tokens and wrote 322 words a chapter.
+
+    So the ask is cut to fit. Words come down first, because a chapter of three
+    short paragraphs still reads as a chapter; only when the words reach the
+    floor do the paragraphs go, down to a single one at the very bottom.
+
+    Nothing here is ever rounded *up* to a floor. A chapter asked for more than
+    it can hold is the failure this exists to prevent, and one short paragraph
+    that arrives beats two that are chopped in half.
+    """
+    words = max(0, int((allowance - CHAPTER_FRAMING) * ASK_FOR / TOKENS_PER_WORD))
+    most = WANTED_PARAGRAPHS[1]
+    while most > FEWEST_PARAGRAPHS and words // most < FEWEST_WORDS:
+        most -= 1
+    each = min(WANTED_WORDS, words // most)
+    return max(FEWEST_PARAGRAPHS, most - 1), most, max(1, each)
+
+
+def length_asked(fewest, most, words):
+    """The one sentence that tells the model how long a chapter is to be."""
+    if most <= 1:
+        return f"One paragraph each, of about {words} words."
+    count = (
+        f"Exactly {most} paragraphs"
+        if fewest >= most
+        else f"{fewest} to {most} paragraphs"
+    )
+    return f"{count} each, about {words} words a paragraph."
+
+
+def batch_system(allowance):
+    """The chapter-writing instructions, asking for a length that will fit."""
+    return _BATCH_SYSTEM.format(
+        length=length_asked(*paragraph_plan(allowance)), rules=STYLE_RULES
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1436,7 +1565,82 @@ def _prose(entry, fallback_heading, number):
     }
 
 
-def write_batch(plan, numbers, ask, config, share=1.0, later=0):
+def batch_user(plan, numbers):
+    """The half of a chapter request that changes: the plan, and what to write.
+
+    Its own function because the allowance arithmetic has to price a chapter
+    request before there is one to price — see `chapter_allowance`. Two ways of
+    building the same message would be two ways of costing it, and the ledger's
+    sums are only worth anything if what is measured is what is sent.
+    """
+    chapters = plan["chapters"]
+    outline = "\n".join(
+        f"{number}. {chapter['heading']} — {chapter['summary'] or '(follow the book)'}"
+        for number, chapter in enumerate(chapters, start=1)
+    )
+    return (
+        f"{plan['title']}, by {plan['author']}. {plan['style_note']}\n"
+        f"About: {shorten(plan['premise'], PREMISE_TOKENS)}\n\n"
+        f"The plan, all {len(chapters)} chapters:\n{outline}\n\n"
+        f"Write chapters {', '.join(str(number) for number in numbers)} now, "
+        "in that order."
+    )
+
+
+def _batch_cost(plan, size):
+    """What one chapter request of `size` chapters costs to send."""
+    numbers = list(range(1, size + 1))
+    messages = [
+        # Priced at the full-length ask. Every sentence `length_asked` can
+        # produce is within a token or two of every other, so which one is used
+        # here changes nothing `TOKEN_RESERVE` does not already cover.
+        ("system", batch_system(FULL_ALLOWANCE)),
+        ("human", batch_user(plan, numbers)),
+    ]
+    return estimate_request(messages, batch_schema(size))
+
+
+def affordable_batches(ledger, plan, wanted, total):
+    """`wanted` chapter requests, cut to the number the tokens left can send.
+
+    Every batch carries the whole plan, so batches cost input whether or not
+    they have room to write anything with. Asking for more of them than the
+    ledger can pay for used to mean the early ones were priced out one by one
+    while the last one — which holds back nothing for anybody after it — got
+    whatever was left. Fewer, fuller requests are better than more, starved
+    ones, and they are the same book in fewer pieces.
+    """
+    cost = _batch_cost(plan, total)
+    room = ledger.left - TOKEN_RESERVE
+    return max(1, min(wanted, room // max(1, cost + MIN_OUTPUT_TOKENS)))
+
+
+def chapter_allowance(ledger, plan, sizes):
+    """The output tokens one chapter may have — the same number for every one.
+
+    Worked out once, before any chapter is asked for, and it is the whole of the
+    answer to a book whose chapters were 28, 27, 22, 322 and 224 words long.
+
+    A `share` of what is left cannot give it. A batch is allotted its fraction of
+    the tokens remaining *at the moment it is sent*, so everything an earlier
+    batch did not spend is inherited by the batch after it — and a batch that
+    came back with nothing hands on its whole allowance. The last chapters of the
+    book were not written better, they were funded twice as well.
+
+    Dividing what is affordable by the chapters that have to share it fixes both
+    ends: an early batch cannot be starved by an expensive outline, and a late
+    one cannot be fattened by an early failure.
+    """
+    total = sum(sizes) or 1
+    room = ledger.left - len(sizes) * _batch_cost(plan, max(sizes or [1])) - TOKEN_RESERVE
+    # Divided by what the chapters will be *charged*, not by what they will
+    # cost: see `SETTLE_FACTOR`. Without it the first batch is allotted a share
+    # it then overruns on the ledger's books, and the last batch pays for it.
+    return min(FULL_ALLOWANCE, int(max(0, room) / (SETTLE_FACTOR * total)))
+
+
+def write_batch(plan, numbers, ask, config, share=1.0, later=0,
+                allowance=FULL_ALLOWANCE):
     """Ask for several chapters at once. `numbers` are 1-based, in order.
 
     Every request carries the whole outline, so the model always knows where in
@@ -1445,32 +1649,29 @@ def write_batch(plan, numbers, ask, config, share=1.0, later=0):
     budget on repetition — the outline is what holds the book together, and it
     is small.
 
-    `share` is this batch's portion of the tokens left, and `later` how many
-    batches follow it. Both go to the ledger, which turns them into the output
-    cap this request is allowed. Coming back empty-handed is a legal answer.
-    """
-    chapters = plan["chapters"]
-    outline = "\n".join(
-        f"{number}. {chapter['heading']} — {chapter['summary'] or '(follow the book)'}"
-        for number, chapter in enumerate(chapters, start=1)
-    )
+    `allowance` is what one chapter may spend, and it does two things here: it
+    sizes the request's cap, and it sizes what the prompt asks for. Both, because
+    a cap the prompt ignores is a reply that gets chopped — see `paragraph_plan`.
 
-    user = (
-        f"{plan['title']}, by {plan['author']}. {plan['style_note']}\n"
-        f"About: {shorten(plan['premise'], PREMISE_TOKENS)}\n\n"
-        f"The plan, all {len(chapters)} chapters:\n{outline}\n\n"
-        f"Write chapters {', '.join(str(number) for number in numbers)} now, "
-        "in that order."
-    )
-    system = _BATCH_SYSTEM.format(
-        low=WANTED_PARAGRAPHS[0],
-        high=WANTED_PARAGRAPHS[1],
-        words=WANTED_WORDS,
-        rules=STYLE_RULES,
-    )
+    `share` is this batch's portion of the tokens left, and `later` how many
+    batches follow it. Both go to the ledger, which turns them into a second cap
+    this request may not exceed; the allowance is the one that normally binds,
+    and the ledger's is what keeps the whole-book limit true whatever else
+    changes here. Coming back empty-handed is a legal answer.
+    """
+    def system(cap):
+        """The instructions, asking for what this request's cap can hold.
+
+        `cap` is `None` while the cap is still being worked out — see `ask` —
+        and the allowance is the right answer then, being what the cap is
+        expected to come to.
+        """
+        each = allowance if cap is None else cap // len(numbers)
+        return batch_system(min(allowance, each))
+
     data = ask(
         system,
-        user,
+        batch_user(plan, numbers),
         "book_chapters",
         batch_schema(len(numbers)),
         salvage_chapters,
@@ -1479,6 +1680,8 @@ def write_batch(plan, numbers, ask, config, share=1.0, later=0):
         keep=True,
         share=share,
         later=later,
+        # The same room per chapter whichever batch it happens to be in.
+        ceiling=len(numbers) * allowance,
     )
 
     raw = data.get("chapters") if isinstance(data, dict) else None
@@ -1501,7 +1704,7 @@ def write_batch(plan, numbers, ask, config, share=1.0, later=0):
             number = numbers[position] if position < len(numbers) else None
         if number is None or number in written:
             continue
-        prose = _prose(entry, chapters[number - 1]["heading"], number)
+        prose = _prose(entry, plan["chapters"][number - 1]["heading"], number)
         if prose:
             written[number] = prose
     return [written[number] for number in numbers if number in written]
@@ -1642,8 +1845,13 @@ def write_book(prompt, *, design=None, progress=None, on_text=None, config=None)
     _say(progress, 0.0, f"Planning {total} chapters…")
     plan = build_outline(prompt, ask, config)
 
-    # One request for the outline, and the rest shared out between the chapters.
-    sizes = split_batches(total, budget.left)
+    # One request for the outline, and the rest shared out between the chapters —
+    # but no more of them than the tokens left can pay to send, and with the
+    # tokens divided evenly per chapter rather than per batch. Both are worked
+    # out here, once, while every chapter is still ahead of us: after the first
+    # batch has spent or refused its share it is too late to be fair about it.
+    sizes = split_batches(total, affordable_batches(ledger, plan, budget.left, total))
+    allowance = chapter_allowance(ledger, plan, sizes)
     _say(progress, 0.12, f"{total} chapters planned. Writing them now.")
 
     written = {}
@@ -1669,9 +1877,11 @@ def write_book(prompt, *, design=None, progress=None, on_text=None, config=None)
             ask,
             config,
             # This batch's portion of what is left, and how many batches are
-            # still to be paid for after it.
+            # still to be paid for after it. Both are the ledger's safety net
+            # now; `allowance` is what decides how long these chapters are.
             share=size / max(1, total - done),
             later=len(sizes) - index - 1,
+            allowance=allowance,
         ):
             written[chapter["number"]] = chapter
         done += size

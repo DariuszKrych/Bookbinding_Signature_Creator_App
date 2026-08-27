@@ -72,7 +72,12 @@ STREAM_VAR = "AI_STREAM"
 TOKEN_LIMIT_VAR = "AI_TOKEN_LIMIT"
 
 DEFAULT_TITLE = "Bookbinding Signature Creator"
-DEFAULT_TIMEOUT = 90.0
+
+# Seconds one request may take. Raised with the token limit: a batch of three
+# full-length chapters is a couple of thousand tokens of writing, and a slow
+# provider serves those at a crawl. Three of these still fit inside the whole
+# book's budget below.
+DEFAULT_TIMEOUT = 120.0
 DEFAULT_BUDGET = 420.0
 
 # Off, because the model above is a paid one and a guard set to refuse every paid
@@ -111,7 +116,16 @@ DEFAULT_MAX_CALLS = 3
 # from the outline instead, which costs nothing.
 #
 # So lowering this shortens the book. It cannot break it.
-DEFAULT_TOKEN_LIMIT = 5000
+#
+# Eight thousand rather than the five it started at. At five, a description near
+# the thousand-character maximum was charged so much of the budget — the
+# untrusted rate is deliberately about three times what English really costs —
+# that the five chapters were left about forty words each. Eight buys back the
+# chapters a long description was spending, and leaves a short one asking for a
+# full-length chapter every time (`ai_book.FULL_ALLOWANCE`), which is the most
+# `WANTED_PARAGRAPHS` and `WANTED_WORDS` describe. On the default model that is
+# still well under a penny a book.
+DEFAULT_TOKEN_LIMIT = 8000
 
 # The repository root, i.e. the folder holding `app.py`.
 ROOT_DIR = Path(__file__).resolve().parent.parent

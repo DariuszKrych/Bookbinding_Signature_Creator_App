@@ -16,6 +16,7 @@ from a real free model, and every one has a test.
 import json
 import os
 import random
+import re
 import shutil
 import sys
 import tempfile
@@ -39,6 +40,11 @@ FAKE_KEY = "sk-or-" + "v1-" + "0123456789abcdef" * 2
 # again, so changing it in one place does not leave a row of tests asserting the
 # old name.
 DEFAULT_MODEL = ai_config.DEFAULT_MODEL
+
+# And the token ceiling, for the same reason and more of it: forty assertions
+# below are "not one token over", and a literal in every one of them is forty
+# places to miss when the ceiling moves.
+LIMIT = ai_config.DEFAULT_TOKEN_LIMIT
 
 
 def settings(**changes):
@@ -353,6 +359,20 @@ class TestTheFormatLadder(AiTestCase):
         # The chapter request did not repeat the probe.
         self.assertEqual(ai_book._RUNG[DEFAULT_MODEL], "json_object")
         self.assertEqual(chat.bindings[2]["response_format"]["type"], "json_object")
+
+    def test_a_model_that_refuses_every_rung_gives_a_book_not_an_error(self):
+        """The bottom of the ladder is a shorter book, like every other limit here.
+
+        Three refusals is a stubborn model, not something the reader can act on,
+        and the plan can write the chapters for nothing. This used to raise —
+        rarely, because a book usually ran out of tokens before it could refuse
+        three times, which is exactly the sort of bug a bigger budget uncovers.
+        """
+        refusal = RuntimeError("400 response_format json_schema is unsupported")
+        chat = FakeChat(*[refusal] * 9)
+        book = self.run_book(chat, config=settings(max_calls=9))
+        self.assertEqual(len(book.chapters), 5)
+        self.assertTrue(all(chapter.text.strip() for chapter in book.chapters))
 
     def test_a_rate_limit_does_not_drop_a_rung(self):
         """Only a format complaint downgrades; anything else is reported at once."""
@@ -1052,6 +1072,188 @@ class TestWatchingTheBookBeingWritten(AiTestCase):
         self.assertIn("Chapter 1, first.", seen[-1])
 
 
+class DutifulChat(FakeChat):
+    """A model that does as it is told, and a service that cuts it off.
+
+    The one behaviour no scripted reply can show, and the whole of what went
+    wrong: it writes the length the prompt asked for — a little over, as models
+    do — and the reply is then chopped wherever `max_tokens` lands.
+
+    That was a loop the old prompt could not win. It asked for the same 320-word
+    chapters however small the cap, so the reply always ran past it, the chapters
+    after the cut were always lost, and their tokens were always inherited by the
+    batch that came next. Every chapter here is what the prompt asked for, so a
+    book that comes back lopsided came back lopsided for a reason.
+    """
+
+    VOCABULARY = (
+        "paper thread linen bone folder wire spine gather sewn fold sheet quire "
+        "needle wax board cloth glue press trim head tail band leather rain"
+    ).split()
+
+    # Models run long rather than short, and the margin has to survive it.
+    OVERRUN = 1.15
+
+    def __init__(self, chapters=5):
+        super().__init__()
+        self.chapters = chapters
+        self.cap = None
+
+    def bind(self, **kwargs):
+        self.cap = kwargs.get("max_tokens")
+        return super().bind(**kwargs)
+
+    def _prose(self, count):
+        words = [self.VOCABULARY[i % len(self.VOCABULARY)] for i in range(count)]
+        return " ".join(words).capitalize() + "."
+
+    def _asked(self, system, user):
+        """The chapters wanted and the length wanted, read off the prompt."""
+        numbers = [
+            int(piece)
+            for piece in re.search(r"Write chapters ([\d, ]+) now", user)
+            .group(1)
+            .split(",")
+        ]
+        found = re.search(r"(?:to|Exactly) (\d+) paragraphs", system)
+        most = int(found.group(1)) if found else 1
+        return numbers, most, int(re.search(r"about (\d+) words", system).group(1))
+
+    def _next(self, messages):
+        self.calls.append(messages)
+        system, user = messages[0][1], messages[1][1]
+        if "You plan short books" in system:
+            body = outline_reply(self.chapters)
+        else:
+            numbers, most, words = self._asked(system, user)
+            body = json.dumps(
+                {
+                    "chapters": [
+                        {
+                            "number": number,
+                            "heading": f"Chapter {number}",
+                            "paragraphs": [
+                                self._prose(int(words * self.OVERRUN))
+                                for _ in range(most)
+                            ],
+                        }
+                        for number in numbers
+                    ]
+                }
+            )
+        # Four bytes to the token, which is about what the service counts, and
+        # the cut is where the cap falls rather than where a sentence ends.
+        return body[: self.cap * 4] if self.cap else body
+
+
+class TestEveryChapterGetsTheSameRoom(AiTestCase):
+    """The book that came back 28, 27, 22, 322 and 224 words long.
+
+    Two faults that made each other worse. The tokens were shared out a batch at
+    a time, so whatever an early batch did not spend was inherited by the batch
+    after it; and the prompt asked every batch for the same 320-word chapters
+    however little it could afford, so a batch asked for three times its cap ran
+    past it, lost every chapter after the cut, and handed all of its tokens on.
+    """
+
+    def chapter_words(self, book):
+        return [len(chapter.text.split()) for chapter in book.chapters]
+
+    # ---- the ask fits the room ------------------------------------------
+
+    def test_the_length_asked_for_always_fits_the_room_given(self):
+        """The fault that lost three chapters: a prompt that ignored the cap."""
+        for allowance in (ai_book.FULL_ALLOWANCE, 900, 400, 250, 160, 90, 60):
+            with self.subTest(allowance=allowance):
+                _fewest, most, words = ai_book.paragraph_plan(allowance)
+                asked = most * words * ai_book.TOKENS_PER_WORD + ai_book.CHAPTER_FRAMING
+                self.assertLess(asked, allowance)
+
+    def test_the_full_length_is_still_asked_for_when_there_is_room(self):
+        """Nothing above is a reason to write a smaller book than the tokens buy."""
+        self.assertEqual(
+            ai_book.paragraph_plan(ai_book.FULL_ALLOWANCE),
+            (ai_book.WANTED_PARAGRAPHS[0], ai_book.WANTED_PARAGRAPHS[1],
+             ai_book.WANTED_WORDS),
+        )
+
+    def test_less_room_asks_for_less_and_never_for_more(self):
+        asked = [
+            ai_book.paragraph_plan(allowance)[1] * ai_book.paragraph_plan(allowance)[2]
+            for allowance in (80, 150, 250, 400, 600)
+        ]
+        self.assertEqual(asked, sorted(asked))
+
+    def test_the_prompt_says_the_length_the_cap_actually_allows(self):
+        """Planned and granted are not always the same number. The prompt
+        follows the one the service was told."""
+        chat = FakeChat(*whole_book())
+        self.run_book(chat)
+        for messages, binding, size in zip(chat.calls[1:], chat.bindings[1:], (3, 2)):
+            cap = binding["max_tokens"]
+            wanted = ai_book.length_asked(*ai_book.paragraph_plan(cap // size))
+            self.assertIn(wanted, messages[0][1])
+
+    # ---- and the room is the same for every chapter -----------------------
+
+    def test_every_batch_is_given_the_same_room_per_chapter(self):
+        chat = FakeChat(*whole_book())
+        self.run_book(chat)
+        each = [
+            binding["max_tokens"] / size
+            for binding, size in zip(chat.bindings[1:], (3, 2))
+        ]
+        self.assertAlmostEqual(each[0], each[1], delta=1)
+
+    def test_a_batch_that_came_back_with_nothing_does_not_fatten_the_next(self):
+        """The half of the fault that made chapter four three hundred words."""
+        whole = FakeChat(*whole_book())
+        self.run_book(whole)
+        ai_book._RUNG.clear()
+        # Valid JSON holding no chapters: nothing to keep, and no repair either,
+        # so the second batch is reached with the first batch's tokens unspent.
+        lost = FakeChat(
+            outline_reply(5), json.dumps({"chapters": []}), batch_reply(4, 5)
+        )
+        self.run_book(lost)
+        self.assertEqual(
+            whole.bindings[2]["max_tokens"], lost.bindings[2]["max_tokens"]
+        )
+
+    # ---- end to end, against a model that does as it is told ---------------
+
+    def test_a_whole_book_comes_back_evenly_written(self):
+        """The report this was fixed for, driven the way it happened."""
+        descriptions = {
+            "a short one": "a book about paper",
+            # Long enough to make the outline expensive, which is what left the
+            # first batch too poor to write the chapters it had been given.
+            "a long one": "paper, and the people who fold it, and why " * 17,
+        }
+        for name, description in descriptions.items():
+            with self.subTest(name):
+                ai_book._RUNG.clear()
+                book = self.run_book(DutifulChat(), prompt=description)
+                counts = self.chapter_words(book)
+                self.assertEqual(len(counts), 5, name)
+                # The book that prompted this had a spread of fourteen to one.
+                self.assertLessEqual(max(counts), min(counts) * 1.5, counts)
+
+    def test_no_chapter_comes_back_as_its_own_plan_entry(self):
+        """A summary in the editor is the fallback, not the ordinary outcome."""
+        book = self.run_book(DutifulChat(), prompt="paper, and folding it " * 32)
+        summaries = {f"What happens in {n}." for n in range(1, 6)}
+        for chapter in book.chapters:
+            self.assertNotIn(chapter.text, summaries)
+
+    def test_fewer_requests_are_used_when_they_cannot_all_be_paid_for(self):
+        """Nine starved requests are not a book; two full ones are."""
+        chat = FakeChat(outline_reply(12), *[batch_reply(1)] * 9)
+        book = self.run_book(chat, config=settings(chapters=12, max_calls=10))
+        self.assertEqual(len(book.chapters), 12)
+        self.assertLess(len(chat.calls), 10)
+
+
 def _schema_of(binding):
     """The bare schema out of a recorded `response_format`, or `None`.
 
@@ -1112,7 +1314,7 @@ class GreedyChat(FakeChat):
 
 
 class TestTheTokenLimit(AiTestCase):
-    """5,000 tokens a book, input and output, and never one more.
+    """`LIMIT` tokens a book, input and output, and never one more.
 
     The guarantee rests on two things and they are checked separately below,
     because together they are the whole argument:
@@ -1188,7 +1390,10 @@ class TestTheTokenLimit(AiTestCase):
         samples = [
             ai_book.STYLE_RULES,
             ai_book._OUTLINE_SYSTEM.format(chapters=5),
-            ai_book._BATCH_SYSTEM.format(low=3, high=4, words=80, rules=ai_book.STYLE_RULES),
+            ai_book.batch_system(ai_book.FULL_ALLOWANCE),
+            # The shortest ask too: it is a different sentence, and the estimate
+            # has to read high for that one as well.
+            ai_book.batch_system(ai_book.MIN_OUTPUT_TOKENS),
             ai_book._REPAIR,
             json.dumps(ai_book.OUTLINE_SCHEMA),
             json.dumps(ai_book.BATCH_SCHEMA),
@@ -1226,9 +1431,8 @@ class TestTheTokenLimit(AiTestCase):
         ours = [
             ai_book.STYLE_RULES,
             ai_book._OUTLINE_SYSTEM.format(chapters=5),
-            ai_book._BATCH_SYSTEM.format(
-                low=3, high=4, words=80, rules=ai_book.STYLE_RULES
-            ),
+            ai_book.batch_system(ai_book.FULL_ALLOWANCE),
+            ai_book.batch_system(ai_book.MIN_OUTPUT_TOKENS),
             ai_book._REPAIR,
             ai_book._REPAIR_SYSTEM,
             json.dumps(ai_book.outline_schema(5)),
@@ -1246,20 +1450,20 @@ class TestTheTokenLimit(AiTestCase):
     def test_an_ordinary_book_stays_inside_the_limit(self):
         chat = GreedyChat(*whole_book())
         self.run_book(chat)
-        self.assertLessEqual(self.spend(chat), 5000)
+        self.assertLessEqual(self.spend(chat), LIMIT)
 
     def test_a_greedy_model_cannot_push_it_over(self):
         """Every reply as long as it was allowed to be, on every request."""
         chat = GreedyChat(*whole_book())
         book = self.run_book(chat)
-        self.assertLessEqual(self.spend(chat), 5000)
+        self.assertLessEqual(self.spend(chat), LIMIT)
         self.assertEqual(len(book.chapters), 5)
 
     def test_the_ledger_agrees_it_never_went_over(self):
         chat = GreedyChat(*whole_book())
         ledger = self.run_watching_the_ledger(chat)
-        self.assertLessEqual(ledger.spent, 5000)
-        self.assertLessEqual(sum(ledger.used), 5000)
+        self.assertLessEqual(ledger.spent, LIMIT)
+        self.assertLessEqual(sum(ledger.used), LIMIT)
 
     def run_watching_the_ledger(self, chat, config=None, **kwargs):
         """Run a book and hand back the `_Ledger` it used."""
@@ -1281,19 +1485,19 @@ class TestTheTokenLimit(AiTestCase):
     def test_a_description_at_its_full_length_does_not_break_it(self):
         chat = GreedyChat(*whole_book())
         self.run_book(chat, "paperclips and their discontents " * 40)
-        self.assertLessEqual(self.spend(chat), 5000)
+        self.assertLessEqual(self.spend(chat), LIMIT)
 
     def test_a_description_in_another_script_does_not_break_it(self):
         """Bytes, not characters — a thousand characters of Chinese is three
         thousand bytes and the estimate has to know it."""
         chat = GreedyChat(*whole_book())
         self.run_book(chat, "组装书页的方法，" * 120)
-        self.assertLessEqual(self.spend(chat), 5000)
+        self.assertLessEqual(self.spend(chat), LIMIT)
 
     def test_a_repair_does_not_break_it(self):
         chat = GreedyChat(outline_reply(5), "not json at all", batch_reply(1, 2, 3))
         self.run_book(chat)
-        self.assertLessEqual(self.spend(chat), 5000)
+        self.assertLessEqual(self.spend(chat), LIMIT)
 
     def test_a_format_downgrade_does_not_break_it(self):
         chat = GreedyChat(
@@ -1303,19 +1507,19 @@ class TestTheTokenLimit(AiTestCase):
             batch_reply(4, 5),
         )
         self.run_book(chat, config=settings(max_calls=4))
-        self.assertLessEqual(self.spend(chat), 5000)
+        self.assertLessEqual(self.spend(chat), LIMIT)
 
     def test_more_requests_do_not_buy_more_tokens(self):
         """The two budgets are not the same budget. Raising one is not raising
         the other, and the token limit is the one that binds."""
         chat = GreedyChat(outline_reply(5), *[batch_reply(1)] * 9)
         self.run_book(chat, config=settings(max_calls=10))
-        self.assertLessEqual(self.spend(chat), 5000)
+        self.assertLessEqual(self.spend(chat), LIMIT)
 
     def test_more_chapters_do_not_buy_more_tokens(self):
         chat = GreedyChat(outline_reply(12), *[batch_reply(1)] * 9)
         self.run_book(chat, config=settings(chapters=12, max_calls=10))
-        self.assertLessEqual(self.spend(chat), 5000)
+        self.assertLessEqual(self.spend(chat), LIMIT)
 
     # ---- and it is still a book ------------------------------------------
 
@@ -1342,7 +1546,7 @@ class TestTheTokenLimit(AiTestCase):
                 book = self.run_book(chat)
                 self.assertEqual(len(book.chapters), 5, name)
                 self.assertTrue(all(c.text.strip() for c in book.chapters), name)
-                self.assertLessEqual(self.spend(chat), 5000, name)
+                self.assertLessEqual(self.spend(chat), LIMIT, name)
 
     def test_a_limit_too_small_to_ask_anything_still_gives_a_book(self):
         """The floor of the whole design: no requests at all, still five
@@ -1355,14 +1559,14 @@ class TestTheTokenLimit(AiTestCase):
 
     def test_a_smaller_limit_makes_a_shorter_book_not_a_broken_one(self):
         lengths = {}
-        for limit in (1200, 2500, 5000):
+        for limit in (1200, 2500, LIMIT):
             ai_book._RUNG.clear()
             chat = GreedyChat(*whole_book())
             book = self.run_book(chat, config=settings(token_limit=limit))
             self.assertEqual(len(book.chapters), 5, limit)
             self.assertLessEqual(self.spend(chat), limit, limit)
             lengths[limit] = book.words
-        self.assertLess(lengths[1200], lengths[5000])
+        self.assertLess(lengths[1200], lengths[LIMIT])
 
     # ---- the ground truth ------------------------------------------------
 
@@ -1386,7 +1590,7 @@ class TestTheTokenLimit(AiTestCase):
         """The whole guarantee, measured rather than argued.
 
         Nine ways a book can go, every reply as long as the service would have
-        let it be, counted by a real BPE tokenizer. None of them may pass 5,000.
+        let it be, counted by a real BPE tokenizer. None may pass the limit.
         """
         runs = {
             "an ordinary book": (whole_book(), "a book about paperclips"),
@@ -1446,7 +1650,7 @@ class TestTheTokenLimit(AiTestCase):
                     chat, description, config=settings(max_calls=4)
                 )
                 billed = self.real_spend(chat, encoding)
-                self.assertLessEqual(billed, 5000, f"{name}: billed {billed}")
+                self.assertLessEqual(billed, LIMIT, f"{name}: billed {billed}")
                 self.assertEqual(len(book.chapters), 5, name)
                 self.assertTrue(all(c.text.strip() for c in book.chapters), name)
 
@@ -1489,7 +1693,7 @@ class TestTheTokenLimit(AiTestCase):
             if not description.strip():
                 continue  # An empty box is refused before any of this, rightly.
             replies = [rng.choice(misbehaviours)() for _ in range(rng.randint(1, 6))]
-            limit = rng.choice([400, 900, 1500, 2500, 5000])
+            limit = rng.choice([400, 900, 1500, 2500, LIMIT])
             chapters = rng.choice([1, 3, 5, 8])
             calls = rng.choice([1, 2, 3, 5])
             chat = GreedyChat(*replies, *["and nothing more"] * 8)
@@ -1511,7 +1715,7 @@ class TestTheTokenLimit(AiTestCase):
         """Not just what was said — what every reply was *allowed* to say."""
         chat = GreedyChat(*whole_book())
         self.run_book(chat)
-        self.assertLessEqual(self.caps_allowed(chat), 5000)
+        self.assertLessEqual(self.caps_allowed(chat), LIMIT)
 
     def test_the_limit_can_be_set_from_the_environment(self):
         with mock.patch.dict(
