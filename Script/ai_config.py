@@ -38,51 +38,51 @@ from pathlib import Path
 # `langchain_openai.ChatOpenAI` talk to it without a bespoke client.
 BASE_URL = "https://openrouter.ai/api/v1"
 
-# A router, not a model.
+# One model, named, and the same one every time.
 #
-# `openrouter/free` picks from whatever free models are available at that moment
-# and — the part this app depends on — narrows them to the ones that support the
-# features the request needs, which here means structured JSON output. Naming a
-# single model instead would mean editing this file every time a free model is
-# retired or renamed, which is the maintenance this default exists to avoid.
+# Small and quick is the whole point: at eight billion parameters this answers in
+# a fraction of the time a large model takes, and the app's problem was never the
+# quality of the prose but the length of the wait in front of it.
 #
-# It selects at random per request, so two chapters of one book can be written by
-# two different models. `ai_book` sends the outline and the style note with every
-# chapter for that reason.
-DEFAULT_MODEL = "openrouter/free"
+# Which provider serves it is left to OpenRouter. Five of them offer this model
+# and OpenRouter's own routing already leans hard on cost; there is no `provider`
+# block in the request telling it otherwise.
+#
+# It is not free. It is about as close as a paid model gets — $0.02 per million
+# tokens in and $0.04 out, so a whole book costs a small fraction of a penny —
+# but "not free" is why `DEFAULT_FREE_ONLY` below is off. The credit limit on the
+# key is what makes the ceiling real.
+DEFAULT_MODEL = "meta-llama/llama-3.1-8b-instruct"
+
+# OpenRouter's free-model router, kept as a name because two things still point
+# at it: the message a free-only copy prints when it refuses a paid model, and
+# `is_free`. It picks from whatever free models exist at that moment, which is
+# what makes it the one model name that never goes stale.
+FREE_MODEL = "openrouter/free"
 
 KEY_VAR = "OPENROUTER_API_KEY"
 MODEL_VAR = "OPENROUTER_MODEL"
 FREE_ONLY_VAR = "OPENROUTER_FREE_ONLY"
 TITLE_VAR = "OPENROUTER_APP_TITLE"
-SORT_VAR = "OPENROUTER_PROVIDER_SORT"
 TIMEOUT_VAR = "AI_CALL_TIMEOUT_SECONDS"
 BUDGET_VAR = "AI_TOTAL_BUDGET_SECONDS"
 CHAPTERS_VAR = "AI_CHAPTERS"
 MAX_CALLS_VAR = "AI_MAX_CALLS_PER_BOOK"
 STREAM_VAR = "AI_STREAM"
+TOKEN_LIMIT_VAR = "AI_TOKEN_LIMIT"
 
 DEFAULT_TITLE = "Bookbinding Signature Creator"
 DEFAULT_TIMEOUT = 90.0
 DEFAULT_BUDGET = 420.0
 
-# Which provider OpenRouter should route to, when several of them serve the same
-# model.
+# Off, because the model above is a paid one and a guard set to refuse every paid
+# model would refuse this app's own default — the button would be switched on,
+# and every press would come back with a refusal.
 #
-# The same free model is usually hosted by more than one provider, and they are
-# not equally quick — the slow one can take several times as long for the same
-# reply. Left alone, OpenRouter balances by its own default order; `throughput`
-# tells it to pick whichever provider is currently producing the most tokens per
-# second, which is the one that finishes a chapter first.
-#
-# The three OpenRouter accepts. Anything else here would be sent to the API only
-# to be refused, so an unrecognised value falls back to the default the way a
-# mistyped number does.
-DEFAULT_SORT = "throughput"
-SORTS = ("throughput", "latency", "price")
-# Written in the environment to send no `provider` block at all, i.e. to leave
-# the routing entirely to OpenRouter.
-SORT_OFF = ("off", "none", "default")
+# The guard itself is untouched and still worth having. Set `OPENROUTER_FREE_ONLY`
+# to 1 on a copy that must not be able to spend anything, and set
+# `OPENROUTER_MODEL` to `openrouter/free` or a `:free` model to go with it.
+DEFAULT_FREE_ONLY = False
 
 # Exactly this many chapters, every time, whatever the description asks for.
 #
@@ -94,11 +94,24 @@ DEFAULT_CHAPTERS = 5
 
 # The most requests one book may cost, counting every retry and repair.
 #
-# OpenRouter's free tier allows about 50 requests a day, shared across the whole
-# app. A chapter-per-request book spent one plus one per chapter — six for five
-# chapters, so eight books a day. Batching the chapters into the calls that are
-# left brings that to three, and the cap is enforced rather than hoped for.
+# Three, because a request is the unit of everything expensive here: of time
+# waited, of tokens paid for, and — on a copy configured with a free model — of a
+# daily ration of about fifty shared by everyone using it. A chapter-per-request
+# book spent one plus one per chapter; batching the chapters into the calls left
+# over brings that to three, and the cap is enforced rather than hoped for.
 DEFAULT_MAX_CALLS = 3
+
+# Every token one book may cost, input and output, from the first request to the
+# last. A ceiling, not a target: most books come in well under it.
+#
+# It is kept rather than hoped for. `ai_book._Ledger` measures what a request
+# will cost to send, sends `max_tokens` so the reply cannot exceed what is left,
+# and charges the worst case before the request goes out. A request that will
+# not fit is not made at all — the chapters it would have written are filled in
+# from the outline instead, which costs nothing.
+#
+# So lowering this shortens the book. It cannot break it.
+DEFAULT_TOKEN_LIMIT = 5000
 
 # The repository root, i.e. the folder holding `app.py`.
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -123,10 +136,10 @@ class Settings:
     budget: float
     chapters: int
     max_calls: int
-    # Both have defaults so that the two speed settings could be added without
-    # touching every place a `Settings` is built by hand.
-    sort: str = DEFAULT_SORT
+    # Defaulted so that these could be added without touching every place a
+    # `Settings` is built by hand.
     stream: bool = True
+    token_limit: int = DEFAULT_TOKEN_LIMIT
 
     @property
     def batches(self):
@@ -134,25 +147,16 @@ class Settings:
         return max(1, self.max_calls - 1)
 
     @property
-    def provider(self):
-        """The `provider` block to send with the request, or `None` for none.
-
-        OpenRouter reads this out of the request body and uses it to choose
-        between the providers serving the model. `{"sort": "throughput"}` asks
-        for the fastest one by tokens per second — the whole reason this exists,
-        since a book is three replies and the difference between the quickest
-        provider and the slowest is felt on every one of them.
-        """
-        return {"sort": self.sort} if self.sort else None
-
-    @property
     def is_free(self):
-        """Whether this model can cost money.
+        """Whether this model is one that cannot cost anything.
 
         `openrouter/free` is the free-model router; a `:free` suffix is one
-        specific free model. Anything else has a price per token.
+        specific free model. Everything else has a price per token, the app's own
+        default included — which is exactly why this is not written in terms of
+        `DEFAULT_MODEL`. A guard that counted the default as free by definition
+        would be no guard at all.
         """
-        return self.model == DEFAULT_MODEL or self.model.endswith(":free")
+        return self.model == FREE_MODEL or self.model.endswith(":free")
 
 
 def load_env(path=None):
@@ -205,35 +209,20 @@ def _flag(name, default=True):
     return raw not in {"0", "false", "no", "off"}
 
 
-def _sort(name=SORT_VAR):
-    """Which provider ordering to ask OpenRouter for. `""` means ask for none.
-
-    Unrecognised values fall back to the default rather than being forwarded:
-    OpenRouter refuses a sort rule it does not know, and a typo in a Render
-    environment variable should not turn every request into a 400.
-    """
-    raw = _text(name).lower()
-    if not raw:
-        return DEFAULT_SORT
-    if raw in SORT_OFF:
-        return ""
-    return raw if raw in SORTS else DEFAULT_SORT
-
-
 def settings():
     """The current settings, read fresh from the environment."""
     return Settings(
         api_key=_text(KEY_VAR),
         model=_text(MODEL_VAR, DEFAULT_MODEL),
         base_url=_text("OPENROUTER_BASE_URL", BASE_URL),
-        free_only=_flag(FREE_ONLY_VAR, True),
+        free_only=_flag(FREE_ONLY_VAR, DEFAULT_FREE_ONLY),
         app_title=_text(TITLE_VAR, DEFAULT_TITLE),
         timeout=_number(TIMEOUT_VAR, DEFAULT_TIMEOUT, float),
         budget=_number(BUDGET_VAR, DEFAULT_BUDGET, float),
         chapters=int(_number(CHAPTERS_VAR, DEFAULT_CHAPTERS, int)),
         max_calls=int(_number(MAX_CALLS_VAR, DEFAULT_MAX_CALLS, int)),
-        sort=_sort(),
         stream=_flag(STREAM_VAR, True),
+        token_limit=int(_number(TOKEN_LIMIT_VAR, DEFAULT_TOKEN_LIMIT, int)),
     )
 
 

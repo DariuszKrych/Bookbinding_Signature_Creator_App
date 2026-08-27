@@ -1,4 +1,4 @@
-"""Tests for the "Generate 5 chapter book for printing with AI" button.
+"""Tests for the "Generate 5 chapter mini-novel for printing with AI" button.
 
 Run with:  python -m unittest Script.test_ai_editor -v
 
@@ -141,12 +141,91 @@ class TestTheButton(AiEditorTestCase):
         box = self.widget_named("ai-prompt")
         self.assertIn(f"always {ai_book.chapter_count()} chapters", box.proto.placeholder)
 
-    def test_the_button_does_nothing_without_a_description(self):
-        self.assertTrue(self.at.button(key="ai-write").disabled)
+    def test_the_button_offers_a_mini_novel(self):
+        self.assertIn("mini-novel", self.at.button(key="ai-write").label)
 
-    def test_a_description_switches_the_button_on(self):
-        self.at.text_input(key="ai-prompt").set_value("a book").run()
+    def test_the_button_has_no_hover_text(self):
+        """It said its piece in a tooltip nobody hovers over. The caption under
+        it says the same thing where it can be read."""
+        self.assertFalse(self.at.button(key="ai-write").proto.help)
+
+    def test_the_button_is_drawn_on_even_with_an_empty_box(self):
+        """Not a slip, and the reason is in `TYPING_SCRIPT`.
+
+        Streamlit's button ignores a click whenever *React* thinks it is
+        disabled, whatever the page has since been told — so a button the server
+        drew switched off can be made to look switched on and still swallow the
+        press. Drawing it on and refusing on the server is what makes the first
+        press after typing a real one.
+        """
         self.assertFalse(self.at.button(key="ai-write").disabled)
+
+    def test_an_empty_box_asks_for_a_description_on_the_button(self):
+        label = self.at.button(key="ai-write").label
+        self.assertIn("**(Please type a description of the book to generate)**", label)
+
+    def test_the_asking_goes_away_once_something_is_typed(self):
+        self.at.text_input(key="ai-prompt").set_value("a book").run()
+        self.assertNotIn("Please type", self.at.button(key="ai-write").label)
+
+    def test_pressing_it_with_an_empty_box_starts_nothing(self):
+        """The refusal that the drawn-on button leans on."""
+        self.at.button(key="ai-write").click().run()
+        self.assertEqual(self.asked, [])
+        self.assertFalse(self.at.exception, self.at.exception)
+
+    def test_pressing_it_with_only_spaces_starts_nothing(self):
+        self.at.text_input(key="ai-prompt").set_value("    ")
+        self.at.button(key="ai-write").click().run()
+        self.assertEqual(self.asked, [])
+        self.assertFalse(self.at.exception, self.at.exception)
+
+    def test_a_description_and_one_press_is_enough(self):
+        """The whole complaint, as a test: type, press once, get a book."""
+        self.at.text_input(key="ai-prompt").set_value("a book about paperclips")
+        self.at.button(key="ai-write").click().run()
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(self.asked[0]["prompt"], "a book about paperclips")
+
+
+class TestTheButtonKeepsUpWithTyping(AiEditorTestCase):
+    """Streamlit sends a box's value on blur; the button cannot wait that long.
+
+    The fix is a script, so what can be checked here is that the script is on
+    the page, that it carries the two things it needs, and that it is told to
+    keep its hands off the button when the button is off for another reason.
+    """
+
+    def scripts(self):
+        """Every `st.iframe` on the page, as one lump of text.
+
+        `AppTest` has no accessor for an iframe, so it comes back through `get`
+        as an unknown element with its proto attached.
+        """
+        return "\n".join(str(frame.proto.srcdoc) for frame in self.at.get("iframe"))
+
+    def test_the_script_is_on_the_page(self):
+        self.assertIn("st-key-ai-prompt", self.scripts())
+        self.assertIn("st-key-ai-write", self.scripts())
+
+    def test_the_script_says_the_same_words_as_the_button(self):
+        """One string in `app.py`, so the label and the script cannot drift."""
+        self.assertIn(
+            "Please type a description of the book to generate", self.scripts()
+        )
+
+    def test_it_is_free_to_act_when_nothing_else_is_wrong(self):
+        self.assertIn("__bindLocked = false", self.scripts())
+
+    def test_typing_alone_never_switches_the_button_on(self):
+        """The script may only lift the lock the empty box put there.
+
+        Whether it is allowed to act at all is decided in Python and carried in
+        the script's own text, so the browser is never in a position to switch
+        on a button that a running job, a full disk or a missing key turned off.
+        `TestSwitchedOffLeavesTheScriptLocked` is the other half of this.
+        """
+        self.assertIn("if (window.parent.__bindLocked) return;", self.scripts())
 
     def test_the_box_is_there_on_both_views(self):
         """It lives above the view radio, so neither view can hide it."""
@@ -189,6 +268,13 @@ class TestSwitchedOff(EditorTestCase):
         self.assertFalse(self.at.exception, self.at.exception)
         self.assertEqual(len(list_drafts(self.drafts)), 1)
 
+    def test_the_typing_script_is_locked_out(self):
+        """No key, so no amount of typing may light that button up."""
+        scripts = "\n".join(
+            str(frame.proto.srcdoc) for frame in self.at.get("iframe")
+        )
+        self.assertIn("__bindLocked = true", scripts)
+
 
 # --------------------------------------------------------------------------
 # What pressing it does
@@ -198,7 +284,7 @@ class TestSwitchedOff(EditorTestCase):
 class TestWatchingItBeWritten(AiEditorTestCase):
     """The book appears while it is being written, not only once it is done.
 
-    A free model takes minutes over five chapters. What it does with those
+    A model takes minutes over five chapters. What it does with those
     minutes used to be nothing at all — a progress bar and a blank page — and the
     fix is not a faster model but showing the words as they arrive.
     """
@@ -433,7 +519,7 @@ class TestTheDataPolicySaysSo(AiEditorTestCase):
         self.assertIn("only if you press", policy)
         self.assertIn("Nothing else goes with it", policy)
 
-    def test_the_policy_admits_free_models_may_train_on_it(self):
+    def test_the_policy_admits_providers_may_train_on_it(self):
         """The part a reader would most resent finding out later."""
         self.assertIn("may train on it", self.policy())
 

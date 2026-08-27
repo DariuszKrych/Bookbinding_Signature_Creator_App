@@ -521,12 +521,21 @@ ai_job = None
 # anything replaces it. That happens in the job runner at the foot of this file,
 # not on the click: a click claims, and only the runner does work.
 AI_PROMPT_KEY = "ai-prompt"
+# Said on the button itself while the box is empty, and taken off it again the
+# moment a character is typed. One string, used by the label below and by the
+# script that keeps the label right between reruns — so the two cannot drift.
+AI_HINT = "(Please type a description of the book to generate)"
 ai_ready = ai_book.available()
 ai_writing = job == ("ai", "write")
 # Said on the button, because it is fixed and a reader should not have to find
 # out by counting. It comes from the same setting the request is built from, so
 # the promise and the schema cannot drift apart.
 ai_chapters = ai_book.chapter_count()
+# Every reason the button is off that has nothing to do with what is in the box.
+# Kept apart because the script at the foot of the file may switch the button on
+# when somebody types, and must never do it while a job is running, the disk is
+# full, or this copy has no key.
+ai_locked = busy or full or not ai_ready
 
 with st.container(border=True):
     ai_button_column, ai_prompt_column = st.columns(
@@ -547,28 +556,38 @@ with st.container(border=True):
     )
     # The slot holds the button, and the runner replaces it with a progress bar,
     # so starting a book does not move anything else on the page.
+    #
+    # The bracketed half of the label is the box's instructions, put on the
+    # button because the button is what the eye goes to when nothing happens.
+    # It is drawn only while the box is empty — by the server here, and by
+    # `TYPING_SCRIPT` at the foot of the file between reruns, which is what makes
+    # it disappear on the first keystroke rather than on the next click.
     if ai_slot.button(
         "✍️ Writing…"
         if ai_writing
-        else f"🤖 Generate {ai_chapters} chapter book for printing with AI",
+        else f"🤖 Generate {ai_chapters} chapter mini-novel for printing with AI"
+        + ("" if ai_prompt.strip() else f" **{AI_HINT}**"),
         key="ai-write",
         type="primary",
         use_container_width=True,
-        disabled=busy or full or not ai_ready or not ai_prompt.strip(),
-        help=(
-            f"Writes a {ai_chapters}-chapter book from that description and puts "
-            "it straight into the writing view, where you can edit it like "
-            "anything you typed. Anything already in the editor is kept as a "
-            "draft first. Your description — and nothing else from this session "
-            "— is sent to OpenRouter; see the data policy at the foot of the page."
-        ),
+        # Not switched off for an empty box, and that is deliberate — see
+        # `TYPING_SCRIPT`. Streamlit's button ignores a click whenever *React*
+        # thinks it is disabled, whatever the browser has been told, so a button
+        # the server drew switched off cannot be switched on from the page. It
+        # is drawn on, made to look and behave off while the box is empty, and
+        # the click below is what actually refuses.
+        disabled=ai_locked,
     ):
-        # The one moment this assignment is legal: the radio below has not been
-        # instantiated yet on this run, so this is the value it will take when it
-        # is. `claim_job` reruns immediately and the next run draws the writing
-        # view, locked, with the progress bar in the slot above.
-        st.session_state["view"] = WRITE_VIEW
-        claim_job(("ai", "write"))
+        # Asked again, because the button can be pressed with the box empty: the
+        # script that unlocks it while somebody types works from what the browser
+        # can see, and the server has the last word on what it was actually sent.
+        if st.session_state.get(AI_PROMPT_KEY, "").strip():
+            # The one moment this assignment is legal: the radio below has not
+            # been instantiated yet on this run, so this is the value it will
+            # take when it is. `claim_job` reruns immediately and the next run
+            # draws the writing view, locked, with the progress bar in the slot.
+            st.session_state["view"] = WRITE_VIEW
+            claim_job(("ai", "write"))
     if ai_writing:
         # Where the book appears while it is being written. Drawn only while the
         # job is running, and inside the same bordered box as the button it
@@ -1625,7 +1644,7 @@ copy is kept, nothing about them is logged, shared, sold, or used to train
 anything. The only lasting copy of anything is the zip you download yourself.
 
 **One thing leaves this server, and only if you press the button that does it.**
-**🤖 Generate 5 chapter book for printing with AI** sends the sentence you type in
+**🤖 Generate 5 chapter mini-novel for printing with AI** sends the sentence you type in
 its box to an AI service, which writes a book back. Nothing else from your session goes
 with it — not your manuscript, not your drafts, not your uploads, not their
 names. Never press it, and nothing you do here ever leaves. Section 5 says
@@ -1706,15 +1725,15 @@ clean-sounding promise:
   technical runtime logs the platform shows every service owner; they carry
   nothing out of your files.
 - **The AI service, if and only if you press the AI button.** Pressing
-  **🤖 Generate 5 chapter book for printing with AI** sends the description you typed, plus
+  **🤖 Generate 5 chapter mini-novel for printing with AI** sends the description you typed, plus
   this app's own fixed writing instructions, to
   [OpenRouter](https://openrouter.ai). **Nothing else goes with it** — not your
   manuscript, not your drafts, not your uploaded PDFs, not any file name, and no
   identifier of you: the request is made by this server, under this copy's own
   key, and your IP address is never part of it. OpenRouter passes it on to
-  whichever free model provider is serving the request, which may be in the
-  United States or anywhere else. **Providers of free models may keep what is
-  sent to them, and may train on it.** So treat that box as public: do not type
+  whichever provider is serving the model at that moment, which may be in the
+  United States or anywhere else. **Some providers keep what is sent to them,
+  and may train on it.** So treat that box as public: do not type
   anything into it you would not be willing to publish. What comes back is
   written into the editor and stored nowhere but your own session, exactly like a
   book you typed yourself. See the [OpenRouter Privacy
@@ -1914,6 +1933,146 @@ APPEARANCE_SCRIPT = """
 # about by it. `st.iframe` will not take a height of nought.
 st.iframe(
     APPEARANCE_SCRIPT.replace("__MODE__", appearance),
+    width=1,
+    height=1,
+    tab_index=-1,
+)
+
+# --------------------------------------------------------------------------
+# Noticing that somebody is typing
+# --------------------------------------------------------------------------
+# Streamlit sends a text box's value to the server when the box loses focus, and
+# not before. That is usually right and here it was not: the ✍️ button used to be
+# drawn off until there was a description to write from, so a visitor typed one,
+# saw nothing happen, and had to click somewhere else before the button would
+# light up — and then click the button. Two clicks for one press, and the first
+# one had nothing to do with the thing being pressed.
+#
+# There is no Python for this — the server does not know a key was pressed — so
+# the browser is asked directly, the same way the appearance radio reaches the
+# theme menu. On every keystroke: the button is switched, and the "please type a
+# description" half of its label is taken off or put back.
+#
+# **The way round it is switched is the whole thing, and the obvious way is
+# wrong.** Leaving the server to draw the button off and switching it on from
+# here does not work: Streamlit's button ignores a click whenever *React* thinks
+# it is disabled, and React thinks whatever the server told it. Clearing the
+# attribute in the page changes the colour and lets the browser fire its events,
+# and the component drops them regardless — a button that lights up and then
+# swallows the press, which is worse than the bug.
+#
+# So the button is drawn **on** (see `disabled=ai_locked` above), this makes it
+# look and behave off while the box is empty, and the click handler refuses an
+# empty description on the server. React is never told the button is off, so the
+# first press after typing is a real one.
+#
+# **The server still decides.** This only changes what is drawn between reruns.
+# When the button is pressed, Streamlit sends the box's value along with the
+# click — losing focus to the button is what flushes it — and the click handler
+# checks that value again before it starts anything.
+#
+# `__LOCKED__` carries the reasons the button is off that have nothing to do
+# with typing — a job running, a full disk, no key. While any of those hold, the
+# server has really disabled it, and the script keeps its hands off entirely.
+TYPING_SCRIPT = """
+<style>html, body { margin: 0; background: transparent; }</style>
+<script>
+(function () {
+  var page;
+  try {
+    page = window.parent.document;
+  } catch (error) {
+    return;                       // Not the same origin: nothing to reach.
+  }
+
+  var BOX = '.st-key-ai-prompt input';
+  var BUTTON = '.st-key-ai-write button';
+  var HINT = "__HINT__";
+
+  // Read fresh on every reload of this frame, which happens whenever the lock
+  // changes — the script is only re-sent when its text changes, and the flag is
+  // part of its text.
+  window.parent.__bindLocked = __LOCKED__;
+
+  function label(button) {
+    // The bracketed hint, as an element. Streamlit renders the `**...**` in the
+    // label as a <strong>, so on a run the server drew it there is already one
+    // to find; on a run it did not, one is made. Either way it is tagged, so it
+    // is the same element next time.
+    var found = button.querySelector('[data-typed-hint]');
+    if (found) return found;
+    var bold = button.getElementsByTagName('strong');
+    if (bold.length) {
+      bold[0].setAttribute('data-typed-hint', '1');
+      return bold[0];
+    }
+    var made = page.createElement('strong');
+    made.setAttribute('data-typed-hint', '1');
+    made.textContent = ' ' + HINT;
+    var into = button.querySelector('p') || button;
+    into.appendChild(made);
+    return made;
+  }
+
+  // Which way round the button is switched, and why it is done like this.
+  //
+  // The obvious version — let the server draw the button switched off and have
+  // this switch it on — does not work, and the way it fails is worth writing
+  // down. Streamlit's button ignores a click whenever *React* thinks it is
+  // disabled, and React thinks what the server told it. Clearing the attribute
+  // in the page changes how the button looks and lets the browser fire its
+  // events, and the component drops them on the floor anyway. The button lights
+  // up, the press does nothing, and it looks more broken than before.
+  //
+  // So it is the other way round. The server draws the button **on**, this
+  // makes it look and behave off while the box is empty, and the click handler
+  // in `app.py` refuses an empty description on the server. React is never
+  // told the button is off, so the first press after typing is a real one.
+  function refresh() {
+    if (window.parent.__bindLocked) return;
+    var box = page.querySelector(BOX);
+    var button = page.querySelector(BUTTON);
+    if (!box || !button) return;
+    var typed = box.value.trim().length > 0;
+    // The attribute is the browser's, not React's: it greys the button, stops
+    // the pointer and takes it out of the tab order, and React puts it back
+    // every time it redraws — which the observer below notices. Written only
+    // when it would actually change, or that observer would wake itself for
+    // ever.
+    if (button.disabled !== !typed) button.disabled = !typed;
+    if (button.getAttribute('aria-disabled') !== String(!typed)) {
+      button.setAttribute('aria-disabled', String(!typed));
+    }
+    var wanted = typed ? 'none' : '';
+    var hint = label(button);
+    if (hint.style.display !== wanted) hint.style.display = wanted;
+  }
+
+  if (!window.parent.__bindTyping) {
+    window.parent.__bindTyping = true;
+    // Captured on the document rather than bound to the box, because Streamlit
+    // replaces the box element on every rerun and a listener on it would go
+    // with it.
+    page.addEventListener('input', function (event) {
+      var where = event.target;
+      if (where && where.closest && where.closest('.st-key-ai-prompt')) refresh();
+    }, true);
+    new window.parent.MutationObserver(refresh).observe(page.body, {
+      childList: true, subtree: true,
+      attributes: true, attributeFilter: ['disabled'],
+    });
+  }
+
+  refresh();
+  window.setTimeout(refresh, 120);   // The widgets may not be drawn yet.
+})();
+</script>
+"""
+
+st.iframe(
+    TYPING_SCRIPT.replace("__LOCKED__", "true" if ai_locked else "false").replace(
+        "__HINT__", AI_HINT
+    ),
     width=1,
     height=1,
     tab_index=-1,

@@ -12,7 +12,7 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.59-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![Docker](https://img.shields.io/badge/Docker-micromamba-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Render](https://img.shields.io/badge/Render-deployed-46E3B7?logo=render&logoColor=black)](https://render.com/)
-[![Tests](https://img.shields.io/badge/tests-385-brightgreen)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-447-brightgreen)](#-testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 **[▶ Open the live app](https://bookbinding-signature-creator.onrender.com)** · [What it does](#-what-it-does) · [Architecture](#-deployment--architecture) · [Engineering notes](#-engineering-highlights) · [Run it locally](#-run-it-yourself)
@@ -56,7 +56,7 @@ Type a book straight into the browser — title, author, dedication, chapters, a
 
 ### 🤖 Or have one written
 
-A one-line description — *"a warm, plain-English beginner's guide to hand bookbinding"* — fills the editor in with a five-chapter book, which you then edit like anything else you typed. Optional, off unless a key is configured, and it writes the **words only**: your page size, type and margins are left exactly as you set them. [How it works, and where its key lives.](#-the-ai-writer-and-where-its-key-lives)
+A one-line description — *"a warm, plain-English beginner's guide to hand bookbinding"* — fills the editor in with a five-chapter mini-novel, which you then edit like anything else you typed. The words appear on the page **as they are written** rather than after a silent wait, and every book is held to a hard ceiling of 5,000 tokens. Optional, off unless a key is configured, and it writes the **words only**: your page size, type and margins are left exactly as you set them. [How it works, and where its key lives.](#-the-ai-writer-and-where-its-key-lives)
 
 ```mermaid
 flowchart LR
@@ -101,7 +101,7 @@ flowchart LR
 | **Dependency locking** | [`conda-lock.yml`](./conda-lock.yml) | Targeted at **`linux-64`** for exact cross-platform reproducibility — and to pin Streamlit, so an unpinned upgrade cannot break the custom GUI CSS classes the interface relies on. |
 | **Container** | [`mambaorg/micromamba:1.5.8`](./Dockerfile) | A specific, locked base image rather than a floating tag. |
 | **Host** | Render (free tier, Docker) | 24/7 public URL from a container built straight out of the repo. |
-| **AI writing** | LangChain → OpenRouter (`openrouter/free`) | Optional and off without a key. A router rather than a named model, so a retired free model needs no code change. [Details below.](#-the-ai-writer-and-where-its-key-lives) |
+| **AI writing** | LangChain → OpenRouter (`meta-llama/llama-3.1-8b-instruct`) | Optional and off without a key. One small, quick model, streamed to the page as it writes. [Details below.](#-the-ai-writer-and-where-its-key-lives) |
 | **Secrets** | Render environment variables | The key is never in the repo and never in the image; `.env` is for local use only. |
 
 ### Docker configuration
@@ -133,15 +133,15 @@ Render spins free Docker instances down after **15 minutes** of inactivity, whic
 
 ### 🤖 The AI writer, and where its key lives
 
-**🤖 Generate 5 chapter book for printing with AI** takes a one-line description and fills the writing view in with a whole book: title, author, dedication and every chapter.
+**🤖 Generate 5 chapter mini-novel for printing with AI** takes a one-line description and fills the writing view in with a whole book: title, author, dedication and every chapter.
 
 All of it is in [`Script/ai_book.py`](./Script/ai_book.py), which imports LangChain and nothing from Streamlit, and [`Script/ai_config.py`](./Script/ai_config.py).
 
-**Five chapters, every time, and three requests to write them.** Both numbers are budgets rather than preferences, and each fixes something that went wrong in practice.
+**Five chapters, three requests, five thousand tokens.** Three budgets rather than three preferences, and each fixes something that went wrong in practice.
 
 *The chapter count* is fixed because a model will not treat it as a number. A description asking for "a short novel" came back with twice the chapters of one that had asked for a full-length novel — length words read as tone, not as instructions. So the count goes into the JSON schema as `minItems` and `maxItems`, is trimmed or padded again after the reply, and is printed on the button. A description that asks for something sprawling gets that story told in five chapters instead of a longer book.
 
-*The request count* is fixed because OpenRouter's free tier is rationed at roughly **50 requests a day**, shared by everyone using the app. A request per chapter cost six for a five-chapter book — eight books a day. Batching the chapters into the requests left after the outline brings that to three, so about sixteen. `_Budget` counts every attempt, retries and format probes included, and refuses rather than overspending.
+*The request count* is fixed because a request is the unit of everything costly here: of waiting, of tokens paid for, and — on a copy configured with a free model — of a ration of roughly **50 a day** shared by everyone using it. A request per chapter cost six for a five-chapter book. Batching the chapters into the requests left after the outline brings that to three.
 
 ```text
 request 1   outline      title, author, dedication, 5 headings + summaries
@@ -151,25 +151,52 @@ request 3   chapters 4-5
 
 Batching is only safe because of `salvage_chapters`. A reply that runs past the model's output limit is truncated JSON — but the chapters that *did* finish are complete objects inside it, so they are mined out and kept. Recovering three good chapters costs nothing; asking again costs a request the book does not have.
 
-Raising `AI_MAX_CALLS_PER_BOOK` gives more, smaller batches — better prose, fewer books per day. Lowering it to 2 puts all five chapters in one reply, which free models will often cut short.
+#### The 5,000-token ceiling
 
-**Two things make the wait bearable, and neither is a faster model.**
+**A book costs at most 5,000 tokens, input and output, first request to last.** Not on average. Ever. `_Ledger` in [`ai_book.py`](./Script/ai_book.py) is what makes that a fact rather than an intention, and the argument has exactly two halves:
 
-*The book is streamed.* The reply arrives token by token, and the words go onto the page as they are written — headings, paragraphs, a sentence still half-finished — into a box under the button. It costs nothing and changes no request; the same complete reply is parsed by the same code when the stream ends. What it changes is a two-minute stare at a progress bar, which is what "slow" actually meant here.
+| Half | Bounded by | How |
+| --- | --- | --- |
+| **Output** | the service | every request carries `max_tokens`, which the provider enforces |
+| **Input** | this repo | it is text this repo composed, measured by `estimate_tokens` before it is sent |
+
+So the worst a request can come to is *estimated input + `max_tokens`*, and a request is only sent when that whole worst case still fits in what is left. The ledger charges the worst case up front, sends, then refunds whatever the reply did not use — so between the two the total already covers a reply that has not arrived. Each batch is allotted its share of what remains, and the input of the batches still to come is held back so an early one cannot spend the tokens a later one needs to exist.
+
+**Measuring the input is the hard half, and it is why there are two estimators.** A token is not a fixed number of bytes: against a real tokenizer, English prose runs about 4.5 bytes to the token, a line of pure punctuation runs 1.6, and a string of combining accents runs 1.2. One ratio is therefore either wasteful for the text the app sends or unsafe for text somebody can paste into the box. So prompt text — written in `ai_book.py`, and held to its ratio by a test that checks every prompt against a real tokenizer — is measured at 3 bytes to the token; anything that has been outside, a typed description or a model's reply quoted back to it, is measured at 1.2, which nothing realistic beats.
+
+**Running out is never an error.** This is the part worth stating loudly, because it is what the limit is *for*. When the ledger cannot afford a request, the chapters it would have written are made by `from_plan` from their own outline summaries, which costs nothing. The same happens when the clock runs out, when the request budget runs out, when a reply is unreadable, and when a format probe eats a request. Every budget in the file now says "no" instead of raising, and the reader gets a book with a heading and a line of plan in the thin chapters, sitting in an editor, waiting to be written over. **A shorter book, never a broken one.**
+
+Genuine service failures — a bad key, a rate limit, a network that is not there — still raise, because those are things the reader has to be told about and cannot be papered over with a summary.
+
+Lowering `AI_TOKEN_LIMIT` shortens the book; it cannot break it, and there is a test that walks it down from 5,000 to nothing and checks exactly that. Raising `AI_MAX_CALLS_PER_BOOK` gives more, smaller batches — but not more tokens: the two budgets are separate, and the token one binds.
+
+**The book is streamed.** The reply arrives token by token, and the words go onto the page as they are written — headings, paragraphs, a sentence still half-finished — into a box under the button. It costs nothing and changes no request; the same complete reply is parsed by the same code when the stream ends. It does not make the model faster. It makes the wait readable, and the wait was what "slow" actually meant here.
 
 Reading a book out of a reply that has not arrived yet is the interesting part, because a part-arrived JSON object is not JSON and `json.loads` will never take it. `_json_strings` reads the strings straight out of the fragment instead, telling a key from a value by tracking the containers it is inside, and returning the final unfinished string as well — a half-written sentence is exactly what somebody watching wants to see. `stream_prose` lays those out; `_Live` keeps the chapters that have finished so the next batch appears *under* them rather than over them.
 
-*The fastest provider is asked for.* The same free model is usually served by several providers, and they are not equally quick. Every request carries an OpenRouter `provider` block:
-
-```json
-{ "provider": { "sort": "throughput" } }
-```
-
-which asks for whichever is producing the most tokens per second right now. It rides in `extra_body` — `model_kwargs` is for OpenAI's own parameters, and `provider` is not one of them. `OPENROUTER_PROVIDER_SORT` changes it to `latency` (first word soonest), `price`, or `off`.
-
 **It is optional.** With no key set, the button is drawn switched off with a line explaining why, and the rest of the app is untouched. The LangChain import happens *inside* the call that needs it, so a machine without `langchain-openai` installed still runs the whole app — the test suite is proof, since it never installs it.
 
-**The model is `openrouter/free`, and that is not a model.** It is OpenRouter's free-model router: it costs nothing, and it filters the free pool down to models that support what the request needs — here, structured JSON output. Naming one model instead would mean editing this repo every time a free model is retired. It selects at random per request, so the outline and the style note are sent with *every* chapter to hold the voice together.
+**The model is `meta-llama/llama-3.1-8b-instruct` — Meta: Llama 3.1 8B Instruct.** One model, named, the same one every time. Small is the point: at eight billion parameters it answers in a fraction of the time a large model takes, and the complaint this feature attracted was never about the prose.
+
+*Which provider serves it is OpenRouter's decision.* Five of them offer this model, and the request carries no `provider` block telling OpenRouter which to prefer — its own routing already weighs cost heavily, and that is the wanted behaviour.
+
+*It is not free, and the app no longer pretends otherwise.* $0.02 per million tokens in and $0.04 out, so a whole book costs a small fraction of a penny — but paid is paid, so `OPENROUTER_FREE_ONLY` now defaults to **0**. With it at 1 and a paid model set, every press of the button comes back refused, which is why the two had to move together. **The credit limit on the key is the ceiling**, and it is the only control OpenRouter enforces for you. A copy that must not be able to spend anything sets `OPENROUTER_FREE_ONLY=1` *and* `OPENROUTER_MODEL=openrouter/free`; the guard is untouched and still works exactly as it did.
+
+*The JSON ladder earns its keep here.* An 8B model is less reliable about strict schemas than a large one, and support varies by provider. `RUNGS` starts at `json_schema`, drops to `json_object` and then to asking in the prompt, remembers which rung worked, and `salvage_chapters` mines a truncated reply for the chapters that finished.
+
+The outline and the style note are sent with *every* chapter request. Not because the model changes between them any more, but because there is no conversation to remember them — each request stands alone, and the outline is what holds the voice together. The description itself is not sent again in full: the outline was written from it, and a trimmed line of it goes with each batch for flavour. Repeating it cost more tokens than the chapters those tokens would have bought.
+
+#### The button knows you are typing
+
+Streamlit only tells the server what is in a text box when the box loses focus. The ✍️ button was switched off until the server had a description, so it looked broken: you typed one, nothing happened, and you had to click somewhere else before the button would light up — and then click it.
+
+There is no Python for a keystroke, so `TYPING_SCRIPT` at the foot of [`app.py`](./app.py) asks the browser directly — the same `st.iframe` trick the appearance radio uses to reach Streamlit's own theme menu, finding the widgets through the `st-key-…` classes their keys put on them. On every keystroke it switches the button and takes the bracketed **(Please type a description of the book to generate)** half of the label off or puts it back.
+
+**Which way round it is switched is the whole trick, and the obvious way does not work.** Letting the server draw the button off and having the script switch it on gets you a button that lights up and then eats the press: Streamlit's button ignores a click whenever *React* thinks it is disabled, and React thinks what the server told it. Clearing the attribute in the page changes the colour, lets the browser fire its events, and the component drops them anyway — which looks worse than the bug it was meant to fix.
+
+So it is the other way round. **The server draws the button on**, the script makes it look and behave off while the box is empty — the `disabled` attribute greys it, blocks the pointer and takes it out of the tab order — and the click handler in `app.py` refuses an empty description on the server. React is never told the button is off, so the first press after typing is a real one. Pressing it sends the box's value along with the click, because losing focus to the button is what flushes it.
+
+**The server still decides.** The script only changes what is drawn between reruns, and there is a test that the words it puts on the button are the same string the label is built from, so the two cannot drift. It is also told, in its own text, when the button is off for a reason that has nothing to do with typing — a job running, a full disk, no key — and then it keeps its hands off entirely.
 
 #### Setting the key on Render
 
@@ -204,10 +231,10 @@ Open the app after the deploy finishes. The button under the title tells you whi
 
 | What you see | What it means |
 | --- | --- |
-| **🤖 Generate 5 chapter book for printing with AI** is clickable once you type a description | The key arrived. Done. |
+| **🤖 Generate 5 chapter mini-novel for printing with AI** is clickable once you type a description | The key arrived. Done. |
 | Button greyed out, caption reads *"…No `OPENROUTER_API_KEY` is set…"* | The variable is missing or misnamed. Check the spelling in Render — it is case-sensitive. |
 | Button greyed out, caption mentions **langchain-openai** | The key is fine but the image is stale. Redeploy with **Clear build cache**, since `conda-lock.yml` changed. |
-| *"…is not a free model, and this copy is set to free models only"* | You set `OPENROUTER_MODEL` to something paid. Remove it, or use a `:free` model. |
+| *"…is not a free model, and this copy is set to free models only"* | `OPENROUTER_FREE_ONLY` is at 1 while the model is a paid one — the app's own default included. Switch the flag off, or set `OPENROUTER_MODEL` to `openrouter/free`. |
 
 #### Every setting
 
@@ -216,15 +243,15 @@ All optional except the key, all read from the environment, all documented in [`
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | *(none)* | The key. Empty or unset switches the button off; everything else still works. |
-| `OPENROUTER_MODEL` | `openrouter/free` | The free-model router. A specific `:free` model works too. |
-| `OPENROUTER_FREE_ONLY` | `1` | Refuse anything that could be charged for, before any request is made. Leave this on. |
+| `OPENROUTER_MODEL` | `meta-llama/llama-3.1-8b-instruct` | The model that writes the book. `openrouter/free` (the free-model router) and any `:free` model work too. |
+| `OPENROUTER_FREE_ONLY` | `0` | Refuse anything that could be charged for, before any request is made. Off, because the default model is paid. Set it to 1 *and* pick a free model together. |
 | `OPENROUTER_APP_TITLE` | `Bookbinding Signature Creator` | The `X-Title` header — how OpenRouter's dashboard labels this app's traffic. Identifies the app, never the visitor. |
-| `OPENROUTER_PROVIDER_SORT` | `throughput` | Which provider OpenRouter picks when several serve the model. `throughput` is the fastest to finish; `latency`, `price` and `off` are the others. An unrecognised value falls back to the default. |
 | `AI_STREAM` | `1` | Show the book as it is written instead of all at once at the end. `0` waits for the whole reply. |
+| `AI_TOKEN_LIMIT` | `5000` | Every token one book may cost, input and output. A ceiling that is kept, not a target. Lower it for a shorter book. |
 | `AI_CALL_TIMEOUT_SECONDS` | `90` | How long one request may take. |
-| `AI_TOTAL_BUDGET_SECONDS` | `420` | How long a whole book may take before it gives up. |
+| `AI_TOTAL_BUDGET_SECONDS` | `420` | How long a whole book may take before it stops asking for more. |
 | `AI_CHAPTERS` | `5` | How many chapters every book has. Exactly this many — see below. |
-| `AI_MAX_CALLS_PER_BOOK` | `3` | The most requests one book may cost, counting retries. The free tier allows about 50 a day. |
+| `AI_MAX_CALLS_PER_BOOK` | `3` | The most requests one book may cost, counting retries. Not more tokens — see the ceiling above. |
 
 #### Why it cannot leak
 
@@ -237,9 +264,10 @@ What stops it leaking, in order of how much each one matters:
 3. The key is **read from the environment, used and dropped**. Never in `st.session_state`, never on a module global, never on a `Manuscript` — that last one matters because **📤 Save my data** zips the drafts folder and hands it to the browser.
 4. Every error is re-raised **scrubbed**, matching both the configured key and the `sk-or-v1-…` shape, and raised outside the `except` block so the original is not even reachable as `__context__`.
 5. `showErrorDetails = "none"` — no traceback is ever drawn on a public page.
-6. **Free models only.** A model that is not `openrouter/free` or `:free` is refused *before the client is constructed*, so a typo in a Render environment variable is a sentence on the page rather than a charge on the account.
+6. **The request budget.** Three requests a book, counted and enforced by `_Budget`, so a book cannot cost an unbounded number of calls however badly the model behaves.
+7. **Free models only, on request.** `OPENROUTER_FREE_ONLY=1` refuses any model that is not `openrouter/free` or `:free` *before the client is constructed*. It is off by default now that the default model is a paid one, and is there for a copy that must not be able to spend anything at all.
 
-**Do these two things on openrouter.ai, because no code here can:** use a key dedicated to this app, and **set a credit limit on it**. With `:free` models and a limit, the worst a stranger clicking the button repeatedly can achieve is exhausting a rate limit.
+**Do these two things on openrouter.ai, because no code here can:** use a key dedicated to this app, and **set a credit limit on it**. The model costs $0.02/$0.04 per million tokens, so a stranger clicking the button repeatedly reaches that limit slowly — but the limit is what makes the worst case a refused request instead of a bill, and it is the only control OpenRouter enforces for you.
 
 To confirm the key was never committed, and that it is not in the image:
 
@@ -276,7 +304,7 @@ A sheet is folded across its width, so one sheet of *W × H* gives four book pag
 
 **🧪 Tests that refuse to mark their own homework**
 
-385 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, derive expected coordinates by hand rather than importing them from the code under test, and feed the AI writer the malformed JSON free models really send. [Details below.](#-testing)
+447 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, derive expected coordinates by hand rather than importing them from the code under test, and feed the AI writer the malformed JSON small models really send. [Details below.](#-testing)
 
 </td></tr>
 <tr><td>
@@ -470,15 +498,18 @@ Five typefaces are available: Times, Helvetica, Courier, Bitstream Vera, and the
 
 #### Having one written for you
 
-The **🤖 Generate 5 chapter book for printing with AI** button sits above both tabs, so it is there whichever one you are on. Describe the book in the box beside it — subject, voice, who it is for, what should happen — and press it. It moves you to the writing tab, writes a title, an author, a dedication and five chapters, and fills the boxes in. From that moment it is an ordinary unsaved draft: edit it, save it, build it, convert it.
+The **🤖 Generate 5 chapter mini-novel for printing with AI** button sits above both tabs, so it is there whichever one you are on. Until you have typed something the button is greyed out and says **(Please type a description of the book to generate)** on itself; type the first character and it goes live there and then, without your having to click away first.
+
+Describe the book in the box beside it — subject, voice, who it is for, what should happen — and press it. It moves you to the writing tab and **the book appears in a box under the button as it is written**, a sentence at a time, rather than after a silent wait. When it finishes, the title, author, dedication and five chapters are in the editor. From that moment it is an ordinary unsaved draft: edit it, save it, build it, convert it.
 
 **It is always five chapters**, whatever the description says, so describe *what happens* rather than how long it should be. Asking for "a short novel" or "an epic" changes the voice and the pacing, not the count.
 
-Three more things worth knowing:
+Four more things worth knowing:
 
 - **Whatever was in the editor is kept first.** If it was already saved, it stays where it is; if it had unsaved words, they go to a draft of their own beside it. The banner afterwards tells you which draft to look for. Nothing you typed is the price of pressing the button.
 - **It writes the words only.** Page size, typeface, margins, spacing and every other design choice are left exactly as you set them.
-- **Treat the description box as public**, because it is the one thing on the page that leaves the server. It goes to a free model, and providers of free models may keep and train on what they are sent. Describe a book in it and nothing else — [the data policy](#-your-data-in-and-out-as-one-zip) is explicit about this.
+- **A mini-novel is what it says.** Each book is capped at 5,000 tokens all in, which comes to something over a thousand words across the five chapters. If a chapter arrives as a single line describing what happens in it, that is the cap doing its job — the model ran out of room, so the plan for that chapter was put in the editor instead for you to write over. You always get five chapters and never an error.
+- **Treat the description box as public**, because it is the one thing on the page that leaves the server. It goes to whichever provider OpenRouter routes it to, and some providers keep what they are sent and may train on it. Describe a book in it and nothing else — [the data policy](#-your-data-in-and-out-as-one-zip) is explicit about this.
 
 What comes back is a **draft, not a finished book**. A model invents: it can be confidently wrong, and it can land close to something it was trained on. Read it before you print it, and read it properly before you publish it.
 
@@ -534,7 +565,7 @@ One Streamlit reflex survives all of this: pressing **R** outside a text field r
 
 That is a position, not an accident of hosting. Whatever somebody uploads is theirs, and the way not to be answerable for it is not to keep it.
 
-**The one exception, stated plainly:** pressing **🤖 Generate 5 chapter book for printing with AI** sends the sentence you typed in its box — and nothing else from your session — to OpenRouter. Never press it and nothing you do here ever leaves the server. The app's own data policy, rendered at the foot of every page, says the same thing in more detail and is worth reading before you use that button.
+**The one exception, stated plainly:** pressing **🤖 Generate 5 chapter mini-novel for printing with AI** sends the sentence you typed in its box — and nothing else from your session — to OpenRouter. Never press it and nothing you do here ever leaves the server. The app's own data policy, rendered at the foot of every page, says the same thing in more detail and is worth reading before you use that button.
 
 At the very top of the sidebar sit the controls that make that workable:
 
@@ -633,7 +664,7 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
                    Script.test_ai_book Script.test_ai_editor -v
 ```
 
-**385 tests across five modules**, and they go out of their way not to mark their own homework:
+**447 tests across five modules**, and they go out of their way not to mark their own homework:
 
 - The sheet layout is derived by **simulating the physical fold**, independently of the production formula.
 - The page-size tests build a real PDF, run the real conversion, and then **read back out of the finished file where the ink actually landed** — including a small PDF interpreter that tracks the clipping path, because "did this column reach the paper" is a question text extraction cannot answer.
@@ -649,12 +680,18 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
 - The erasure rules are tested **as rules, not as timings**: a session still on screen survives a sweep, one whose browser has gone does not, and a runtime that cannot be read must never delete a live session — not knowing has to fall back to age, or a bug there would take somebody's book mid-sentence.
 - The size limit is driven through the real app against a real conversion: a job is allowed to start and then refused part way, and what has to be true afterwards is that the staging folder is gone, the half-made book is not offered as something to print, and the input PDF was not archived as if it had converted.
 - The command line is driven for real too, `main.main([...])` against a redirected set of folders, because it is the half of the app with no interface to notice a break.
-- The AI writer is tested **against a model that lies**. No test touches the network: `ai_book._make_chat` is the one place a client is built, so replacing it replaces the outside world. The replies it is fed are the ones free models really send — a JSON object wrapped in a code fence, prefaced with "Certainly!", containing a `}` inside a sentence, or with a real newline in the middle of a paragraph — and each has a test named after it.
-- The two budgets are asserted as budgets. A five-chapter book must cost **exactly three requests**; the chapters must arrive split 3 then 2; a repair must *not* be attempted when the allowance is gone. And the chapter count is pinned from both ends — a model that plans twelve is trimmed to five, one that plans two is padded to five, and the count in the button's label has to equal the `minItems` in the schema.
-- Truncation is tested by actually truncating: a valid two-chapter reply is cut off mid-string, and both chapters have to survive without spending another request.
+- The AI writer is tested **against a model that lies**. No test touches the network: `ai_book._make_chat` is the one place a client is built, so replacing it replaces the outside world. The replies it is fed are the ones small models really send — a JSON object wrapped in a code fence, prefaced with "Certainly!", containing a `}` inside a sentence, or with a real newline in the middle of a paragraph — and each has a test named after it.
+- The budgets are asserted as budgets. A five-chapter book must cost **exactly three requests**; the chapters must arrive split 3 then 2; a repair must *not* be attempted when the allowance is gone. And the chapter count is pinned from both ends — a model that plans twelve is trimmed to five, one that plans two is padded to five, and the count in the button's label has to equal the `minItems` in the schema.
+- **The 5,000-token ceiling is measured, not argued.** A `GreedyChat` answers every request with a reply grown to fill exactly the `max_tokens` it was sent — the worst legal case, which no real model reaches — and the cost is then rebuilt from what was actually sent and actually said. Three ways:
+  - **By a real tokenizer.** Nine runs, counted with `tiktoken` the way the account would be billed: an ordinary book, a description a thousand characters long, one of nothing but punctuation, one in Chinese, one of emoji, a book written in Cyrillic, prose where JSON was asked for, a truncated reply, and a format downgrade. None may pass 5,000.
+  - **By the assumption underneath it.** The estimators are held against that same tokenizer over sixteen scripts, plus every prompt the app actually sends — because the whole limit rests on the input estimate never reading low, and the ratios it uses were chosen from those measurements.
+  - **By fuzzing.** 200 seeded random books, crossing eight alphabets with eight ways a reply can go wrong, at five limits and four chapter counts. Every one has to come back with the full chapter count, every chapter non-empty, and the bill inside the limit. It found two real defects while it was being written.
+- **The floor is tested too**: a limit of 50 tokens makes *no requests at all* and still returns five chapters and no error, and walking the limit down from 5,000 has to give a shorter book rather than a broken one.
+- Truncation is tested by actually truncating: a valid two-chapter reply is cut off mid-string, both chapters have to survive without spending another request, and the one that was lost has to come back filled from its own outline summary — five chapters either way.
 - The key is treated as the thing most worth losing. It must not survive a trip through an error message, must not appear in any session-state value, and must not be reachable as an exception's `__context__` — `raise ... from None` only stops Python *printing* the original, so the scrubbed error is raised outside the `except` block instead. A final test sweeps every committable file in the repository for anything key-shaped, which is why the fake keys in the tests are assembled at runtime rather than written out.
 - Refusing to spend money is asserted at the point before it could be spent: a paid model raises **and the client is never even constructed**.
-- The data policy is tested like code. It has to name OpenRouter, say the sending happens only on that button, admit that free-model providers may train on what is sent, warn that the writing is invented, and name the host the app actually runs on — that last one caught two stale "Hugging Face" references left over from an earlier deployment.
+- The data policy is tested like code. It has to name OpenRouter, say the sending happens only on that button, admit that providers may train on what is sent, warn that the writing is invented, and name the host the app actually runs on — that last one caught two stale "Hugging Face" references left over from an earlier deployment.
+- The typing script is checked where Python can see it: that it is on the page, that the words it puts on the button are the *same string* the label is built from so the two cannot drift, and that a copy with no key sends it locked — the browser is never in a position to switch on a button the server turned off.
 
 ---
 

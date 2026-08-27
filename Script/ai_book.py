@@ -11,10 +11,11 @@ API key, which must never end up there.
 **Three requests, and a fixed number of chapters.** Both are budgets, not
 preferences.
 
-OpenRouter's free tier is rationed at roughly fifty requests a day, shared by
-everyone using the app. A request per chapter spent six on a five-chapter book,
-so the chapters are batched into the requests that are left after the outline —
-three in all, counted by `_Budget` and enforced rather than hoped for.
+A request is the unit of everything costly: of waiting, of tokens paid for, and
+on a copy set to a free model of a daily ration of about fifty shared by everyone
+using it. A request per chapter spent six on a five-chapter book, so the chapters
+are batched into the requests that are left after the outline — three in all,
+counted by `_Budget` and enforced rather than hoped for.
 
 The chapter count is fixed for a different reason. Left to choose, a model reads
 "a short novel" as tone and not as a number: one such description came back with
@@ -23,35 +24,36 @@ count is set in the schema, checked again after the reply, and printed on the
 button, and a description that asks for something long gets that story told in
 the same five chapters.
 
-A whole book still will not survive one request — free models cap their output,
-and a reply that runs out mid-chapter is not a short book but broken JSON. What
+A whole book still will not survive one request — models cap their output, small
+ones especially, and a reply that runs out mid-chapter is not a short book but
+broken JSON. What
 makes batching safe is `salvage_chapters`: a truncated reply is mined for the
 chapters that did finish, which costs nothing and is worth more than a retry the
 budget cannot afford.
 
-**Why it streams, and why it asks for the fastest provider.** A free model
-writing five chapters is not quick, and for most of that time the old version of
-this file had nothing to show: one request went out, and two minutes later a book
-appeared. Two things changed that, neither of which makes the model itself any
-faster.
+**Why it streams.** A model writing five chapters is not quick, and for most of
+that time the old version of this file had nothing to show: one request went out,
+and two minutes later a book appeared.
 
-The reply is *streamed*, so the words arrive as they are written rather than all
-at once at the end, and `write_book` hands them to its caller through `on_text`
+So the reply is *streamed*, and the words arrive as they are written rather than
+all at once at the end. `write_book` hands them to its caller through `on_text`
 as readable prose — see `_Live` and `stream_prose`, which read the paragraphs out
 of a JSON object that is still only half-arrived. Nothing downstream changes: the
-same complete text is parsed by the same `extract_json` when the stream ends.
+same complete text is parsed by the same `extract_json` when the stream ends. It
+does not make the model faster, it makes the wait readable, and that was what
+"slow" meant here.
 
-And the request carries a `provider` block asking OpenRouter to sort by
-throughput. One model is usually served by several providers at very different
-speeds; that one line picks whichever is currently fastest in tokens per second.
-It is set in `ai_config` and sent by `_make_chat`.
+Which provider answers is left to OpenRouter. The request carries no `provider`
+block, so its own routing decides — see `_make_chat`.
 
-**Why the JSON handling looks paranoid.** Free models are a moving target. Some
-honour a strict JSON schema, some only understand "reply with JSON", some will
-wrap a perfectly good object in ```json fences or a sentence of preamble. So the
-request is made at the strongest rung the model will accept, the reply is parsed
-by something that expects to be lied to, and one repair is asked for before
-giving up. See `_invoke` and `extract_json`.
+**Why the JSON handling looks paranoid.** A small model is not a reliable one,
+and which provider is serving it changes underneath you. Some honour a strict
+JSON schema, some only understand "reply with JSON", some will wrap a perfectly
+good object in ```json fences or a sentence of preamble. So the request is made
+at the strongest rung the model will accept, the reply is parsed by something
+that expects to be lied to, and one repair is asked for before giving up. That
+ladder matters more with an eight-billion-parameter model than it ever did.
+See `_invoke` and `extract_json`.
 
 **Why chapters arrive as a list of strings.** The editor stores a chapter as one
 blob of text where a blank line starts a paragraph. Asking a model to put that
@@ -100,14 +102,24 @@ class AIError(RuntimeError):
 # through somebody else's account.
 MAX_PROMPT_CHARS = 1000
 
+# How much of the description goes into a chapter request, as opposed to the
+# outline request which gets all of it.
+#
+# The outline is written from the whole description; the chapters are written
+# from the outline. Sending the description again with every batch cost more
+# tokens than the chapters those tokens could have bought, so what goes with a
+# batch is the first line or two of it, for flavour, and the plan does the work.
+PREMISE_TOKENS = 60
+
 # Paragraphs asked for per chapter, and the hard ceiling validation applies.
 #
-# Lower than they were when a chapter had a request to itself. Several chapters
-# now share one reply, so the whole reply has to fit inside the model's output
-# limit — and a reply that runs out half way is truncated JSON, which is the one
-# failure that costs a whole batch. Asking for fewer, shorter chapters is what
-# buys the request budget.
-WANTED_PARAGRAPHS = (6, 10)
+# A mini-novel, and sized to the token budget rather than to taste. Five chapters
+# of three or four paragraphs at about eighty words comes to roughly fourteen
+# hundred words, which is comfortably inside what `_Ledger` can allow for output
+# — the point being that the model is asked for less than its cap, so the cap is
+# a backstop and not a guillotine.
+WANTED_PARAGRAPHS = (3, 4)
+WANTED_WORDS = 80
 MAX_PARAGRAPHS = 20
 
 TEMPERATURE = 0.8
@@ -125,6 +137,12 @@ _REPAIR = (
     "That reply was not valid JSON. Send the JSON object again, on its own: "
     "no explanation before it, no code fence around it, nothing after it."
 )
+
+# A repair does not carry the question that was asked, only the answer that was
+# no good. Sending the whole original request again would cost twice over — the
+# request and the failed reply both — and buy nothing: reformatting what has
+# already been written does not need the instructions that produced it.
+_REPAIR_SYSTEM = "You reformat text as JSON. Reply with the JSON object only."
 
 
 # --------------------------------------------------------------------------
@@ -210,9 +228,9 @@ def _readable(error, config):
         return AIError("This copy has no credit left for the AI writer.")
     if status == 429 or "rate limit" in low or "too many requests" in low:
         return AIError(
-            "The free models are out of requests for the moment. Try again in "
-            "a few minutes, or later today — free models are shared and they "
-            "do run out."
+            "The AI writer has been asked for too much at once. Try again in a "
+            "few minutes — the rate limit is on this copy as a whole, so a busy "
+            "moment passes."
         )
     if "timeout" in low or "timed out" in low:
         return AIError(
@@ -536,16 +554,9 @@ def _make_chat(config):
     """
     from langchain_openai import ChatOpenAI
 
-    # OpenRouter's own additions to the OpenAI request body, `provider` being the
-    # one that matters here: it asks for the fastest provider serving this model
-    # rather than whichever the router would have picked. It goes in `extra_body`
-    # and not in `model_kwargs` because the two are not the same place —
-    # `model_kwargs` sets top-level OpenAI parameters, while `extra_body` is the
-    # documented way to send fields the OpenAI schema knows nothing about.
-    extra_body = {}
-    if config.provider:
-        extra_body["provider"] = config.provider
-
+    # No `provider` block. Several providers serve this model and which of them
+    # answers is OpenRouter's decision, not this app's: its own routing already
+    # weighs cost heavily, and that is the behaviour wanted here.
     return ChatOpenAI(
         model=config.model,
         api_key=config.api_key,
@@ -554,32 +565,36 @@ def _make_chat(config):
         timeout=config.timeout,
         max_retries=1,
         default_headers={"X-Title": config.app_title},
-        extra_body=extra_body or None,
     )
 
 
-def _bind(chat, rung, schema_name, schema):
-    """`chat`, told how firmly to insist on JSON.
+def _bind(chat, rung, schema_name, schema, cap):
+    """`chat`, told how firmly to insist on JSON and how long it may go on for.
 
     Bound onto the runnable rather than built into the client so that one chat
-    object serves every rung. Passing `response_format` through `model_kwargs`
-    instead collides with `ChatOpenAI`'s own handling of it on some releases;
-    `.bind()` does not.
+    object serves every rung — and every cap, which is the reason it now has to
+    be per request rather than per client: each one gets whatever the ledger can
+    still afford it. Passing `response_format` through `model_kwargs` instead
+    collides with `ChatOpenAI`'s own handling of it on some releases; `.bind()`
+    does not.
+
+    `max_tokens` is the half of the token limit this app does not enforce
+    itself. The service enforces it, which is what makes it a limit rather than
+    an intention.
     """
+    bound = {"max_tokens": int(cap)}
     if rung == "json_schema":
-        return chat.bind(
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": schema,
-                },
-            }
-        )
-    if rung == "json_object":
-        return chat.bind(response_format={"type": "json_object"})
-    return chat
+        bound["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": True,
+                "schema": schema,
+            },
+        }
+    elif rung == "json_object":
+        bound["response_format"] = {"type": "json_object"}
+    return chat.bind(**bound)
 
 
 _FORMAT_TROUBLE = (
@@ -626,32 +641,70 @@ def _read_stream(runnable, messages, live):
     arrive, not a different kind of reply.
     """
     parts = []
+    usage = None
     for chunk in runnable.stream(messages):
+        usage = _usage(chunk) or usage
         piece = _content(chunk)
         if not piece:
             continue
         parts.append(piece)
         live.feed("".join(parts))
-    return "".join(parts)
+    return "".join(parts), usage
 
 
-def _invoke(chat, config, messages, schema_name, schema, budget, live=None):
-    """One request, starting at the strongest format this model has accepted."""
+def _usage(reply):
+    """What the service said the request cost, if it said anything.
+
+    Present on an ordinary reply and absent from a streamed one, which is why
+    the ledger is built to work without it — see `_Charge.settle`. Read here
+    because when it is there it is exact, and exact beats generous.
+    """
+    counted = getattr(reply, "usage_metadata", None)
+    if isinstance(counted, dict):
+        total = counted.get("total_tokens")
+        if isinstance(total, int) and total > 0:
+            return total
+    return None
+
+
+def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, cap):
+    """One request, starting at the strongest format this model has accepted.
+
+    `cap` is the output ceiling the ledger has allowed this request, and it is
+    charged for in full before the request goes out. Every rung costs its own
+    charge: a downgrade is another request, and the point of the ledger is that
+    nothing goes out uncounted.
+
+    Returns `None` when there were no requests left to make one with — which the
+    caller turns into chapters written from the outline, not into an error. A
+    service that answered badly still raises; only a budget goes quiet.
+    """
     live = live or _Live()
     start = _RUNG.get(config.model, RUNGS[0])
     rungs = RUNGS[RUNGS.index(start) :]
     for index, rung in enumerate(rungs):
         failure = None
-        budget.take()
+        # A rung below `json_schema` does not send the schema, so it costs less
+        # to send. Counted at what this rung actually carries.
+        cost = estimate_request(messages, schema if rung == "json_schema" else None)
+        # Asked again here, and not only by the caller, because a downgrade is a
+        # second request the caller never budgeted for: it worked out what one
+        # attempt could afford, and this is the third. Without this line a model
+        # that refuses two rungs could walk the total past the limit.
+        allowed = min(cap, ledger.left - cost - TOKEN_RESERVE)
+        if allowed < MIN_OUTPUT_TOKENS or not budget.take():
+            return None
+        charge = ledger.take(cost, allowed)
         try:
-            runnable = _bind(chat, rung, schema_name, schema)
+            runnable = _bind(chat, rung, schema_name, schema, allowed)
             if live and config.stream:
-                reply = _read_stream(runnable, messages, live)
+                reply, usage = _read_stream(runnable, messages, live)
             else:
-                reply = runnable.invoke(messages)
+                answered = runnable.invoke(messages)
+                reply, usage = _content(answered), _usage(answered)
         except Exception as error:
+            charge.failed()
             if index < len(rungs) - 1 and _is_format_problem(error, config):
-                budget.probed = True
                 continue
             failure = _readable(error, config)
         # Raised out here rather than inside the `except`, which matters more
@@ -662,66 +715,313 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live=None):
         # being handled, so this one is raised with no context at all.
         if failure is not None:
             raise failure
+        reply = _content(reply)
+        charge.settle(reply, usage)
         _RUNG[config.model] = rung
-        return _content(reply)
+        return reply
     raise AIError("The model would not answer in JSON.")
+
+
+# --------------------------------------------------------------------------
+# The token budget
+# --------------------------------------------------------------------------
+# A book may cost 5,000 tokens, input and output, start to finish. Not on
+# average — ever. That is a hard number, and the way it is kept is worth stating
+# plainly, because "we ask nicely and hope" is the usual way and it is not this.
+#
+# Two halves, and each is bounded before the request leaves:
+#
+# * **Output** is bounded by the service. Every request carries `max_tokens`,
+#   which is a cap the provider enforces, so a reply cannot come back longer
+#   than the number sent with it however talkative the model feels.
+# * **Input** is bounded because this file wrote it. It is measured before it is
+#   sent by `estimate_tokens`, which deliberately guesses high.
+#
+# So the worst a request can possibly come to is `estimated input + max_tokens`,
+# and a request is only sent when that whole worst case still fits in what is
+# left. Charge the worst case, send, then give back what was not used. The
+# running total can therefore never pass the limit — not on a slow model, not on
+# a retry, not on a repair.
+#
+# And when there is not enough left for a request, the answer is never an error.
+# The chapters that could not be asked for are written from their own outline
+# summaries instead, which costs nothing at all. The limit can make a book
+# shorter. It cannot make it fail.
+
+# Kept back from the last request rather than spent, so that a small error in
+# the estimate on the far side of it still lands inside the limit.
+#
+# Both estimators read high, so this is not where the safety comes from — it is
+# the margin on top of it. Sized to cover the one thing neither estimator can
+# promise: a reply whose own script prices worse than anything measured.
+TOKEN_RESERVE = 400
+
+# Below this an output cap is not worth sending: the reply would be cut off
+# mid-chapter and salvaged into nothing.
+MIN_OUTPUT_TOKENS = 160
+
+# The most the outline may have. It is a page of headings, not prose, and every
+# token it does not take is a token of the book itself.
+OUTLINE_CAP = 320
+
+# Added per message for the role framing the wire format puts around it.
+MESSAGE_OVERHEAD = 8
+
+
+# Two estimators, and which one is used depends on who wrote the text.
+#
+# There is no getting round this. A token is not a fixed number of bytes: measured
+# against a real tokenizer, ordinary English prose runs about 4.5 bytes to the
+# token, but a line of pure punctuation runs 1.6 and a string of combining
+# accents runs 1.2. So a single ratio is either wasteful for the text this app
+# actually sends or unsafe for text somebody could paste into the box.
+#
+# Hence the split. Prompt text is written in this file, so its ratio can be
+# measured and kept — `test_the_estimate_is_never_below_a_real_tokenizer` does
+# exactly that against every prompt the app sends. Anything that has been outside
+# — a typed description, a model's own reply quoted back to it — gets the ratio
+# that nothing realistic beats.
+#
+# Not `tiktoken`, though it is installed. Its encodings are OpenAI's, not this
+# model's, and `get_encoding` fetches the table over the network the first time
+# it is asked — a download in the middle of somebody's book, on a container that
+# may not be allowed to make it. It is used in the tests, where a network is
+# allowed and a wrong answer is a failure rather than a bill.
+
+# Three UTF-8 bytes to the token for ASCII, one and a half for anything else.
+_OURS = (3.0, 1.5)
+# One and a fifth bytes to the token, whatever the bytes are. Below every ratio
+# measured across sixteen scripts, punctuation and emoji included.
+_THEIRS = (1.2, 1.2)
+
+
+def _estimate(text, ratios):
+    data = str(text or "").encode("utf-8")
+    plain = sum(1 for byte in data if byte < 0x80)
+    ascii_ratio, other_ratio = ratios
+    return int(plain / ascii_ratio + (len(data) - plain) / other_ratio) + 1
+
+
+def estimate_tokens(text):
+    """An over-estimate of what text this file wrote costs to send."""
+    return _estimate(text, _OURS)
+
+
+def estimate_untrusted(text):
+    """An over-estimate of what text from anywhere else costs to send.
+
+    Deliberately about three times what English really costs. That is the price
+    of not having to trust it, and it is paid in a slightly shorter book rather
+    than in a limit that only usually holds.
+    """
+    return _estimate(text, _THEIRS)
+
+
+def estimate_request(messages, schema=None):
+    """What one request costs to send, counting everything that goes with it.
+
+    A "system" message is this file's own words. Everything else — the human
+    turn carrying the description, an "ai" turn quoting a reply back for repair —
+    is charged at the untrusted rate.
+
+    The schema counts. A `response_format` of type `json_schema` is part of the
+    request body and is charged for like any other input, which is easy to forget
+    and worth several hundred tokens a book.
+    """
+    total = 0
+    for role, text in messages:
+        measure = estimate_tokens if role == "system" else estimate_untrusted
+        total += measure(text) + MESSAGE_OVERHEAD
+    if schema is not None:
+        total += estimate_tokens(json.dumps(schema))
+    return total
+
+
+class _Charge:
+    """One request's worst case, held against the ledger until it is settled."""
+
+    def __init__(self, ledger, cost, cap):
+        self.ledger = ledger
+        self.cost = cost
+        self.cap = cap
+
+    @property
+    def reserved(self):
+        return self.cost + self.cap
+
+    def settle(self, reply, usage=None):
+        """Hand back whatever the reply did not use.
+
+        `usage` is the service's own count when it sent one, and it is believed
+        in both directions: a reply that somehow cost *more* than was reserved
+        adds the difference rather than being quietly clamped, so that a provider
+        ignoring `max_tokens` shrinks the requests after it instead of going
+        unnoticed.
+
+        With no `usage` — the ordinary case, since a streamed reply does not
+        carry one unless it is asked for — the input estimate stands and the
+        reply itself is measured the same over-generous way.
+        """
+        if usage:
+            actual = int(usage)
+        else:
+            actual = self.cost + estimate_tokens(reply)
+        self.ledger.spent += actual - self.reserved
+        self.ledger.used.append(actual)
+
+    def failed(self):
+        """Nothing came back. Give up the output half; keep the input charged.
+
+        A request that raised may still have been read by the model before it
+        did, and charging for that is the safe direction to be wrong in.
+        """
+        self.ledger.spent -= self.cap
+
+
+class _Ledger:
+    """Every token one book may cost, counted before it is spent.
+
+    `spent` is never behind the truth. It is put *up* by the worst a request
+    could come to before that request is made, and only brought back down once
+    the reply is in hand — so at every moment between those two, the number
+    already covers a reply that has not arrived yet.
+    """
+
+    def __init__(self, limit):
+        self.limit = max(0, int(limit))
+        self.spent = 0
+        # What each finished request actually came to. Only the tests read it,
+        # and they read it to prove the total.
+        self.used = []
+
+    @property
+    def left(self):
+        return self.limit - self.spent
+
+    def room_for(self, messages, schema=None, later=0):
+        """`(cost, room)` — what this request costs to send, and what is left
+        over for it to reply with.
+
+        `later` is how many more requests of about this size are still to come.
+        Their input is held back here, so an early batch cannot spend the tokens
+        a later one needs to exist at all.
+        """
+        cost = estimate_request(messages, schema)
+        room = self.left - cost - later * cost - TOKEN_RESERVE
+        return cost, max(0, room)
+
+    def take(self, cost, cap):
+        """Charge the worst this request could possibly come to, and send it."""
+        self.spent += cost + cap
+        return _Charge(self, cost, cap)
 
 
 class _Budget:
     """The requests one book is allowed, counted rather than assumed.
 
-    OpenRouter's free tier is rationed by request, not by token, and the ration
-    is shared by everyone using this app that day. So the limit has to be a
+    A request is what costs — time on every copy, tokens on a paid one, and a
+    share of a rationed fifty a day on a free one. So the limit has to be a
     limit: every attempt costs one, including a rung downgrade and including a
-    repair, and when there is nothing left the answer is a sentence rather than
-    one more request.
+    repair.
+
+    Running out is not an error, and this is the one thing worth being careful
+    about. It used to raise, and raising is what turned a budget into a broken
+    book: a model that spent a request working out which JSON format it accepts
+    left too few for five chapters, and the reader got a red banner instead of
+    anything at all. Now `take` simply says no, the chapters that were not asked
+    for are written from the outline, and the reader gets a book. Every other
+    limit in this file behaves the same way, and for the same reason.
     """
 
     def __init__(self, allowed):
         self.allowed = max(1, allowed)
         self.spent = 0
-        # Set when a request was spent discovering which JSON format this model
-        # accepts. That happens at most once per model per restart, and it is
-        # worth saying so rather than letting the book look simply broken.
-        self.probed = False
 
     @property
     def left(self):
         return self.allowed - self.spent
 
     def take(self):
+        """Claim a request. `False` when there is not one to claim."""
         if self.left <= 0:
-            if self.probed:
-                raise AIError(
-                    "One request went on working out which reply format this "
-                    "model accepts, which left too few for the whole book. That "
-                    "is remembered now — press the button again and it will not "
-                    "happen a second time."
-                )
-            raise AIError(
-                f"This book has used its {self.allowed} requests. Free models "
-                "are rationed by the request, so that limit is a real one — try "
-                "again with a shorter, plainer description."
-            )
+            return False
         self.spent += 1
+        return True
 
 
-def _asker(chat, config, budget, live=None):
+def _asker(chat, config, budget, live=None, ledger=None):
     """A function that asks one question and gets one dictionary back.
 
-    A repair is allowed only when the budget can pay for it. A model that has
+    A repair is allowed only when both budgets can pay for it. A model that has
     produced prose once will often produce JSON when told so plainly, but not at
-    the cost of the chapters that have not been written yet.
+    the cost of the chapters that have not been written yet — and a repair is
+    expensive in tokens as well as in requests, because the reply being repaired
+    is sent back with it.
 
     `keep` says whether the answer is part of the book being read on screen. The
     chapters are; the outline is shown while it arrives and then makes way for
     them, because a plan is not the book.
+
+    **`None` means "could not be afforded", and it is not a failure.** It is the
+    one thing every caller here has to handle, because handling it is what turns
+    a token limit into a shorter book instead of an error message.
     """
     live = live or _Live()
+    ledger = ledger if ledger is not None else _Ledger(10**9)
 
-    def ask(system, user, schema_name, schema, salvage=None, keep=False):
+    def ask(
+        system,
+        user,
+        schema_name,
+        schema,
+        salvage=None,
+        keep=False,
+        share=1.0,
+        later=0,
+        ceiling=None,
+    ):
         messages = [("system", system), ("human", user)]
-        reply = _invoke(chat, config, messages, schema_name, schema, budget, live)
+        # `share` is this request's portion of what is left — two chapters out of
+        # the five still to write is two fifths of it — and `later` holds back
+        # what the requests after this one will need simply to be sent.
+        def afford(for_messages):
+            """The output cap these messages may have. `0` for "do not send"."""
+            _cost, room = ledger.room_for(for_messages, schema, later=later)
+            allowed = int(room * share)
+            if ceiling is not None:
+                allowed = min(allowed, ceiling)
+            return allowed if allowed >= MIN_OUTPUT_TOKENS else 0
+
+        def repair(reply):
+            """One more try, if both budgets can still pay for one."""
+            if budget.left <= 0:
+                return None
+            again = [("system", _REPAIR_SYSTEM), ("ai", reply), ("human", _REPAIR)]
+            cap = afford(again)
+            if not cap:
+                return None
+            mended = _invoke(
+                chat, config, again, schema_name, schema,
+                budget, live, ledger, cap,
+            )
+            if mended is None:
+                return None
+            try:
+                return extract_json(mended)
+            except AIError:
+                return None
+
+        if budget.left <= 0:
+            return None
+        cap = afford(messages)
+        if not cap:
+            return None
+
+        reply = _invoke(
+            chat, config, messages, schema_name, schema, budget, live, ledger, cap
+        )
+        if reply is None:
+            return None
         try:
             data = extract_json(reply)
         except AIError:
@@ -732,19 +1032,8 @@ def _asker(chat, config, budget, live=None):
             if salvage is not None:
                 data = salvage(reply) or None
             if data is None:
-                if budget.left <= 0:
-                    raise
-                repaired = _invoke(
-                    chat,
-                    config,
-                    messages + [("ai", reply), ("human", _REPAIR)],
-                    schema_name,
-                    schema,
-                    budget,
-                    live,
-                )
-                data = extract_json(repaired)
-        if keep:
+                data = repair(reply)
+        if keep and data is not None:
             live.keep()
         return data
 
@@ -759,15 +1048,15 @@ def _asker(chat, config, budget, live=None):
 # ignored, it is printed literally — a stray "- " becomes a hyphen in the middle
 # of a paragraph of a finished book — so the rules are stated to the model, and
 # `clean_text` cleans up what comes through anyway.
+#
+# Shorter than it was, and every word that went was paid for in chapters: a
+# system prompt is sent with every request, so a hundred tokens of housekeeping
+# here is a hundred tokens of prose the book does not get. What is left is the
+# markup the typesetter can print and the ban on everything it cannot.
 STYLE_RULES = """\
-Formatting rules, which are strict:
-- Plain prose. Each paragraph is one string with no line breaks inside it.
-- *one star* for italic, **two stars** for bold.
-- A paragraph of exactly *** is a scene break.
-- A paragraph beginning with "> " is a quotation.
-- No lists, no bullet points, no numbered points, no tables, no links, no
-  images, no footnotes, no code, and no headings inside the chapter text.
-"""
+Plain prose only. One paragraph per string, no line breaks inside one.
+*italic*, **bold**, a paragraph of *** for a scene break, "> " to start a quote.
+Nothing else: no lists, tables, links, footnotes, code or headings."""
 
 OUTLINE_SCHEMA = {
     "type": "object",
@@ -843,43 +1132,34 @@ def batch_schema(count):
     return schema
 
 
+# Both of these are written to be short before they are written to be nice. They
+# go out with every request, so their length is subtracted from the book — see
+# `_Ledger`. What survived the cutting is the part that changes what comes back:
+# the shape, the count, and the ban on prefaces.
 _OUTLINE_SYSTEM = """\
-You plan books that will be printed and sewn by hand. You are given a short
-description and you return a plan for the whole book.
+You plan short books to be printed and sewn by hand. Reply with one JSON object
+and nothing else:
+{{"title":"","subtitle":"","author":"","dedication":"","style_note":"",
+ "chapters":[{{"heading":"","summary":""}}]}}
 
-Reply with one JSON object and nothing else, in this shape:
-{{"title": "", "subtitle": "", "author": "", "series": "", "dedication": "",
-  "style_note": "", "chapters": [{{"heading": "", "summary": ""}}]}}
-
-- "chapters" holds **exactly {chapters} entries. Not more, not fewer.** This is
-  fixed and is not yours to choose. If the description asks for something long,
-  fit it into {chapters} chapters; if it asks for something short, still use
-  {chapters}. Words like "short", "brief", "epic" or "full-length" describe the
-  tone wanted, never the number of chapters.
-- "summary" is one or two sentences saying what happens in that chapter. Plan
-  them so the {chapters} together tell the whole story the description asks for,
-  beginning to end.
-- "author" is an invented author's name suited to the book. Never a real person.
-- "dedication" is one short line, or "" for none.
-- "style_note" is one sentence describing the voice, tense and register, so that
-  every chapter is written the same way. It is not printed.
-"""
+- "chapters" holds exactly {chapters} entries. Not more, not fewer, whatever the
+  description says about length — "short" and "epic" are tone, not counts.
+- "summary": one sentence on what happens. The {chapters} together must tell the
+  whole story, beginning to end.
+- "author": an invented name, never a real person.
+- "dedication": one short line, or "".
+- "style_note": one sentence on voice and tense. Not printed."""
 
 _BATCH_SYSTEM = """\
-You are writing a book that will be printed and sewn by hand. You are given the
-plan for the whole book and asked for some of its chapters.
+You write the chapters of a short book from its plan. Reply with one JSON object
+and nothing else:
+{{"chapters":[{{"number":1,"heading":"","paragraphs":["",""]}}]}}
 
-Reply with one JSON object and nothing else, in this shape:
-{{"chapters": [{{"number": 1, "heading": "", "paragraphs": ["", ""]}}]}}
-
-- Return **exactly the chapters you are asked for, in order**, each with its
-  "number" as given in the plan.
-- Each chapter is {low} to {high} paragraphs of real prose. Keep to that: the
-  whole reply must fit in one answer, and a reply that runs out mid-sentence is
-  lost entirely.
-- Continue the voice of the book exactly. Do not summarise, do not explain what
-  you are doing, do not write a preface, and do not repeat the chapter heading
-  inside the paragraphs.
+- Exactly the chapters asked for, in order, each keeping its "number".
+- {low} to {high} paragraphs each, about {words} words a paragraph. Keep to it:
+  a reply that runs out mid-sentence loses the chapter it was in.
+- Continue the book's voice. No preface, no summary, no explaining, and do not
+  repeat the heading inside the paragraphs.
 
 {rules}"""
 
@@ -912,6 +1192,28 @@ def clean_prompt(text):
 def clean_line(text, fallback=""):
     text = _CONTROL.sub(" ", str(text or ""))
     return " ".join(text.split()) or fallback
+
+
+def shorten(text, tokens):
+    """`text` cut down to about `tokens` tokens, at a word boundary.
+
+    Used on the description before it is sent with a batch of chapters, where
+    the whole of it is not worth what it costs. Cut at a space so the model is
+    given a phrase rather than half a word, and cut by the same over-estimate
+    the ledger budgets with, so what is sent is never bigger than what was
+    allowed for.
+    """
+    text = str(text or "")
+    if estimate_untrusted(text) <= tokens:
+        return text
+    # Measured the untrusted way, because this is the description and the whole
+    # reason for cutting it is that its cost has to be known rather than guessed.
+    # Sliced on characters and re-checked, since a character is not a byte.
+    cut = text
+    while cut and estimate_untrusted(cut) > tokens:
+        cut = cut[: int(len(cut) * 0.9)] if len(cut) > 20 else cut[:-1]
+    spaced = cut.rsplit(" ", 1)[0] if " " in cut else cut
+    return (spaced or cut).rstrip(" ,;:—-") + "…"
 
 
 def clean_text(paragraph):
@@ -954,14 +1256,23 @@ def build_outline(prompt, ask, config):
     """
     wanted = config.chapters
     system = _OUTLINE_SYSTEM.format(chapters=wanted)
-    data = ask(system, prompt, "book_outline", outline_schema(wanted))
-
-    raw = data.get("chapters")
-    if not isinstance(raw, list) or not raw:
-        raise AIError(
-            "The model did not plan any chapters. Try describing the book "
-            "differently."
-        )
+    data = ask(
+        system,
+        prompt,
+        "book_outline",
+        outline_schema(wanted),
+        # A plan is a page of headings. Anything more is taken out of the book
+        # the plan is for.
+        ceiling=OUTLINE_CAP,
+    )
+    # `None` is the ledger saying there was not enough left even for this, and an
+    # unreadable reply is the model saying the same thing differently. Neither is
+    # an error: a plan can be made here, for nothing, and a book with plain
+    # chapter headings is a book.
+    raw = data.get("chapters") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        raw = []
+    data = data if isinstance(data, dict) else {}
 
     chapters = []
     for entry in raw:
@@ -973,13 +1284,10 @@ def build_outline(prompt, ask, config):
                 "summary": clean_line(entry.get("summary")),
             }
         )
-    if not chapters:
-        raise AIError("The model's chapter list did not hold any chapters.")
 
     # Too many: keep the first `wanted`, which are the ones the rest of the plan
-    # was built around. Too few: pad, so the book is the length the button says
-    # it is. A padded chapter still gets the whole outline and the premise when
-    # it is written, so it is short of a summary rather than short of context.
+    # was built around. Too few — or none at all: pad, so the book is the length
+    # the button says it is.
     chapters = chapters[:wanted]
     while len(chapters) < wanted:
         chapters.append({"heading": "", "summary": ""})
@@ -995,9 +1303,8 @@ def build_outline(prompt, ask, config):
         "series": clean_line(data.get("series")),
         "dedication": clean_line(data.get("dedication")),
         "style_note": clean_line(data.get("style_note")),
-        # The description as typed, carried along so that the second batch of
-        # chapters is written against what was actually asked for and not only
-        # against the outline the first batch was written from.
+        # The description as typed. The batches get a trimmed version of it —
+        # see `PREMISE_TOKENS` — and the fill-in of last resort gets all of it.
         "premise": prompt,
         "chapters": chapters,
     }
@@ -1034,7 +1341,7 @@ def _prose(entry, fallback_heading, number):
     }
 
 
-def write_batch(plan, numbers, ask, config):
+def write_batch(plan, numbers, ask, config, share=1.0, later=0):
     """Ask for several chapters at once. `numbers` are 1-based, in order.
 
     Every request carries the whole outline, so the model always knows where in
@@ -1042,28 +1349,29 @@ def write_batch(plan, numbers, ask, config):
     story so far would grow every request after the first and spend the token
     budget on repetition — the outline is what holds the book together, and it
     is small.
+
+    `share` is this batch's portion of the tokens left, and `later` how many
+    batches follow it. Both go to the ledger, which turns them into the output
+    cap this request is allowed. Coming back empty-handed is a legal answer.
     """
     chapters = plan["chapters"]
     outline = "\n".join(
-        f"{number}. {chapter['heading']} — {chapter['summary'] or '(no summary; follow the book)'}"
+        f"{number}. {chapter['heading']} — {chapter['summary'] or '(follow the book)'}"
         for number, chapter in enumerate(chapters, start=1)
-    )
-    asked = "\n".join(
-        f"{number}. {chapters[number - 1]['heading']} — "
-        f"{chapters[number - 1]['summary'] or '(carry the story on from the chapter before)'}"
-        for number in numbers
     )
 
     user = (
-        f"Book: {plan['title']}\n"
-        f"By: {plan['author']}\n"
-        f"Voice: {plan['style_note']}\n"
-        f"What the book is: {plan['premise']}\n\n"
-        f"The whole book, all {len(chapters)} chapters:\n{outline}\n\n"
-        f"Write these {len(numbers)} of them now, in this order:\n{asked}"
+        f"{plan['title']}, by {plan['author']}. {plan['style_note']}\n"
+        f"About: {shorten(plan['premise'], PREMISE_TOKENS)}\n\n"
+        f"The plan, all {len(chapters)} chapters:\n{outline}\n\n"
+        f"Write chapters {', '.join(str(number) for number in numbers)} now, "
+        "in that order."
     )
     system = _BATCH_SYSTEM.format(
-        low=WANTED_PARAGRAPHS[0], high=WANTED_PARAGRAPHS[1], rules=STYLE_RULES
+        low=WANTED_PARAGRAPHS[0],
+        high=WANTED_PARAGRAPHS[1],
+        words=WANTED_WORDS,
+        rules=STYLE_RULES,
     )
     data = ask(
         system,
@@ -1074,13 +1382,17 @@ def write_batch(plan, numbers, ask, config):
         # Chapters stay on screen once they have arrived; the next batch is added
         # under them rather than replacing them.
         keep=True,
+        share=share,
+        later=later,
     )
 
-    raw = data.get("chapters")
+    raw = data.get("chapters") if isinstance(data, dict) else None
     if isinstance(raw, dict):
         raw = [raw]
     if not isinstance(raw, list):
-        raise AIError("The chapters came back in a shape that could not be read.")
+        # Nothing usable, and nothing raised. These chapters are simply not
+        # written yet; `write_book` fills them from the plan.
+        return []
 
     # Matched by the number the model was given, falling back to position for a
     # model that dropped the field. Either way a chapter lands where it belongs
@@ -1098,6 +1410,28 @@ def write_batch(plan, numbers, ask, config):
         if prose:
             written[number] = prose
     return [written[number] for number in numbers if number in written]
+
+
+def from_plan(plan, number):
+    """The chapter the model did not write, written from its own plan entry.
+
+    This is what makes the token limit a limit on the *length* of a book rather
+    than on whether there is one. When the ledger cannot afford a request, or a
+    reply comes back unreadable, or the clock runs out, the chapters that are
+    missing are made here — from the summary the outline already gave them,
+    which cost nothing and is on the subject.
+
+    It is not prose and does not pretend to be. It is a chapter with its heading
+    and a line saying what happens in it, sitting in an editor, waiting to be
+    written over. That is worth more than a red banner and no book at all.
+    """
+    entry = plan["chapters"][number - 1]
+    said = entry.get("summary") or shorten(plan.get("premise", ""), PREMISE_TOKENS)
+    return {
+        "number": number,
+        "heading": entry.get("heading") or f"Chapter {number}",
+        "text": clean_line(said) or "…",
+    }
 
 
 def to_manuscript(plan, chapters, design=None):
@@ -1154,11 +1488,16 @@ def _say(progress, fraction, message):
 
 
 def _check_allowed(config):
-    """Refuse a model that could be charged for, before anything is sent.
+    """Refuse a model this copy is not allowed to use, before anything is sent.
 
-    The account's own credit limit is the real control, but it is on the far side
-    of a request. This one is on this side of it, so a mistyped model name in a
-    Render environment variable becomes a sentence on the page rather than a
+    The default model is a paid one — a very cheap paid one, but paid — so
+    `OPENROUTER_FREE_ONLY` is off by default and this check normally passes. The
+    account's credit limit is what makes the ceiling real, and it is the only
+    control on the far side of a request.
+
+    Switching the flag on is for a copy that must not be able to spend anything
+    at all. Then this is the check on *this* side of the request, and a model
+    name that could be charged for becomes a sentence on the page rather than a
     charge on the account.
     """
     # Asked of the settings in hand rather than of the environment, so the
@@ -1172,7 +1511,8 @@ def _check_allowed(config):
         raise AIError(
             f"“{config.model}” is not a free model, and this copy is set to "
             f"free models only. Set {ai_config.MODEL_VAR} to "
-            f"“{ai_config.DEFAULT_MODEL}” or to a model ending in “:free”."
+            f"“{ai_config.FREE_MODEL}” or to a model ending in “:free”, or "
+            f"switch {ai_config.FREE_ONLY_VAR} off."
         )
 
 
@@ -1198,9 +1538,10 @@ def write_book(prompt, *, design=None, progress=None, on_text=None, config=None)
 
     started = time.monotonic()
     budget = _Budget(config.max_calls)
+    ledger = _Ledger(config.token_limit)
     chat = _make_chat(config)
     live = _Live(on_text)
-    ask = _asker(chat, config, budget, live)
+    ask = _asker(chat, config, budget, live, ledger)
 
     total = config.chapters
     _say(progress, 0.0, f"Planning {total} chapters…")
@@ -1210,16 +1551,15 @@ def write_book(prompt, *, design=None, progress=None, on_text=None, config=None)
     sizes = split_batches(total, budget.left)
     _say(progress, 0.12, f"{total} chapters planned. Writing them now.")
 
-    chapters = []
+    written = {}
     done = 0
-    for size in sizes:
+    for index, size in enumerate(sizes):
         numbers = list(range(done + 1, done + size + 1))
         if time.monotonic() - started > config.budget:
-            raise AIError(
-                f"This took too long and was stopped after {len(chapters)} of "
-                f"{total} chapters. Free models can be slow when they are busy — "
-                "try again in a few minutes."
-            )
+            # Out of time rather than out of tokens. The chapters already
+            # written are kept and the rest are filled in below, so a slow model
+            # costs the reader prose and not the book.
+            break
         first, last = numbers[0], numbers[-1]
         _say(
             progress,
@@ -1228,11 +1568,23 @@ def write_book(prompt, *, design=None, progress=None, on_text=None, config=None)
             + (f"–{last}" if size > 1 else "")
             + f" of {total}…",
         )
-        chapters.extend(write_batch(plan, numbers, ask, config))
+        for chapter in write_batch(
+            plan,
+            numbers,
+            ask,
+            config,
+            # This batch's portion of what is left, and how many batches are
+            # still to be paid for after it.
+            share=size / max(1, total - done),
+            later=len(sizes) - index - 1,
+        ):
+            written[chapter["number"]] = chapter
         done += size
 
-    if not chapters:
-        raise AIError("The model returned no usable chapters. Try again.")
+    chapters = [
+        written.get(number) or from_plan(plan, number)
+        for number in range(1, total + 1)
+    ]
 
     _say(progress, 0.98, "Putting the book together…")
     book = to_manuscript(plan, chapters, design)

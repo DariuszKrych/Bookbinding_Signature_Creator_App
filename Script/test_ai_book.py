@@ -15,6 +15,7 @@ from a real free model, and every one has a test.
 
 import json
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -34,13 +35,20 @@ from Script.manuscript import Design, Manuscript  # noqa: E402
 # `test_no_key_is_sitting_in_the_repository` sweep every file with no exceptions.
 FAKE_KEY = "sk-or-" + "v1-" + "0123456789abcdef" * 2
 
+# The model the app is set to, read from the settings rather than written out
+# again, so changing it in one place does not leave a row of tests asserting the
+# old name.
+DEFAULT_MODEL = ai_config.DEFAULT_MODEL
+
 
 def settings(**changes):
     base = ai_config.Settings(
         api_key=FAKE_KEY,
-        model="openrouter/free",
+        model=DEFAULT_MODEL,
         base_url=ai_config.BASE_URL,
-        free_only=True,
+        # Off, as it is in the app: the default model is a paid one. The tests
+        # that care about the guard switch it on themselves.
+        free_only=False,
         app_title="tests",
         timeout=5.0,
         budget=60.0,
@@ -290,7 +298,7 @@ class TestTheFormatLadder(AiTestCase):
         chat.replies.insert(0, RuntimeError("response_format not supported"))
         self.run_book(chat, config=config)
         # The chapter request did not repeat the probe.
-        self.assertEqual(ai_book._RUNG["openrouter/free"], "json_object")
+        self.assertEqual(ai_book._RUNG[DEFAULT_MODEL], "json_object")
         self.assertEqual(chat.bindings[2]["response_format"]["type"], "json_object")
 
     def test_a_rate_limit_does_not_drop_a_rung(self):
@@ -309,18 +317,23 @@ class TestRepairingOneBadReply(AiTestCase):
         self.assertEqual(book.title, "The Folded Sheet")
         self.assertEqual(len(chat.calls), 3)
 
-    def test_two_bad_replies_give_up_rather_than_loop(self):
-        chat = FakeChat("nope", "still nope")
-        with self.assertRaises(ai_book.AIError):
-            self.run_book(chat)
-        self.assertEqual(len(chat.calls), 2)
+    def test_two_bad_replies_move_on_rather_than_loop(self):
+        """One repair per question, and then the book carries on without it."""
+        chat = FakeChat("nope", "still nope", batch_reply(1))
+        book = self.run_book(chat, config=settings(chapters=1))
+        # Outline, its one repair, then straight on to the chapter — not a third
+        # attempt at the outline.
+        self.assertEqual(len(chat.calls), 3)
+        self.assertEqual(len(book.chapters), 1)
 
     def test_a_repair_is_not_attempted_with_no_requests_left(self):
         """The budget outranks the repair: the chapters matter more."""
         chat = FakeChat("nope", "still nope", "and again")
-        with self.assertRaises(ai_book.AIError):
-            self.run_book(chat, config=settings(max_calls=2))
+        book = self.run_book(chat, config=settings(max_calls=2, chapters=1))
+        # Two requests: the bad outline and the one chapter request. The repair
+        # was skipped rather than eating the chapter's turn.
         self.assertEqual(len(chat.calls), 2)
+        self.assertEqual(len(book.chapters), 1)
 
 
 class TestTidyingTheProse(AiTestCase):
@@ -364,30 +377,51 @@ class TestTheDescription(AiTestCase):
 
 
 class TestRefusingToSpendMoney(AiTestCase):
-    def test_a_paid_model_is_refused_before_anything_is_sent(self):
+    """`OPENROUTER_FREE_ONLY`, which is off by default and still has to work.
+
+    The app's own model is a paid one — a fifth of a penny for ten books, but
+    paid — so the guard no longer stands between an ordinary copy and its first
+    request. It stands between a copy that has deliberately been told it may not
+    spend anything and a model that would.
+    """
+
+    def test_a_paid_model_is_refused_when_the_guard_is_on(self):
         made = mock.Mock()
         with mock.patch.object(ai_book, "_make_chat", made):
             with self.assertRaises(ai_book.AIError) as caught:
-                ai_book.write_book("x", config=settings(model="openai/gpt-4o"))
+                ai_book.write_book(
+                    "x", config=settings(model="openai/gpt-4o", free_only=True)
+                )
         self.assertIn("not a free model", str(caught.exception))
         made.assert_not_called()
 
+    def test_the_message_names_a_model_that_would_be_allowed(self):
+        """Not the default: on a free-only copy that is the one thing it cannot
+        be set to."""
+        with mock.patch.object(ai_book, "_make_chat", mock.Mock()):
+            with self.assertRaises(ai_book.AIError) as caught:
+                ai_book.write_book(
+                    "x", config=settings(model="openai/gpt-4o", free_only=True)
+                )
+        said = str(caught.exception)
+        self.assertIn(ai_config.FREE_MODEL, said)
+        self.assertNotIn(DEFAULT_MODEL, said)
+
+    def test_the_app_default_is_a_paid_model_and_says_so(self):
+        """The guard would be worthless if the default counted itself free."""
+        self.assertFalse(settings().is_free)
+
+    def test_the_default_is_usable_out_of_the_box(self):
+        chat = FakeChat(outline_reply(1), batch_reply(1))
+        with mock.patch.object(ai_book, "_make_chat", return_value=chat):
+            book = ai_book.write_book("x", config=settings(chapters=1))
+        self.assertEqual(book.title, "The Folded Sheet")
+
     def test_the_free_router_is_allowed(self):
-        self.assertTrue(settings(model="openrouter/free").is_free)
+        self.assertTrue(settings(model=ai_config.FREE_MODEL).is_free)
 
     def test_a_free_suffix_is_allowed(self):
         self.assertTrue(settings(model="meta-llama/llama-3.3-70b-instruct:free").is_free)
-
-    def test_a_paid_model_is_allowed_when_that_was_asked_for(self):
-        chat = FakeChat(outline_reply(1), batch_reply(1))
-        with mock.patch.object(ai_book, "_make_chat", return_value=chat):
-            book = ai_book.write_book(
-                "x",
-                config=settings(
-                    model="openai/gpt-4o", free_only=False, chapters=1
-                ),
-            )
-        self.assertEqual(book.title, "The Folded Sheet")
 
     def test_no_key_is_refused(self):
         made = mock.Mock()
@@ -488,20 +522,26 @@ class TestBuildingTheBook(AiTestCase):
         book = self.run_book(chat, config=settings(chapters=1))
         self.assertEqual(book.body[0].heading, "Chapter 1")
 
-    def test_an_outline_with_no_chapters_is_refused(self):
-        chat = FakeChat(json.dumps({"title": "t", "author": "a", "chapters": []}))
-        with self.assertRaises(ai_book.AIError) as caught:
-            self.run_book(chat)
-        self.assertIn("did not plan any chapters", str(caught.exception))
+    def test_an_outline_with_no_chapters_still_gives_a_book(self):
+        """A plan of nothing is not a failure. It is plain chapter headings."""
+        chat = FakeChat(
+            json.dumps({"title": "t", "author": "a", "chapters": []}),
+            batch_reply(1),
+        )
+        book = self.run_book(chat, config=settings(chapters=1))
+        self.assertEqual(len(book.chapters), 1)
+        self.assertEqual(book.chapters[0].heading, "Chapter 1")
 
-    def test_a_book_with_no_usable_chapters_is_refused(self):
+    def test_a_batch_with_nothing_usable_in_it_still_gives_a_book(self):
         chat = FakeChat(
             outline_reply(1),
             json.dumps({"chapters": [{"number": 1, "paragraphs": ["", "  "]}]}),
         )
-        with self.assertRaises(ai_book.AIError) as caught:
-            self.run_book(chat, config=settings(chapters=1))
-        self.assertIn("no usable chapters", str(caught.exception))
+        book = self.run_book(chat, config=settings(chapters=1))
+        # Filled from the plan rather than refused: the summary the outline gave
+        # that chapter, in an editor, waiting to be written over.
+        self.assertEqual(len(book.chapters), 1)
+        self.assertEqual(book.chapters[0].text, "What happens in 1.")
 
 
 class TestTheDesignIsLeftAlone(AiTestCase):
@@ -562,13 +602,18 @@ class TestProgress(AiTestCase):
 
 
 class TestTheTimeBudget(AiTestCase):
-    def test_a_slow_book_is_stopped_and_says_where(self):
+    def test_a_slow_book_stops_asking_and_keeps_what_it_has(self):
+        """Out of time is not out of book: the rest comes from the plan."""
         chat = FakeChat(*whole_book())
         clock = iter([0.0, 0.0, 999.0, 1000.0, 1001.0])
         with mock.patch.object(ai_book.time, "monotonic", lambda: next(clock)):
-            with self.assertRaises(ai_book.AIError) as caught:
-                self.run_book(chat)
-        self.assertIn("of 5 chapters", str(caught.exception))
+            book = self.run_book(chat)
+        # The clock ran out between the two batches. Chapters 1-3 were written;
+        # 4 and 5 come from their own summaries — and there are still five.
+        self.assertEqual(len(book.chapters), 5)
+        self.assertEqual(book.chapters[0].text.split("\n")[0], "Chapter 1, first.")
+        self.assertEqual(book.chapters[4].text, "What happens in 5.")
+        self.assertEqual(len(chat.calls), 2)
 
 
 class TestTheRequestBudget(AiTestCase):
@@ -584,8 +629,8 @@ class TestTheRequestBudget(AiTestCase):
         self.run_book(chat)
         # Batch one asks for chapters 1-3, batch two for 4-5.
         first, second = chat.calls[1][1][1], chat.calls[2][1][1]
-        self.assertIn("Write these 3 of them now", first)
-        self.assertIn("Write these 2 of them now", second)
+        self.assertIn("Write chapters 1, 2, 3 now", first)
+        self.assertIn("Write chapters 4, 5 now", second)
 
     def test_a_bigger_allowance_is_used_as_more_batches(self):
         chat = FakeChat(outline_reply(5), *[batch_reply(1, 2)] * 3)
@@ -599,21 +644,31 @@ class TestTheRequestBudget(AiTestCase):
         self.assertEqual(ai_book.split_batches(1, 2), [1])
         self.assertEqual(ai_book.split_batches(5, 1), [5])
 
-    def test_running_out_of_requests_says_so_plainly(self):
+    def test_running_out_of_requests_says_no_rather_than_raising(self):
+        """A budget that raises is a budget that can break a book."""
         budget = ai_book._Budget(1)
-        budget.take()
-        with self.assertRaises(ai_book.AIError) as caught:
-            budget.take()
-        self.assertIn("rationed by the request", str(caught.exception))
+        self.assertTrue(budget.take())
+        self.assertFalse(budget.take())
+        self.assertFalse(budget.take())
 
-    def test_a_format_probe_that_costs_the_book_says_to_press_again(self):
-        """Self-healing, and worth saying rather than looking simply broken."""
-        budget = ai_book._Budget(1)
-        budget.probed = True
-        budget.take()
-        with self.assertRaises(ai_book.AIError) as caught:
-            budget.take()
-        self.assertIn("press the button again", str(caught.exception))
+    def test_a_format_probe_that_costs_a_request_still_gives_a_book(self):
+        """The failure this used to be an error message about.
+
+        A model that spends a request working out which JSON format it accepts
+        leaves one fewer for the chapters. That used to end the book with a
+        banner asking the reader to press the button again. It now ends with a
+        book, short of the chapters the missing request would have written.
+        """
+        chat = FakeChat(
+            RuntimeError("400 - response_format json_schema is not supported"),
+            outline_reply(5),
+            batch_reply(1, 2, 3),
+        )
+        book = self.run_book(chat, config=settings(max_calls=3))
+        self.assertEqual(len(book.chapters), 5)
+        self.assertEqual(book.chapters[0].text.split("\n")[0], "Chapter 1, first.")
+        # The probe cost the second batch, so 4 and 5 come from the plan.
+        self.assertEqual(book.chapters[4].text, "What happens in 5.")
 
 
 class TestExactlyFiveChapters(AiTestCase):
@@ -679,8 +734,12 @@ class TestRescuingATruncatedBatch(AiTestCase):
         chat = FakeChat(outline_reply(5), truncated, batch_reply(4, 5))
         book = self.run_book(chat)
         self.assertEqual(len(chat.calls), 3)
-        # Chapter three was lost with the truncation; the rest survived.
-        self.assertEqual(len(book.chapters), 4)
+        # Chapter three was lost with the truncation. Four came back written and
+        # the fifth entry is chapter three, filled from its own summary — so the
+        # book is still the five the button promised.
+        self.assertEqual(len(book.chapters), 5)
+        self.assertEqual(book.chapters[2].text, "What happens in 3.")
+        self.assertEqual(book.chapters[3].text.split("\n")[0], "Chapter 4, first.")
 
     def test_objects_are_found_at_every_depth(self):
         found = ai_book._every_object('{"a": {"b": 1}, "c": {"d": 2}}')
@@ -826,12 +885,480 @@ class TestWatchingTheBookBeingWritten(AiTestCase):
         truncated = good[: good.rindex("]")] + ', {"number": 3, "paragraphs": ["Ha'
         chat = FakeChat(outline_reply(5), truncated, batch_reply(4, 5))
         book, seen = self.run_watched(chat)
-        self.assertEqual(len(book.chapters), 4)
+        self.assertEqual(len(book.chapters), 5)
         self.assertIn("Chapter 1, first.", seen[-1])
 
 
-class TestAskingForTheFastestProvider(AiTestCase):
-    """The `provider` block, which is the other half of not waiting."""
+def _schema_of(binding):
+    """The bare schema out of a recorded `response_format`, or `None`.
+
+    The ledger charges for the schema it was given; this digs the same object
+    back out of what was sent, so the two are counting the same thing.
+    """
+    fmt = binding.get("response_format") or {}
+    return fmt.get("json_schema", {}).get("schema")
+
+
+class GreedyChat(FakeChat):
+    """A model that always says the most it is allowed to say.
+
+    The worst legal case, and the one the limit has to survive: every reply comes
+    back exactly as long as the `max_tokens` it was sent, measured in the same
+    over-generous way `estimate_tokens` measures it. A real model answers with
+    less. This one never does.
+
+    It answers with real chapters first — padded out to the cap with a long last
+    paragraph — so the book is still a book while the arithmetic is at its worst.
+    """
+
+    def __init__(self, *replies, **kwargs):
+        super().__init__(*replies, **kwargs)
+        self.caps = []
+        self.said = []
+
+    def bind(self, **kwargs):
+        self.caps.append(kwargs.get("max_tokens"))
+        return super().bind(**kwargs)
+
+    def _next(self, messages):
+        try:
+            reply = super()._next(messages)
+        except Exception:
+            # Recorded as having said nothing, so `said` stays lined up with
+            # `calls`. A request that was refused is a request that was sent and
+            # produced no output, and the sums below need both facts.
+            self.said.append("")
+            raise
+        reply = self.fatten(reply, self.caps[-1] or 0)
+        self.said.append(reply)
+        return reply
+
+    @staticmethod
+    def fatten(reply, cap):
+        """`reply`, grown until it is as long as `cap` allows and no longer."""
+        room = cap * 3 - len(reply.encode("utf-8"))  # three bytes to the token
+        if room <= 0:
+            return reply
+        padding = "pad " * (room // 4)
+        # Inside the last paragraph when there is one, so the reply stays the
+        # JSON it was going to be; on the end when there is not.
+        marker = '"]'
+        if marker in reply:
+            return reply.replace(marker, padding + marker, 1)
+        return reply + " " + padding
+
+
+class TestTheTokenLimit(AiTestCase):
+    """5,000 tokens a book, input and output, and never one more.
+
+    The guarantee rests on two things and they are checked separately below,
+    because together they are the whole argument:
+
+    1. Output cannot exceed what `max_tokens` allows, because the service
+       enforces it. So every request must carry one.
+    2. Input cannot exceed `estimate_tokens`, because that number is an
+       over-estimate. So it must never read low.
+
+    Given both, `estimated input + max_tokens` is the worst a request can come
+    to, and the ledger only sends a request whose worst case still fits.
+    """
+
+    def spend(self, chat):
+        """What these requests really came to, in tokens.
+
+        Rebuilt from what the model was sent and what it said back, not from the
+        ledger's own books — which would only be checking that the ledger agrees
+        with itself. Input is the messages plus the schema that went with them;
+        output is the reply, which a `GreedyChat` has already grown to fill every
+        token its `max_tokens` allowed. So for a `GreedyChat` this is both the
+        real cost and the worst possible one.
+        """
+        total = 0
+        for messages, binding, said in zip(chat.calls, chat.bindings, chat.said):
+            total += ai_book.estimate_request(messages, _schema_of(binding))
+            total += ai_book.estimate_tokens(said)
+        return total
+
+    def caps_allowed(self, chat):
+        """The other reading: every reply as long as it was *allowed* to be.
+
+        Only meaningful when no request was refused. A refused one produced no
+        output at all, so its cap was handed straight back — counting it would
+        be adding up tokens that could not all have existed at once.
+        """
+        return sum(
+            ai_book.estimate_request(messages, _schema_of(binding))
+            + (binding.get("max_tokens") or 0)
+            for messages, binding in zip(chat.calls, chat.bindings)
+        )
+
+    # ---- 1. every request is capped ------------------------------------
+
+    def test_every_request_carries_a_maximum(self):
+        chat = GreedyChat(*whole_book())
+        self.run_book(chat)
+        self.assertEqual(len(chat.caps), len(chat.calls))
+        self.assertTrue(all(isinstance(cap, int) and cap > 0 for cap in chat.caps))
+
+    def test_the_cap_is_what_the_service_is_told(self):
+        chat = GreedyChat(*whole_book())
+        self.run_book(chat)
+        for binding, cap in zip(chat.bindings, chat.caps):
+            self.assertEqual(binding["max_tokens"], cap)
+
+    # ---- 2. the estimate never reads low --------------------------------
+
+    def test_the_estimate_is_never_below_a_real_tokenizer(self):
+        """The one assumption the whole limit rests on.
+
+        Checked against a real BPE tokenizer over text of the kinds this app
+        actually sends — its own prompts, a description, prose, JSON, and the
+        scripts that break a bytes-per-character guess.
+        """
+        try:
+            import tiktoken
+
+            encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:  # pragma: no cover - offline or not installed
+            self.skipTest("tiktoken is not available to check against")
+
+        samples = [
+            ai_book.STYLE_RULES,
+            ai_book._OUTLINE_SYSTEM.format(chapters=5),
+            ai_book._BATCH_SYSTEM.format(low=3, high=4, words=80, rules=ai_book.STYLE_RULES),
+            ai_book._REPAIR,
+            json.dumps(ai_book.OUTLINE_SCHEMA),
+            json.dumps(ai_book.BATCH_SCHEMA),
+            outline_reply(5),
+            batch_reply(1, 2, 3),
+            "a book about paperclips" * 40,
+            "Здравствуй, мир! " * 30,
+            "组装书页的方法。" * 40,
+            "🙂🙃" * 200,
+            "".join(chr(c) for c in range(32, 127)) * 8,
+            "",
+            " ",
+        ]
+        for sample in samples:
+            self.assertGreaterEqual(
+                ai_book.estimate_untrusted(sample),
+                len(encoding.encode(sample)),
+                f"under-estimated as untrusted: {sample[:40]!r}",
+            )
+
+    def test_the_prompts_this_app_sends_are_not_under_estimated(self):
+        """The looser of the two estimators, held to the text it is used on.
+
+        `estimate_tokens` is only ever applied to words written in `ai_book`
+        itself, so it is allowed a ratio that suits English prose and JSON. This
+        is the check that keeps it honest as those words are edited.
+        """
+        try:
+            import tiktoken
+
+            encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:  # pragma: no cover - offline or not installed
+            self.skipTest("tiktoken is not available to check against")
+
+        ours = [
+            ai_book.STYLE_RULES,
+            ai_book._OUTLINE_SYSTEM.format(chapters=5),
+            ai_book._BATCH_SYSTEM.format(
+                low=3, high=4, words=80, rules=ai_book.STYLE_RULES
+            ),
+            ai_book._REPAIR,
+            ai_book._REPAIR_SYSTEM,
+            json.dumps(ai_book.outline_schema(5)),
+            json.dumps(ai_book.batch_schema(3)),
+        ]
+        for sample in ours:
+            self.assertGreaterEqual(
+                ai_book.estimate_tokens(sample),
+                len(encoding.encode(sample)),
+                f"under-estimated: {sample[:60]!r}",
+            )
+
+    # ---- the two together ------------------------------------------------
+
+    def test_an_ordinary_book_stays_inside_the_limit(self):
+        chat = GreedyChat(*whole_book())
+        self.run_book(chat)
+        self.assertLessEqual(self.spend(chat), 5000)
+
+    def test_a_greedy_model_cannot_push_it_over(self):
+        """Every reply as long as it was allowed to be, on every request."""
+        chat = GreedyChat(*whole_book())
+        book = self.run_book(chat)
+        self.assertLessEqual(self.spend(chat), 5000)
+        self.assertEqual(len(book.chapters), 5)
+
+    def test_the_ledger_agrees_it_never_went_over(self):
+        chat = GreedyChat(*whole_book())
+        ledger = self.run_watching_the_ledger(chat)
+        self.assertLessEqual(ledger.spent, 5000)
+        self.assertLessEqual(sum(ledger.used), 5000)
+
+    def run_watching_the_ledger(self, chat, config=None, **kwargs):
+        """Run a book and hand back the `_Ledger` it used."""
+        seen = []
+        real = ai_book._Ledger
+
+        def remember(limit):
+            made = real(limit)
+            seen.append(made)
+            return made
+
+        with mock.patch.object(ai_book, "_Ledger", remember):
+            self.run_book(chat, config=config or settings(), **kwargs)
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    # ---- the awkward cases ----------------------------------------------
+
+    def test_a_description_at_its_full_length_does_not_break_it(self):
+        chat = GreedyChat(*whole_book())
+        self.run_book(chat, "paperclips and their discontents " * 40)
+        self.assertLessEqual(self.spend(chat), 5000)
+
+    def test_a_description_in_another_script_does_not_break_it(self):
+        """Bytes, not characters — a thousand characters of Chinese is three
+        thousand bytes and the estimate has to know it."""
+        chat = GreedyChat(*whole_book())
+        self.run_book(chat, "组装书页的方法，" * 120)
+        self.assertLessEqual(self.spend(chat), 5000)
+
+    def test_a_repair_does_not_break_it(self):
+        chat = GreedyChat(outline_reply(5), "not json at all", batch_reply(1, 2, 3))
+        self.run_book(chat)
+        self.assertLessEqual(self.spend(chat), 5000)
+
+    def test_a_format_downgrade_does_not_break_it(self):
+        chat = GreedyChat(
+            RuntimeError("400 response_format json_schema is not supported"),
+            outline_reply(5),
+            batch_reply(1, 2, 3),
+            batch_reply(4, 5),
+        )
+        self.run_book(chat, config=settings(max_calls=4))
+        self.assertLessEqual(self.spend(chat), 5000)
+
+    def test_more_requests_do_not_buy_more_tokens(self):
+        """The two budgets are not the same budget. Raising one is not raising
+        the other, and the token limit is the one that binds."""
+        chat = GreedyChat(outline_reply(5), *[batch_reply(1)] * 9)
+        self.run_book(chat, config=settings(max_calls=10))
+        self.assertLessEqual(self.spend(chat), 5000)
+
+    def test_more_chapters_do_not_buy_more_tokens(self):
+        chat = GreedyChat(outline_reply(12), *[batch_reply(1)] * 9)
+        self.run_book(chat, config=settings(chapters=12, max_calls=10))
+        self.assertLessEqual(self.spend(chat), 5000)
+
+    # ---- and it is still a book ------------------------------------------
+
+    def test_five_chapters_arrive_whatever_the_model_does(self):
+        """Every way a request can come to nothing, and a book each time."""
+        cases = {
+            "a whole book": whole_book(),
+            "nothing but prose": ["sorry", "still sorry", "no", "no", "no"],
+            "an empty outline": [json.dumps({"chapters": []}), batch_reply(1, 2, 3)],
+            "one batch missing": [outline_reply(5), batch_reply(1, 2, 3), "rubbish"],
+            "chapters with no text": [
+                outline_reply(5),
+                json.dumps({"chapters": [{"number": 1, "paragraphs": []}]}),
+            ],
+            "a truncated reply": [
+                outline_reply(5),
+                '{"chapters": [{"number": 1, "paragraphs": ["Half a sen',
+            ],
+        }
+        for name, replies in cases.items():
+            with self.subTest(name):
+                ai_book._RUNG.clear()
+                chat = GreedyChat(*replies, *["still nothing"] * 6)
+                book = self.run_book(chat)
+                self.assertEqual(len(book.chapters), 5, name)
+                self.assertTrue(all(c.text.strip() for c in book.chapters), name)
+                self.assertLessEqual(self.spend(chat), 5000, name)
+
+    def test_a_limit_too_small_to_ask_anything_still_gives_a_book(self):
+        """The floor of the whole design: no requests at all, still five
+        chapters, still no error."""
+        chat = GreedyChat(*whole_book())
+        book = self.run_book(chat, config=settings(token_limit=50))
+        self.assertEqual(len(chat.calls), 0)
+        self.assertEqual(len(book.chapters), 5)
+        self.assertTrue(all(c.text.strip() for c in book.chapters))
+
+    def test_a_smaller_limit_makes_a_shorter_book_not_a_broken_one(self):
+        lengths = {}
+        for limit in (1200, 2500, 5000):
+            ai_book._RUNG.clear()
+            chat = GreedyChat(*whole_book())
+            book = self.run_book(chat, config=settings(token_limit=limit))
+            self.assertEqual(len(book.chapters), 5, limit)
+            self.assertLessEqual(self.spend(chat), limit, limit)
+            lengths[limit] = book.words
+        self.assertLess(lengths[1200], lengths[5000])
+
+    # ---- the ground truth ------------------------------------------------
+
+    def real_spend(self, chat, encoding):
+        """What OpenRouter would have billed, counted with a real tokenizer.
+
+        Everything above is this file's arithmetic checking this file's
+        arithmetic. This is the number that would appear on the account: every
+        byte of every request body that carries tokens, plus every reply.
+        """
+        total = 0
+        for messages, binding, said in zip(chat.calls, chat.bindings, chat.said):
+            total += sum(len(encoding.encode(text)) for _role, text in messages)
+            fmt = binding.get("response_format")
+            if fmt:
+                total += len(encoding.encode(json.dumps(fmt)))
+            total += len(encoding.encode(said))
+        return total
+
+    def test_a_real_tokenizer_agrees_the_limit_held(self):
+        """The whole guarantee, measured rather than argued.
+
+        Nine ways a book can go, every reply as long as the service would have
+        let it be, counted by a real BPE tokenizer. None of them may pass 5,000.
+        """
+        runs = {
+            "an ordinary book": (whole_book(), "a book about paperclips"),
+            "a long description": (
+                whole_book(),
+                "paperclips, their history, their discontents, and the people "
+                "who bent them " * 12,
+            ),
+            "a description of punctuation": (
+                whole_book(),
+                "!@#$%^&*()_+-=[]{};':\",./<>?`~ " * 40,
+            ),
+            "a description in chinese": (whole_book(), "组装书页的方法，" * 120),
+            "a description of emoji": (whole_book(), "🙂🙃😀😃" * 200),
+            "a book in cyrillic": (
+                [
+                    outline_reply(5, title="Сложенный лист", author="М. Квайр"),
+                    batch_reply(1, 2, 3),
+                    batch_reply(4, 5),
+                ],
+                "книга о бумаге",
+            ),
+            "prose instead of json": (
+                ["sorry", "still sorry", "no", "no", "no"],
+                "a book about paper",
+            ),
+            "a truncated reply": (
+                [
+                    outline_reply(5),
+                    '{"chapters": [{"number": 1, "paragraphs": ["Half a sen',
+                    batch_reply(4, 5),
+                ],
+                "a book about paper",
+            ),
+            "a format downgrade": (
+                [
+                    RuntimeError("400 response_format json_schema is not supported"),
+                    outline_reply(5),
+                    batch_reply(1, 2, 3),
+                    batch_reply(4, 5),
+                ],
+                "a book about paper",
+            ),
+        }
+        try:
+            import tiktoken
+
+            encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:  # pragma: no cover - offline or not installed
+            self.skipTest("tiktoken is not available to check against")
+
+        for name, (replies, description) in runs.items():
+            with self.subTest(name):
+                ai_book._RUNG.clear()
+                chat = GreedyChat(*replies, *["nothing more"] * 6)
+                book = self.run_book(
+                    chat, description, config=settings(max_calls=4)
+                )
+                billed = self.real_spend(chat, encoding)
+                self.assertLessEqual(billed, 5000, f"{name}: billed {billed}")
+                self.assertEqual(len(book.chapters), 5, name)
+                self.assertTrue(all(c.text.strip() for c in book.chapters), name)
+
+    def test_two_hundred_random_books_all_stayed_inside_it(self):
+        """The cases nobody thought to write down.
+
+        Descriptions built out of every script that priced badly in the table
+        the estimators were set from, crossed with every way a reply can go
+        wrong, at limits from cramped to generous. Seeded, so a failure here is
+        a failure anybody can reproduce.
+        """
+        rng = random.Random(20260827)
+        alphabets = [
+            "abcdefghijklmnopqrstuvwxyz ",
+            "!@#$%^&*()_+-=[]{};':\",./<>?`~ ",
+            "0123456789 .,",
+            "组装书页的方法，用亚麻线缝合书脊。",
+            "Здравствуй, мир! Книги сшиваются льняной нитью.",
+            "שלום עולם, הספרים נתפרים בחוט פשתן.",
+            "🙂🙃😀😃😄😁😆😅",
+            "áèîõǘ ̈ ̃ ̄",
+        ]
+        misbehaviours = [
+            lambda: outline_reply(5),
+            lambda: batch_reply(1, 2, 3),
+            lambda: batch_reply(4, 5),
+            lambda: "I am sorry, I cannot help with that.",
+            lambda: '{"chapters": [{"number": 1, "paragraphs": ["Cut off mid',
+            lambda: "```json\n" + batch_reply(1) + "\n```",
+            lambda: json.dumps({"chapters": []}),
+            lambda: RuntimeError("400 response_format json_schema is unsupported"),
+        ]
+
+        for run in range(200):
+            ai_book._RUNG.clear()
+            alphabet = rng.choice(alphabets)
+            description = "".join(
+                rng.choice(alphabet) for _ in range(rng.randint(1, 1000))
+            )
+            if not description.strip():
+                continue  # An empty box is refused before any of this, rightly.
+            replies = [rng.choice(misbehaviours)() for _ in range(rng.randint(1, 6))]
+            limit = rng.choice([400, 900, 1500, 2500, 5000])
+            chapters = rng.choice([1, 3, 5, 8])
+            calls = rng.choice([1, 2, 3, 5])
+            chat = GreedyChat(*replies, *["and nothing more"] * 8)
+            config = settings(
+                token_limit=limit, chapters=chapters, max_calls=calls
+            )
+            try:
+                book = self.run_book(chat, description, config=config)
+            except ai_book.AIError as error:  # pragma: no cover - a real failure
+                self.fail(f"run {run} raised: {error}")
+            note = f"run {run}: limit={limit} chapters={chapters} calls={calls}"
+            self.assertEqual(len(book.chapters), chapters, note)
+            self.assertTrue(all(c.text.strip() for c in book.chapters), note)
+            self.assertLessEqual(self.spend(chat), limit, note)
+            if all(chat.said):  # nothing was refused, so the caps all stood
+                self.assertLessEqual(self.caps_allowed(chat), limit, note)
+
+    def test_the_worst_case_of_every_request_together_fits(self):
+        """Not just what was said — what every reply was *allowed* to say."""
+        chat = GreedyChat(*whole_book())
+        self.run_book(chat)
+        self.assertLessEqual(self.caps_allowed(chat), 5000)
+
+    def test_the_limit_can_be_set_from_the_environment(self):
+        with mock.patch.dict(
+            os.environ, {ai_config.TOKEN_LIMIT_VAR: "2000"}, clear=False
+        ):
+            self.assertEqual(ai_config.settings().token_limit, 2000)
+
+
+class TestTheRequestOpenRouterGets(AiTestCase):
+    """What `_make_chat` builds, and what it deliberately leaves out."""
 
     def built_with(self, config):
         made = {}
@@ -847,28 +1374,19 @@ class TestAskingForTheFastestProvider(AiTestCase):
             ai_book._make_chat(config)
         return made
 
-    def test_throughput_is_asked_for_by_default(self):
-        made = self.built_with(settings())
-        self.assertEqual(
-            made["extra_body"], {"provider": {"sort": "throughput"}}
-        )
+    def test_the_model_is_the_one_that_was_configured(self):
+        self.assertEqual(self.built_with(settings())["model"], DEFAULT_MODEL)
 
-    def test_it_goes_in_extra_body_and_not_in_the_model_parameters(self):
-        """`model_kwargs` sets OpenAI's own fields; `provider` is not one."""
+    def test_no_provider_block_is_sent(self):
+        """Routing is OpenRouter's to decide, and its default leans on cost."""
         made = self.built_with(settings())
+        self.assertNotIn("extra_body", made)
         self.assertNotIn("provider", made.get("model_kwargs") or {})
 
-    def test_another_sort_is_sent_as_asked(self):
-        made = self.built_with(settings(sort="latency"))
-        self.assertEqual(made["extra_body"], {"provider": {"sort": "latency"}})
-
-    def test_switching_it_off_sends_no_provider_block_at_all(self):
-        made = self.built_with(settings(sort=""))
-        self.assertIsNone(made["extra_body"])
-
-    def test_the_key_is_still_the_only_thing_that_carries_the_key(self):
+    def test_nothing_but_the_key_carries_the_key(self):
         made = self.built_with(settings())
-        self.assertNotIn(FAKE_KEY, str(made["extra_body"]))
+        elsewhere = {name: value for name, value in made.items() if name != "api_key"}
+        self.assertNotIn(FAKE_KEY, str(elsewhere))
 
 
 class TestSwitchedOff(AiTestCase):
@@ -904,7 +1422,6 @@ class TestWhereTheKeyComesFrom(AiTestCase):
             ai_config.CHAPTERS_VAR,
             ai_config.MAX_CALLS_VAR,
             ai_config.TIMEOUT_VAR,
-            ai_config.SORT_VAR,
             ai_config.STREAM_VAR,
         ):
             self.addCleanup(os.environ.pop, name, None)
@@ -933,14 +1450,21 @@ class TestWhereTheKeyComesFrom(AiTestCase):
     def test_no_file_is_not_an_error(self):
         self.assertFalse(ai_config.load_env(self.folder / "nothing-here"))
 
-    def test_the_default_model_is_the_free_router(self):
-        self.assertEqual(ai_config.settings().model, "openrouter/free")
-        self.assertTrue(ai_config.settings().is_free)
+    def test_the_default_model_is_one_named_model(self):
+        self.assertEqual(
+            ai_config.settings().model, "meta-llama/llama-3.1-8b-instruct"
+        )
 
-    def test_free_only_is_on_unless_it_is_turned_off(self):
-        self.assertTrue(ai_config.settings().free_only)
-        os.environ[ai_config.FREE_ONLY_VAR] = "0"
+    def test_a_model_can_still_be_named_in_the_environment(self):
+        os.environ[ai_config.MODEL_VAR] = ai_config.FREE_MODEL
+        self.assertEqual(ai_config.settings().model, ai_config.FREE_MODEL)
+
+    def test_free_only_is_off_unless_it_is_turned_on(self):
+        """The default model is paid, so a guard refusing paid models would
+        refuse the app itself."""
         self.assertFalse(ai_config.settings().free_only)
+        os.environ[ai_config.FREE_ONLY_VAR] = "1"
+        self.assertTrue(ai_config.settings().free_only)
 
     def test_a_nonsense_number_falls_back_instead_of_crashing(self):
         """A typo in a hosted environment variable must not take the app down."""
@@ -956,24 +1480,8 @@ class TestWhereTheKeyComesFrom(AiTestCase):
         self.assertEqual(now.max_calls, 3)
         self.assertEqual(now.batches, 2)
 
-    def test_the_defaults_are_the_fast_ones(self):
-        now = ai_config.settings()
-        self.assertEqual(now.sort, "throughput")
-        self.assertEqual(now.provider, {"sort": "throughput"})
-        self.assertTrue(now.stream)
-
-    def test_another_ordering_can_be_asked_for(self):
-        os.environ[ai_config.SORT_VAR] = "price"
-        self.assertEqual(ai_config.settings().provider, {"sort": "price"})
-
-    def test_a_sort_openrouter_would_refuse_falls_back_to_the_default(self):
-        """A typo here would otherwise turn every request into a 400."""
-        os.environ[ai_config.SORT_VAR] = "fastest"
-        self.assertEqual(ai_config.settings().sort, ai_config.DEFAULT_SORT)
-
-    def test_the_routing_can_be_left_entirely_to_openrouter(self):
-        os.environ[ai_config.SORT_VAR] = "off"
-        self.assertIsNone(ai_config.settings().provider)
+    def test_streaming_is_on_by_default(self):
+        self.assertTrue(ai_config.settings().stream)
 
     def test_streaming_can_be_switched_off(self):
         os.environ[ai_config.STREAM_VAR] = "0"
