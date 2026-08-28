@@ -216,6 +216,24 @@ def delete_ready_book(folder):
 # --------------------------------------------------------------------------
 
 
+def safe_stem(file_name):
+    """One file name from the editor's box, cut down to a bare stem.
+
+    Only the last component survives, so nothing anybody types can name a
+    folder; the characters Windows refuses become spaces; and the result is
+    length-capped and never empty. Separate from `book_pdf_path` because the
+    download path builds under a scratch folder of its own rather than in
+    Input/, and both have to sanitise a name in exactly the same way — a build
+    and its download must not disagree about what the file is called.
+    """
+    stem = Path(str(file_name)).name
+    stem = stem[:-4] if stem.lower().endswith(".pdf") else stem
+    stem = "".join(" " if character in '<>:"/\\|?*' else character
+                   for character in stem)
+    stem = " ".join(stem.split()).strip(" .")[:80].strip(" .")
+    return stem or "Untitled book"
+
+
 def book_pdf_path(file_name):
     """Where a typed book is built: an ordinary input PDF in Input/.
 
@@ -223,12 +241,7 @@ def book_pdf_path(file_name):
     written, so whatever the editor's file-name box contains, the build lands
     in Input/ and nowhere else.
     """
-    stem = Path(str(file_name)).name
-    stem = stem[:-4] if stem.lower().endswith(".pdf") else stem
-    stem = "".join(" " if character in '<>:"/\\|?*' else character
-                   for character in stem)
-    stem = " ".join(stem.split()).strip(" .")[:80].strip(" .")
-    return INPUT_DIR / f"{stem or 'Untitled book'}.pdf"
+    return INPUT_DIR / f"{safe_stem(file_name)}.pdf"
 
 
 def typeset_book(manuscript, file_name, progress=None, page_size_in=None):
@@ -340,11 +353,18 @@ def convert_book(
     scale_mode=FIT,
     move_input=True,
     progress=None,
+    output_dir=None,
 ):
     """Convert one input PDF into per-signature print files.
 
     `sheet_size_pt` is the paper to print on, in points; None keeps the source
     page's own size, which is the case where nothing is scaled at all.
+
+    `output_dir` is where the book's folder is made, defaulting to `OUTPUT_DIR`
+    — the session's own. `Script/book_build.py` passes a scratch folder of its
+    own instead: a conversion done to answer a download runs off the script
+    thread, where `OUTPUT_DIR` may already have been re-pointed at another
+    session's workspace, and it has nothing to leave behind anyway.
 
     Raises ValueError only when the book genuinely cannot be printed as asked:
     an unreadable or empty PDF, or a book kept at its original size that runs off
@@ -369,7 +389,7 @@ def convert_book(
     if problems:
         raise ValueError("; ".join(problems))
 
-    book_folder = OUTPUT_DIR / pdf_path.stem
+    book_folder = Path(output_dir if output_dir is not None else OUTPUT_DIR) / pdf_path.stem
     signature_folder = book_folder / "book_signatures"
 
     # The new signatures are built in a staging folder and swapped in only once

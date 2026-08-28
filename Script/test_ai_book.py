@@ -848,6 +848,269 @@ class TestRescuingATruncatedBatch(AiTestCase):
         self.assertEqual(found, ['{"a": "not } a brace"}'])
 
 
+class TestClosingATruncatedObject(AiTestCase):
+    """`close_json` — a good object with its last brace missing."""
+
+    def test_a_whole_object_comes_back_whole(self):
+        self.assertEqual(ai_book.close_json('{"a": 1, "b": "two"}'),
+                         {"a": 1, "b": "two"})
+        # No string value in it at all, so the only place it can close is its own
+        # last brace. A cap that lands exactly there is not a truncated reply.
+        self.assertEqual(ai_book.close_json('{"a": 1}'), {"a": 1})
+        self.assertEqual(ai_book.close_json('{"a": 1} and there you go'), {"a": 1})
+
+    def test_a_cut_after_a_value_keeps_everything_before_it(self):
+        self.assertEqual(ai_book.close_json('{"a": "one", "b": "two"'),
+                         {"a": "one", "b": "two"})
+
+    def test_a_cut_inside_a_string_keeps_the_half_that_arrived(self):
+        self.assertEqual(ai_book.close_json('{"a": "one", "b": "tw'),
+                         {"a": "one", "b": "tw"})
+
+    def test_a_cut_after_a_key_drops_the_key(self):
+        """`{"b"` closed with a brace is not JSON. The value before it is."""
+        self.assertEqual(ai_book.close_json('{"a": "one", "b'), {"a": "one"})
+        self.assertEqual(ai_book.close_json('{"a": "one", "b":'), {"a": "one"})
+
+    def test_a_cut_inside_a_nested_list_closes_every_bracket(self):
+        data = ai_book.close_json('{"chapters": [{"heading": "One"}, {"heading": "Tw')
+        self.assertEqual(
+            data, {"chapters": [{"heading": "One"}, {"heading": "Tw"}]}
+        )
+
+    def test_a_cut_inside_an_escape_does_not_break_the_string(self):
+        """The stream can stop half way through `\\u2014`. Six characters back
+        at the very most, so it can never eat a word."""
+        self.assertEqual(ai_book.close_json('{"a": "one\\'), {"a": "one"})
+        self.assertEqual(ai_book.close_json('{"a": "one\\u20'), {"a": "one"})
+
+    def test_a_brace_inside_a_string_is_not_a_closing_brace(self):
+        self.assertEqual(ai_book.close_json('{"a": "a } brace", "b": "t'),
+                         {"a": "a } brace", "b": "t"})
+
+    def test_a_real_newline_inside_a_string_is_allowed(self):
+        self.assertEqual(ai_book.close_json('{"a": "one\ntwo", "b": "th'),
+                         {"a": "one\ntwo", "b": "th"})
+
+    def test_nothing_closable_is_none(self):
+        self.assertIsNone(ai_book.close_json("I'm sorry, I can't."))
+        self.assertIsNone(ai_book.close_json(""))
+        self.assertIsNone(ai_book.close_json("{"))
+
+    def test_it_never_tries_more_places_than_it_promised(self):
+        """A book-sized reply has thousands of cut points and one useful one.
+
+        The work has to be bounded, or a long batch would be read by trying to
+        parse it a thousand times over.
+        """
+        long_reply = json.dumps({"chapters": [one_chapter(n) for n in range(1, 60)]})
+        truncated = long_reply[:-40]
+        with mock.patch.object(
+            ai_book.json, "loads", side_effect=ai_book.json.loads
+        ) as loads:
+            self.assertIsInstance(ai_book.close_json(truncated), dict)
+        self.assertLessEqual(loads.call_count, ai_book._CUT_ATTEMPTS * 4)
+
+
+class TestRescuingATruncatedOutline(AiTestCase):
+    """The plan is the one reply nothing else can be written without.
+
+    It used to be all or nothing: a reply chopped one character before its last
+    brace threw away the title, the author, the dedication and every heading —
+    and the reader watched all of it arrive on screen and then got a book called
+    “Untitled book”. These are about it being read the way a truncated batch has
+    always been read.
+    """
+
+    def cut_outline(self, at=0.8):
+        whole = outline_reply(5)
+        return whole[: int(len(whole) * at)]
+
+    def test_the_title_and_the_author_survive(self):
+        rescued = ai_book.salvage_outline(self.cut_outline())
+        self.assertEqual(rescued["title"], "The Folded Sheet")
+        self.assertEqual(rescued["author"], "M. Quire")
+
+    def test_the_chapters_that_arrived_whole_survive(self):
+        rescued = ai_book.salvage_outline(self.cut_outline())
+        self.assertTrue(rescued["chapters"])
+        self.assertTrue(all(entry["heading"] for entry in rescued["chapters"]))
+
+    def test_chapters_that_are_not_a_list_are_no_chapters(self):
+        rescued = ai_book.salvage_outline('{"title": "T", "chapters": 5, "a": "b"}')
+        self.assertEqual(rescued["title"], "T")
+        self.assertNotIn("chapters", rescued)
+
+    def test_a_headless_last_entry_is_dropped(self):
+        """A chapter cut before its heading is not a chapter, it is a comma."""
+        rescued = ai_book.salvage_outline(
+            '{"title": "T", "author": "A", "chapters": [{"heading": "One", '
+            '"summary": "S"}, {"summary'
+        )
+        self.assertEqual(len(rescued["chapters"]), 1)
+
+    def test_nothing_usable_is_none_so_a_repair_can_still_be_asked_for(self):
+        self.assertIsNone(ai_book.salvage_outline("I'm sorry, I can't."))
+        self.assertIsNone(ai_book.salvage_outline('{"title": '))
+
+    def test_a_cut_anywhere_at_all_is_read_rather_than_raised(self):
+        """The cap lands where it lands. Every one of those places is tested.
+
+        Two things have to hold at all 400-odd of them: nothing raises, and
+        whatever comes back is a plan rather than half of one — no chapter entry
+        without a heading, because `build_outline` numbers what it is given.
+        """
+        whole = outline_reply(5)
+        for cut in range(1, len(whole) + 1):
+            with self.subTest(cut=cut):
+                rescued = ai_book.salvage_outline(whole[:cut])
+                for entry in (rescued or {}).get("chapters", []):
+                    self.assertTrue(entry.get("heading"))
+
+    def test_the_title_is_never_lost_once_it_has_arrived(self):
+        whole = outline_reply(5)
+        closed = whole.index('"The Folded Sheet"') + len('"The Folded Sheet"')
+        for cut in range(closed, len(whole) + 1):
+            with self.subTest(cut=cut):
+                self.assertEqual(
+                    ai_book.salvage_outline(whole[:cut])["title"], "The Folded Sheet"
+                )
+
+    def test_junk_is_answered_rather_than_raised_on(self):
+        """Whatever a model sends, this is on the path a book takes."""
+        for junk in ("", "   ", None, "{", "}", "[]", "{{{{", '"', '{"a":', "\\",
+                     '{"a": "\\u"}', "```json\n{", "{" * 500, '{"a": [' * 200):
+            with self.subTest(junk=junk):
+                self.assertIn(ai_book.close_json(junk), (None, {}))
+                self.assertIsNone(ai_book.salvage_outline(junk))
+                self.assertIsInstance(ai_book.ran_out(junk), bool)
+
+    def test_a_cut_off_outline_keeps_the_title_it_showed_on_screen(self):
+        """The bug this is all for, end to end.
+
+        The whole plan arrives, the cap chops the last of it, and the book that
+        comes out has the title, the author and the dedication the reader
+        watched being written.
+        """
+        chat = StreamCutOffChat(
+            CutShort(self.cut_outline(0.85)), batch_reply(1, 2, 3), batch_reply(4, 5)
+        )
+        seen = []
+        book = self.run_book(chat, on_text=seen.append)
+        self.assertIn("The Folded Sheet", "".join(seen))
+        self.assertEqual(book.title, "The Folded Sheet")
+        self.assertEqual(book.author, "M. Quire")
+        self.assertEqual(book.subtitle, "A short history")
+        self.assertEqual([section.kind for section in book.front], ["dedication"])
+        self.assertEqual(len(book.chapters), 5)
+
+    def test_a_streamed_cut_off_outline_does_not_cost_a_repair(self):
+        """A streamed reply that ran out is still a reply that ran out.
+
+        The client raises after the last piece has arrived, so the words are
+        already in hand and the exception is swallowed — but the fact of it must
+        not be. A repair carries the same cap and stops in the same place, and
+        the request it spends is one the chapters need: with three allowed, a
+        wasted one here left a single batch to write all five.
+        """
+        chat = StreamCutOffChat(
+            CutShort('{"title": "The Folded Sheet"'),
+            batch_reply(1, 2, 3),
+            batch_reply(4, 5),
+        )
+        book = self.run_book(chat, on_text=lambda text: None)
+        # Three requests, and every one of them two messages. A repair is three.
+        self.assertEqual([len(call) for call in chat.calls], [2, 2, 2])
+        self.assertEqual(book.title, "The Folded Sheet")
+        self.assertTrue(all("first." in chapter.text for chapter in book.chapters))
+
+
+class TestTellingAShortReplyFromABadOne(AiTestCase):
+    """`ran_out` — the bottom rung has no exception to catch."""
+
+    def test_an_object_that_stops_has_run_out(self):
+        self.assertTrue(ai_book.ran_out('{"title": "The Folded She'))
+        self.assertTrue(ai_book.ran_out('{"chapters": [{"heading": "One"}, {"head'))
+
+    def test_a_whole_object_has_not(self):
+        self.assertFalse(ai_book.ran_out('{"title": "The Folded Sheet"}'))
+        self.assertFalse(ai_book.ran_out('```json\n{"a": 1}\n```'))
+
+    def test_prose_has_not(self):
+        self.assertFalse(ai_book.ran_out("I'm sorry, I can't help with that."))
+        self.assertFalse(ai_book.ran_out(""))
+
+    def test_prose_with_a_brace_in_it_has_not(self):
+        """A repair is exactly what this one deserves. It must still get one."""
+        self.assertFalse(ai_book.ran_out("Sorry {I cannot do that}."))
+
+    def test_a_reply_that_stopped_on_the_bottom_rung_does_not_cost_a_repair(self):
+        """No `response_format`, so nothing raises and nothing is refused.
+
+        The reply just ends. Before `ran_out` that looked like a model answering
+        badly, and the repair it earned was a request the chapters needed.
+        """
+        ai_book._RUNG[DEFAULT_MODEL] = "prompt"
+        chat = FakeChat(
+            '{"title": "The Folded Sheet", "author": "M. Quire", "chapters": [{"hea',
+            batch_reply(1, 2, 3),
+            batch_reply(4, 5),
+        )
+        book = self.run_book(chat)
+        self.assertEqual([len(call) for call in chat.calls], [2, 2, 2])
+        self.assertEqual(book.title, "The Folded Sheet")
+        self.assertEqual(book.author, "M. Quire")
+        self.assertEqual(len(book.chapters), 5)
+
+
+class TestATitleOfLastResort(AiTestCase):
+    """When no title arrived at all, the description is a better name than none."""
+
+    def test_the_lead_in_is_taken_off(self):
+        self.assertEqual(
+            ai_book.title_from("Write a short book about a lighthouse keeper"),
+            "A lighthouse keeper",
+        )
+
+    def test_only_the_first_clause_is_used(self):
+        self.assertEqual(
+            ai_book.title_from("A lost dog, told warmly, in the present tense."),
+            "A lost dog",
+        )
+
+    def test_a_long_description_is_cut_at_a_word(self):
+        title = ai_book.title_from(" ".join(["verylongword"] * 20))
+        self.assertLessEqual(len(title), ai_book.TITLE_CHARS)
+        self.assertFalse(title.endswith("verylongwor"))
+
+    def test_an_about_in_the_middle_of_a_sentence_is_left_alone(self):
+        """"About" introduces a description as often as it appears inside one."""
+        said = "A quiet novel set on a canal boat that says something about grief"
+        self.assertEqual(
+            ai_book.title_from(said), "A quiet novel set on a canal boat"
+        )
+
+    def test_a_lead_in_without_a_book_in_it_is_left_alone(self):
+        self.assertEqual(
+            ai_book.title_from("Two sisters argue about a house"),
+            "Two sisters argue about a house",
+        )
+
+    def test_nothing_to_take_is_nothing(self):
+        self.assertEqual(ai_book.title_from("   "), "")
+        self.assertEqual(ai_book.title_from(None), "")
+
+    def test_a_book_with_no_plan_at_all_is_still_named(self):
+        chat = FakeChat("I cannot.", "Still no.", batch_reply(1, 2, 3, 4, 5))
+        book = self.run_book(chat, prompt="A book about a lighthouse keeper")
+        self.assertEqual(book.title, "A lighthouse keeper")
+
+    def test_the_models_own_title_always_wins(self):
+        chat = FakeChat(*whole_book())
+        book = self.run_book(chat, prompt="A book about a lighthouse keeper")
+        self.assertEqual(book.title, "The Folded Sheet")
+
+
 class TestAReplyThatFilledItsCap(AiTestCase):
     """The failure the token limit made ordinary.
 

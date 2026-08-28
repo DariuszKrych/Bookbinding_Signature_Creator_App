@@ -28,9 +28,16 @@ from main import (
     number_book,
     numbered_copy_path,
     printing_steps,
-    typeset_book,
 )
-from Script import ai_book, book_editor, workspace
+from Script import (
+    ai_book,
+    ai_view,
+    book_build,
+    book_editor,
+    home,
+    settings,
+    workspace,
+)
 from Script.paper_sizes import (
     BOOK_PAGE_FAMILIES,
     BOOK_PAGE_SIZES,
@@ -254,6 +261,144 @@ st.html(
     .st-key-zip-uploader [data-testid="stFileUploaderDropzoneInstructions"] span::after {{
         content: "Must fit the {workspace.human(workspace.LIMIT_BYTES)} after decompression";
     }}
+    .st-key-draft-uploader [data-testid="stFileUploaderDropzoneInstructions"] span::after {{
+        content: "One .book.json saved from this app";
+    }}
+    .st-key-draft-uploader [data-testid="stFileUploaderDropzoneInstructions"] span {{
+        font-size: 0 !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        white-space: normal !important;
+    }}
+    .st-key-draft-uploader [data-testid="stFileUploaderDropzoneInstructions"] span::after {{
+        font-size: 0.875rem;
+    }}
+    </style>
+    """
+)
+
+# --------------------------------------------------------------------------
+# The three cards on the front page
+# --------------------------------------------------------------------------
+# Everything here is a *progressive enhancement*, and that word is load-bearing.
+# Each card is an ordinary bordered container holding ordinary markdown and an
+# ordinary button; what follows stretches that button over the whole card so the
+# card is the click target, leaving its label showing at the foot.
+#
+# If a Streamlit release moves the DOM under these selectors, every rule below
+# stops matching and each card falls back to exactly what it is made of — a card
+# with a button in it. That is the whole reason it is built this way round. Four
+# other style blocks in this file are already pinned to Streamlit's internals,
+# and not one of them may be allowed to break the app rather than merely stop
+# improving it.
+st.html(
+    """
+    <style>
+    div[class*="st-key-bookcard-"] {
+        position: relative;
+        overflow: hidden;
+        /* Colour and shadow only. See the note below about `transform`. */
+        transition: border-color 120ms ease, box-shadow 120ms ease,
+                    background-color 120ms ease;
+        /* The whole card is one button, so the pointer is a hand everywhere on
+           it — including the border and the couple of pixels of padding the
+           stretched button does not cover. Without this the cursor flipped
+           between hand and arrow as it crossed that edge. */
+        cursor: pointer;
+    }
+    /* Except when there is nothing to click: a hand over a dead card promises
+       something that will not happen. */
+    div[class*="st-key-bookcard-"]:has(.stButton > button:disabled) {
+        cursor: default;
+    }
+    /* Hover moves nothing.
+       This rule used to lift the card two pixels with `transform:
+       translateY(-2px)`, and that made the three cards nearly unclickable. A
+       transform moves the element's hit area with it, so a cursor anywhere near
+       the bottom edge hovered the card, the card slid out from under the
+       cursor, the hover ended, the card slid back — several times a second, for
+       as long as the pointer stayed there. What the user sees is the cursor
+       flickering between a hand and an arrow and "Start →" strobing with it,
+       because the button underneath is being entered and left over and over.
+       Anything that changes a card's geometry on hover brings it straight back:
+       keep this to colour, shadow and outline. */
+    div[class*="st-key-bookcard-"]:hover {
+        border-color: var(--primary-color, #2E7D32);
+        box-shadow: 0 2px 10px color-mix(
+            in srgb, var(--primary-color, #2E7D32) 22%, transparent);
+    }
+    /* Streamlit gives every element its own positioned wrapper, so an absolute
+       button anchors to that 40px-tall box rather than to the card — which is
+       exactly what it did, invisibly, until this line. Neutralising the two
+       wrappers hands the containing block back to the card. */
+    div[class*="st-key-bookcard-"] .stElementContainer,
+    div[class*="st-key-bookcard-"] .stButton {
+        position: static;
+    }
+    /* The button, stretched over the card. `background: transparent` and no
+       border let the container's own card styling show through, and aligning
+       its content to the bottom leaves "Start →" where a button would be. */
+    div[class*="st-key-bookcard-"] .stButton > button {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        display: flex;
+        align-items: flex-end;
+        padding: 0.9rem 1.25rem;
+        z-index: 2;
+        font-weight: 600;
+    }
+    /* Streamlit centres a button's label inside its own inner div. The card's
+       words are left-aligned, and a call to action floating in the middle
+       underneath them reads as a different element rather than the end of the
+       same one. */
+    div[class*="st-key-bookcard-"] .stButton > button > div {
+        width: 100%;
+        justify-content: flex-start;
+        text-align: left;
+    }
+    div[class*="st-key-bookcard-"] .stButton > button:hover {
+        background: color-mix(in srgb, var(--primary-color, #2E7D32) 8%, transparent);
+    }
+    div[class*="st-key-bookcard-"] .stButton > button:focus-visible {
+        outline: 3px solid var(--primary-color, #2E7D32);
+        outline-offset: -3px;
+    }
+    div[class*="st-key-bookcard-"] .stButton > button:disabled {
+        background: transparent;
+    }
+    .bookcard-body { padding: 0.1rem 0 0 0; }
+    .bookcard-icon { font-size: 2rem; line-height: 1; margin-bottom: 0.5rem; }
+    .bookcard-title {
+        font-size: 1.1rem;
+        font-weight: 700;
+        line-height: 1.3;
+        margin-bottom: 0.45rem;
+    }
+    .bookcard-text { font-size: 0.9rem; opacity: 0.82; line-height: 1.45; }
+    </style>
+    """
+)
+
+# The three ways a book leaves the writing screen, made hard to miss.
+#
+# The same progressive enhancement as the cards above: if a Streamlit release
+# moves the DOM under these selectors nothing breaks — the panel is still three
+# primary download buttons on one row at the top of the screen, which is the
+# part that actually matters. This only makes them the size of the decision.
+st.html(
+    """
+    <style>
+    div[class*="st-key-takeaway"] .stDownloadButton > button {
+        min-height: 3.2rem;
+        font-size: 1.02rem;
+        font-weight: 700;
+        line-height: 1.25;
+    }
     </style>
     """
 )
@@ -276,6 +421,13 @@ OUTPUT_DIR = WORKSPACE["Output"]
 PREVIOUS_DIR = WORKSPACE["Previously_Converted"]
 MANUSCRIPT_DIR = WORKSPACE["Manuscripts"]
 
+# Where a file that is only going to be downloaded is built. A fifth folder
+# beside the four above, deliberately not one of them: what is built there is on
+# its way to somebody's browser rather than being their data, so it counts
+# against nothing, is never in the session zip, and is deleted as soon as the
+# bytes have been handed over. See `workspace.scratch_root` and `make_pdf`.
+SCRATCH_DIR = workspace.scratch_root(WORKSPACE)
+
 # What this session is holding, measured once here so every panel agrees about
 # it, the same way `job` is read once below. `full` closes every control that
 # would write: an app that lets you start a conversion it has already decided it
@@ -284,17 +436,78 @@ used = workspace.usage(WORKSPACE)
 room = max(0, workspace.LIMIT_BYTES - used)
 full = room < workspace.ROOM_TO_WORK
 
-# The two halves of the app. One is picked at the top of the page and the other
-# is not drawn at all — not hidden, not disabled, simply not there — so a
-# half-finished manuscript cannot be reached by a stray click while a
-# conversion is running, and the conversion panels are not rebuilt on every
-# keystroke of a chapter.
+# The four screens. One is drawn and the others are not drawn at all — not
+# hidden, not disabled, simply not there — so a half-finished manuscript cannot
+# be reached by a stray click while a conversion is running, and the conversion
+# panels are not rebuilt on every keystroke of a chapter.
+#
+# `ROUTE_KEY` is deliberately **not** a widget key, and that one fact is what
+# makes the rest of this file simple. The radio this replaced owned
+# `st.session_state["view"]`, and Streamlit refuses to let anything assign to a
+# widget's key once the widget has been instantiated — so the AI button had to
+# be drawn physically above the radio in order to be allowed to move the user to
+# the writing view, and a comment forty lines long explained why. A plain key
+# can be written from anywhere, at any depth, at any point in the run.
+HOME_ROUTE = "home"
 CONVERT_VIEW = "convert"
 WRITE_VIEW = "write"
-VIEW_LABELS = {
-    CONVERT_VIEW: "📚  Convert 2 Column Formatted PDF into PDF Signatures",
-    WRITE_VIEW: "✍️  Convert Inputted Text into PDF Signatures",
-}
+AI_ROUTE = "ai"
+ROUTE_KEY = "route"
+
+# Which screen a running job belongs to. A job's progress bar lives in the slot
+# its button occupied, so a job whose screen is not drawn has nowhere to report
+# and — see the runner at the foot of this file — is silently abandoned. While
+# one is running the route it was claimed on wins over anything else.
+BUSY_ROUTE_KEY = "busy_route"
+
+# Set by `collect()` when a written book arrives, read once by the writing view
+# to explain where the book on screen came from. Named in `book_editor` so the
+# two ends of the hand-off cannot drift apart.
+HANDOFF_KEY = book_editor.HANDOFF
+
+# The three cards on the front page: the title, the sentence under it, and the
+# screen it opens. Written as one table so the card, the header inside the flow
+# and the tests all name the same strings.
+CARDS = (
+    {
+        "route": CONVERT_VIEW,
+        "icon": "📄",
+        "title": "I have a PDF book",
+        "text": "Convert to signatures for printing from the input PDF.",
+        "header": "📄 Convert a PDF book to signatures",
+    },
+    {
+        "route": WRITE_VIEW,
+        "icon": "✍️",
+        "title": "I want to start/continue writing my own book",
+        "text": "Save as a PDF book, as signatures for printing or JSON. "
+                "Or load JSON to continue editing.",
+        "header": "✍️ Write your book",
+    },
+    {
+        "route": AI_ROUTE,
+        "icon": "🤖",
+        "title": "I want AI to generate a 5 chapter mini-novel book",
+        "text": "Save as a PDF book, as signatures for printing or as JSON.",
+        "header": "🤖 Have a 5 chapter mini-novel written",
+    },
+)
+CARDS_BY_ROUTE = {card["route"]: card for card in CARDS}
+
+
+def go(route):
+    """Move to another screen, and leave nothing armed behind.
+
+    An armed delete is answered by two buttons drawn under the card it belongs
+    to, and `confirm_delete` draws them only on the screen that owns that card.
+    Walking away from a screen with one armed would leave the request standing
+    with no way on earth to answer it — so arming is cleared here, at the single
+    place a screen change goes through.
+    """
+    st.session_state[ROUTE_KEY] = route
+    st.session_state.armed_delete = None
+    st.session_state[book_editor.ARMED_ACTION] = None
+    st.rerun()
 
 UNITS = {"Inches (in)": INCHES, "Centimetres (cm)": CENTIMETRES, "Millimetres (mm)": MILLIMETRES}
 
@@ -355,8 +568,15 @@ def claim_job(job):
     Recording the job and rerunning immediately closes that window: the very next
     run paints every button disabled *before* any work starts, so there is no
     moment when a second click can be registered.
+
+    The screen is recorded with it, and that is not bookkeeping. A job reports
+    into the slot its button occupied, so a job whose screen is not drawn hands
+    the runner no slot at all — and the runner's answer to a job it cannot find
+    is to release the lock and rerun, silently, with the work never started and
+    nothing said. Pinning the route to the job makes that unreachable.
     """
     st.session_state.busy_job = job
+    st.session_state[BUSY_ROUTE_KEY] = st.session_state.get(ROUTE_KEY, HOME_ROUTE)
     st.rerun()
 
 
@@ -380,24 +600,20 @@ def set_length(field, inches):
 
 
 def sticky(key, default):
-    """Seed a widget that lives on one tab only, before it is drawn.
+    """Seed a widget that is not drawn on every screen, before it is drawn.
 
-    Streamlit throws away the state of every widget a run did not draw, so a
-    setting that sits on one tab would be back at its default the first time the
-    user came back to it — quietly printing the next book on different paper
-    than the one they chose. `remember` keeps a copy under a second key that no
-    widget owns, and so nothing discards; this puts it back.
-
-    Only for widgets drawn without `value=` or `index=`: Streamlit complains on
-    the page when a widget is given both a starting value and a session one.
+    Kept as a name here because `book_editor` is handed it on the `Editor`; the
+    mechanism itself lives in `Script/settings.py`, which is where the reasoning
+    is written down and where `resolve` — reading a setting *without* drawing
+    it — makes it possible for a setting to live next to what it affects rather
+    than in the sidebar.
     """
-    if key not in st.session_state:
-        st.session_state[key] = st.session_state.get(f"kept-{key}", default)
+    settings.hold(key, default)
 
 
 def remember(key):
-    """Keep one tab-local widget's value for the runs its tab is not on screen."""
-    st.session_state[f"kept-{key}"] = st.session_state[key]
+    """Keep one screen's widget value for the runs that screen is not drawn."""
+    settings.keep(key)
 
 
 def arm_delete(token, help_text, container=st, disabled=False, label="🗑 Delete"):
@@ -475,6 +691,49 @@ def signature_count(written):
     return f"{len(written)} signature" + ("" if len(written) == 1 else "s")
 
 
+def resume_strip():
+    """Work already in progress, for the front page to offer a way back to.
+
+    The three cards ask "what would you like to do?", which is the right
+    question on a first visit and the wrong one on the fourth: somebody who has
+    just converted two books and gone back to the front page should not have to
+    remember which card their work was behind. Each entry is one line of
+    markdown, the label of the button beside it, and where that button goes.
+
+    Read straight off the session rather than from a record of what has been
+    done, so it cannot claim work that has since been deleted.
+    """
+    strip = []
+    book = book_editor.manuscript()
+    if book.has_content():
+        strip.append((
+            f"📖 **{book.display_title}** — {book.words:,} words, "
+            f"{len(book.chapters)} chapter{'' if len(book.chapters) == 1 else 's'}",
+            "Continue writing",
+            WRITE_VIEW,
+            "resume-writing",
+        ))
+    ready = list_ready_books()
+    if ready:
+        strip.append((
+            f"✂️ {len(ready)} book{'' if len(ready) == 1 else 's'} "
+            f"ready to print — {named([book.name for book in ready])}",
+            "Go to them",
+            CONVERT_VIEW,
+            "resume-ready",
+        ))
+    waiting = list_available_books()
+    if waiting and not ready:
+        strip.append((
+            f"📄 {len(waiting)} PDF{'' if len(waiting) == 1 else 's'} "
+            f"waiting to be converted — {named([path.name for path in waiting])}",
+            "Convert them",
+            CONVERT_VIEW,
+            "resume-waiting",
+        ))
+    return strip
+
+
 def markdown_table(header, rows):
     lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     lines += ["| " + " | ".join(str(cell) for cell in row) + " |" for row in rows]
@@ -503,270 +762,51 @@ st.caption(TAGLINE)
 job = busy_job()
 busy = job is not None
 pending_job = None
-# The AI job is kept apart from `pending_job` until below the two views, and
-# that is not tidiness. `pending_job = book_editor.render(...)` further down is
-# an unconditional assignment: anything claimed up here would be overwritten and
-# silently never run. See where the two are joined again.
-ai_job = None
 
-# --------------------------------------------------------------------------
-# Writing a book with a model
-# --------------------------------------------------------------------------
-# Above the view radio for two reasons. It is offered whichever half of the app
-# somebody is looking at, and — the load-bearing one — `st.session_state["view"]`
-# may only be assigned before the radio below has been instantiated. Pressing the
-# button has to move the user to the writing view, so the button has to be here.
-#
-# A book that has already been written into the editor is kept as a draft before
-# anything replaces it. That happens in the job runner at the foot of this file,
-# not on the click: a click claims, and only the runner does work.
-AI_PROMPT_KEY = "ai-prompt"
-# Said on the button itself while the box is empty, and taken off it again the
-# moment a character is typed. One string, used by the label below and by the
-# script that keeps the label right between reruns — so the two cannot drift.
-AI_HINT = "(Please type a description of the book to generate)"
+# The description box and the hint on the button both live on the AI screen now.
+# They are named here because `TYPING_SCRIPT`, at the foot of this file, is built
+# from the same two strings — so the label the server draws and the label the
+# browser rewrites between reruns cannot drift apart.
+AI_PROMPT_KEY = ai_view.AI_PROMPT_KEY
+AI_HINT = ai_view.AI_HINT
 ai_ready = ai_book.available()
-ai_writing = job == ("ai", "write")
-# Said on the button, because it is fixed and a reader should not have to find
-# out by counting. It comes from the same setting the request is built from, so
-# the promise and the schema cannot drift apart.
-ai_chapters = ai_book.chapter_count()
-# Every reason the button is off that has nothing to do with what is in the box.
-# Kept apart because the script at the foot of the file may switch the button on
-# when somebody types, and must never do it while a job is running, the disk is
-# full, or this copy has no key.
-ai_locked = busy or full or not ai_ready
-
-with st.container(border=True):
-    ai_button_column, ai_prompt_column = st.columns(
-        [1, 2.5], vertical_alignment="center"
-    )
-    ai_slot = ai_button_column.empty()
-    ai_prompt = ai_prompt_column.text_input(
-        "Describe the book you want",
-        key=AI_PROMPT_KEY,
-        max_chars=ai_book.MAX_PROMPT_CHARS,
-        placeholder=(
-            f"Describe the book to write — what it is about, who it is for and "
-            f"the voice. It is always {ai_chapters} chapters, so say what should "
-            f"happen in it rather than how long it should be."
-        ),
-        disabled=busy or not ai_ready,
-        label_visibility="collapsed",
-    )
-    # The slot holds the button, and the runner replaces it with a progress bar,
-    # so starting a book does not move anything else on the page.
-    #
-    # The bracketed half of the label is the box's instructions, put on the
-    # button because the button is what the eye goes to when nothing happens.
-    # It is drawn only while the box is empty — by the server here, and by
-    # `TYPING_SCRIPT` at the foot of the file between reruns, which is what makes
-    # it disappear on the first keystroke rather than on the next click.
-    if ai_slot.button(
-        "✍️ Writing…"
-        if ai_writing
-        else f"🤖 Generate {ai_chapters} chapter mini-novel for printing with AI"
-        + ("" if ai_prompt.strip() else f" **{AI_HINT}**"),
-        key="ai-write",
-        type="primary",
-        use_container_width=True,
-        # Not switched off for an empty box, and that is deliberate — see
-        # `TYPING_SCRIPT`. Streamlit's button ignores a click whenever *React*
-        # thinks it is disabled, whatever the browser has been told, so a button
-        # the server drew switched off cannot be switched on from the page. It
-        # is drawn on, made to look and behave off while the box is empty, and
-        # the click below is what actually refuses.
-        disabled=ai_locked,
-    ):
-        # Asked again, because the button can be pressed with the box empty: the
-        # script that unlocks it while somebody types works from what the browser
-        # can see, and the server has the last word on what it was actually sent.
-        if st.session_state.get(AI_PROMPT_KEY, "").strip():
-            # The one moment this assignment is legal: the radio below has not
-            # been instantiated yet on this run, so this is the value it will
-            # take when it is. `claim_job` reruns immediately and the next run
-            # draws the writing view, locked, with the progress bar in the slot.
-            st.session_state["view"] = WRITE_VIEW
-            claim_job(("ai", "write"))
-    if ai_writing:
-        # Where the book appears while it is being written. Drawn only while the
-        # job is running, and inside the same bordered box as the button it
-        # belongs to, so nothing below it moves when the words start arriving.
-        #
-        # It is created here rather than in the runner at the foot of the file for
-        # the reason everything else on this page is: elements land where the
-        # script produces them, and the runner produces its elements last of all.
-        ai_stream = st.empty()
-        ai_job = {
-            "kind": "ai_write",
-            "slot": ai_slot,
-            "stream": ai_stream,
-            "prompt": st.session_state.get(AI_PROMPT_KEY, ""),
-        }
-    if not ai_ready:
-        st.caption(
-            f"Writing with AI is switched off on this copy. "
-            f"{ai_book.why_unavailable()} Everything else works as usual."
-        )
-    else:
-        st.caption(
-            "Writes the words only — your page size, type and margins are left "
-            "exactly as you set them. The description you type is sent to "
-            "OpenRouter to be written; nothing else from this session is."
-        )
 
 # A book handed over by a finished AI job, put on screen before any box is drawn.
 # It cannot be done in the runner: by the time that runs, every box belonging to
 # the book being replaced has already been drawn.
-book_editor.collect()
+#
+# Its return value is what moves the user. The AI screen deliberately does *not*
+# change the route when its button is pressed — the streaming box and the
+# progress bar both live there, and a job whose screen stops being drawn is a job
+# the runner abandons. So the writing has the whole of the AI screen, and the
+# move happens here, on the run after it finished, at the one moment the new book
+# exists and no widget has been drawn yet.
+if book_editor.collect():
+    st.session_state[ROUTE_KEY] = WRITE_VIEW
+    st.session_state[HANDOFF_KEY] = True
 
-# Which half of the app is on screen. A radio rather than tabs or a segmented
-# control: it cannot be deselected into showing nothing, it keeps its choice in
-# session state across every rerun a text box in the editor causes, and it locks
-# like every other control while a job runs — so the view cannot change out from
-# under a book that is being written to disk.
-view = st.radio(
-    "What would you like to do?",
-    list(VIEW_LABELS),
-    format_func=VIEW_LABELS.get,
-    horizontal=True,
-    key="view",
-    disabled=busy,
-    label_visibility="collapsed",
-)
-writing = view == WRITE_VIEW
+# Which screen is on. Read after `collect` so a finished book is already pointing
+# at the writing view, and pinned to the running job so nothing can walk away
+# from work in progress.
+route = st.session_state.setdefault(ROUTE_KEY, HOME_ROUTE)
+if busy:
+    route = st.session_state.get(BUSY_ROUTE_KEY, route)
+    st.session_state[ROUTE_KEY] = route
+writing = route == WRITE_VIEW
 
 with st.sidebar:
-    # --------------------------------------------------------------------------
-    # Your data — the whole workspace, in and out, as one zip
-    # --------------------------------------------------------------------------
-    # Above the settings because it is the first thing a visitor does and the
-    # last thing they do, and because it is the only way in or out: nothing here
-    # is stored, so the zip is the whole of what a person keeps.
-    st.header("Your data")
+    # Preferences, and only preferences. Everything that shapes a book is on the
+    # screen that makes it now — the sheet an existing PDF is printed on and the
+    # size a book being typed is set at are different questions with different
+    # answers, and neither is asked here. What is left is the light the app is
+    # read in and the units its measurements are shown in: two things that change
+    # nothing about any book and mean the same on every screen.
+    st.header("Preferences")
 
-    # A fresh key after each load, for the reason the PDF uploader has one: a
-    # `file_uploader` hands back the same file on every rerun, so without this
-    # the zip would be loaded again the moment anything else on the page moved.
-    load_round = st.session_state.setdefault("workspace_round", 0)
-    # Keyed on the container rather than on the uploader, for the same reason the
-    # book uploader is: the style block at the top of this file reaches inside to
-    # correct the limit line the dropzone prints, and the uploader's own key
-    # changes on every load round, so a selector built from it would stop
-    # matching the moment a zip was loaded.
-    #
-    # The help says nothing about size. The rule is on the dropzone line, once,
-    # where the wrong one used to be — and it is a rule about what the zip holds
-    # rather than about the file, so a figure repeated here would be read as a
-    # second, different limit on the upload itself.
-    with st.container(key="zip-uploader"):
-        incoming = st.file_uploader(
-            "📥 Load my data (.zip)",
-            type="zip",
-            key=f"workspace-zip-{load_round}",
-            disabled=busy,
-            help="A zip saved by the button below. Puts back every book, draft, "
-                 "archived PDF and finished signature it holds.",
-        )
-
-    # A second click before anything is deleted. A `file_uploader` fires the
-    # moment a file is *picked* — no button involved — and this load replaces
-    # the workspace rather than adding to it, so with no confirmation the wrong
-    # file in the dialog would take the books with it. Same rule as `arm_delete`
-    # below, drawn inline because there is only ever one of these on screen.
-    if incoming is not None:
-        st.caption(
-            "⚠️ Replaces everything now in the app: every input PDF, "
-            "archived book, finished signature and draft."
-        )
-        if st.button(
-            "Replace everything with this zip",
-            key="workspace-load-go",
-            type="primary",
-            use_container_width=True,
-            disabled=busy,
-        ):
-            try:
-                loaded = workspace.unpack(incoming.getvalue(), WORKSPACE)
-            except Exception as error:
-                finish(error=f"Could not load that zip: {error}")
-            else:
-                st.session_state.workspace_round = load_round + 1
-                finish(f"Loaded {loaded} file(s) from the zip.")
-
-    # `data` is the function, not its result: Streamlit calls it when the button
-    # is actually clicked, so the workspace is not zipped up again on every
-    # rerun of the page just to have a file sitting ready.
-    st.download_button(
-        "📤 Save my data (.zip)",
-        data=lambda: workspace.pack(WORKSPACE),
-        file_name=f"bookbinding-data-{datetime.now():%Y-%m-%d}.zip",
-        mime="application/zip",
-        key="workspace-save",
-        type="primary",
-        use_container_width=True,
-        disabled=busy,
-        help="Everything in the app — input PDFs, the archive, finished "
-             "signatures and book drafts — in one zip on your own machine. "
-             "Load it back with the box above.",
-    )
-
-    # How full the session is, on screen rather than only in an error message.
-    # A limit somebody only meets by being refused is a limit that reads as a
-    # fault; a bar that has been filling up all along reads as a rule.
-    st.progress(
-        min(1.0, used / workspace.LIMIT_BYTES),
-        text=f"{workspace.human(used)} of {workspace.human(workspace.LIMIT_BYTES)} used",
-    )
-    if full:
-        st.warning(
-            "This session is full. Save your data, then delete a book or two — "
-            "or start again with 🗑 below.",
-            icon="🚫",
-        )
-
-    # The retention rule, in one line, where the person it applies to is
-    # standing. Not buried in an About dialog nobody opens.
-    st.caption(
-        "**Nothing is stored.** Your files are held only while this tab is "
-        "open and are erased when it closes. Save your zip first."
-    )
-
-    # The same rule, on demand. Someone who has just converted something they
-    # would rather not leave sitting anywhere should not have to close the tab
-    # and take it on trust.
-    arm_delete(
-        "workspace",
-        "Erases every file in this session right now: input PDFs, the archive, "
-        "finished signatures and drafts.",
-        disabled=busy,
-        label="🗑 Delete my data now",
-    )
-
-    def erase_everything():
-        workspace.discard(st.session_state)
-        return "Erased. Nothing of yours is left on the server."
-
-    confirm_delete("workspace", erase_everything, disabled=busy)
-
-    st.divider()
-
-    # Settings holds what means the same thing on both tabs, and only that.
-    # Everything about the paper is decided on the tab it belongs to — the sheet
-    # an existing PDF is printed on is a different question from the size a book
-    # being typed is set at, and asking both here is what left the writing tab
-    # with two menus for one measurement, one in the sidebar and one on the page.
-    st.header("Settings")
-
-    # First under the header, and not one of the four the caption below counts:
-    # this one says nothing about the book, only about the light the app is read
-    # in. It is locked with everything else while a job runs, and for the same
-    # reason — a widget that changes asks Streamlit for a rerun, and Streamlit
-    # grants it by stopping the running script dead, half way through writing a
-    # book's signatures.
-
-    st.divider()
-
+    # Locked with everything else while a job runs, and for the same reason: a
+    # widget that changes asks Streamlit for a rerun, and Streamlit grants it by
+    # stopping the running script dead, half way through writing a book's
+    # signatures.
     appearance = st.radio(
         "Theme",
         APPEARANCE_MODES,
@@ -775,15 +815,6 @@ with st.sidebar:
         disabled=busy,
     )
 
-    st.divider()
-
-    if busy:
-        st.warning(
-            "Working on a book. The settings below are locked until it finishes, "
-            "so the file being written matches what you see.",
-            icon="⏳",
-        )
-
     unit = UNITS[
         st.radio(
             "Units",
@@ -791,7 +822,7 @@ with st.sidebar:
             horizontal=True,
             key="setting-units",
             disabled=busy,
-            help="Applies to every measurement in the app, on both tabs. "
+            help="Applies to every measurement in the app, on every screen. "
                  "Switching converts the current values rather than "
                  "reinterpreting them, so no book changes size.",
         )
@@ -806,40 +837,249 @@ with st.sidebar:
             forget_widget(field)
         st.session_state.unit_name = unit.name
 
-    st.divider()
+    # A slot rather than a bare `if`, for the reason the flash slot at the top
+    # of the page is one: an element that exists on some runs and not others
+    # changes the count of its container, and for exactly one run afterwards the
+    # longer previous page's tail is left on screen beside the new one. A job
+    # starting and finishing is the commonest count change there is — this
+    # warning appears when it starts and goes when it ends — and the visible
+    # symptom was a second "📤 Save my data" button in the sidebar for one run
+    # after every conversion. An unfilled `st.empty()` renders nothing.
+    busy_slot = st.empty()
+    if busy:
+        busy_slot.warning(
+            "Working on a book. Everything is locked until it finishes, so the "
+            "file being written matches what you see.",
+            icon="⏳",
+        )
 
-    sheets_per_signature = st.number_input(
+
+    # --------------------------------------------------------------------
+    # This session's data, in and out as one zip
+    # --------------------------------------------------------------------
+    # Folded away, and last, because it is no longer how work leaves this
+    # app. Every screen now ends in a download of the thing that screen
+    # makes — a book, a set of signatures, a draft — so the session zip is
+    # what it always should have been: a way to carry a whole session
+    # somewhere else, not the only door out.
+    #
+    # It stays because two of its buttons are rights rather than
+    # conveniences. The data policy names 📤 Save my data as portability and
+    # 🗑 Delete my data now as erasure; demoting them is fair, removing them
+    # is not.
+    with st.expander("💾 This session's data"):
+        # --------------------------------------------------------------------------
+        # Your data — the whole workspace, in and out, as one zip
+        # --------------------------------------------------------------------------
+        # Above the settings because it is the first thing a visitor does and the
+        # last thing they do, and because it is the only way in or out: nothing here
+        # is stored, so the zip is the whole of what a person keeps.
+
+        # A fresh key after each load, for the reason the PDF uploader has one: a
+        # `file_uploader` hands back the same file on every rerun, so without this
+        # the zip would be loaded again the moment anything else on the page moved.
+        load_round = st.session_state.setdefault("workspace_round", 0)
+        # Keyed on the container rather than on the uploader, for the same reason the
+        # book uploader is: the style block at the top of this file reaches inside to
+        # correct the limit line the dropzone prints, and the uploader's own key
+        # changes on every load round, so a selector built from it would stop
+        # matching the moment a zip was loaded.
+        #
+        # The help says nothing about size. The rule is on the dropzone line, once,
+        # where the wrong one used to be — and it is a rule about what the zip holds
+        # rather than about the file, so a figure repeated here would be read as a
+        # second, different limit on the upload itself.
+        with st.container(key="zip-uploader"):
+            incoming = st.file_uploader(
+                "📥 Load my data (.zip)",
+                type="zip",
+                key=f"workspace-zip-{load_round}",
+                disabled=busy,
+                help="A zip saved by the button below. Puts back every book, draft, "
+                     "archived PDF and finished signature it holds.",
+            )
+
+        # A second click before anything is deleted. A `file_uploader` fires the
+        # moment a file is *picked* — no button involved — and this load replaces
+        # the workspace rather than adding to it, so with no confirmation the wrong
+        # file in the dialog would take the books with it. Same rule as `arm_delete`
+        # below, drawn inline because there is only ever one of these on screen.
+        if incoming is not None:
+            st.caption(
+                "⚠️ Replaces everything now in the app: every input PDF, "
+                "archived book, finished signature and draft."
+            )
+            if st.button(
+                "Replace everything with this zip",
+                key="workspace-load-go",
+                type="primary",
+                use_container_width=True,
+                disabled=busy,
+            ):
+                try:
+                    loaded = workspace.unpack(incoming.getvalue(), WORKSPACE)
+                except Exception as error:
+                    finish(error=f"Could not load that zip: {error}")
+                else:
+                    st.session_state.workspace_round = load_round + 1
+                    finish(f"Loaded {loaded} file(s) from the zip.")
+
+        # `data` is the function, not its result: Streamlit calls it when the button
+        # is actually clicked, so the workspace is not zipped up again on every
+        # rerun of the page just to have a file sitting ready.
+        st.download_button(
+            "📤 Save my data (.zip)",
+            data=lambda: workspace.pack(WORKSPACE),
+            file_name=f"bookbinding-data-{datetime.now():%Y-%m-%d}.zip",
+            mime="application/zip",
+            key="workspace-save",
+            # Not primary any more. Every screen ends in a download of the thing
+            # that screen makes, and those are the buttons that should be loud;
+            # this one carries a whole session somewhere else, which is a real
+            # thing to want and not the ordinary way out.
+            use_container_width=True,
+            disabled=busy,
+            help="Everything in the app — input PDFs, the archive, finished "
+                 "signatures and book drafts — in one zip on your own machine. "
+                 "Load it back with the box above.",
+        )
+
+        # How full the session is, on screen rather than only in an error message.
+        # A limit somebody only meets by being refused is a limit that reads as a
+        # fault; a bar that has been filling up all along reads as a rule.
+        st.progress(
+            min(1.0, used / workspace.LIMIT_BYTES),
+            text=f"{workspace.human(used)} of {workspace.human(workspace.LIMIT_BYTES)} used",
+        )
+        if full:
+            st.warning(
+                "This session is full. Save your data, then delete a book or two — "
+                "or start again with 🗑 below.",
+                icon="🚫",
+            )
+
+        # The retention rule, in one line, where the person it applies to is
+        # standing. Not buried in an About dialog nobody opens.
+        st.caption(
+            "**Nothing is stored.** Your files are held only while this tab is "
+            "open and are erased when it closes. Save your zip first."
+        )
+
+        # The same rule, on demand. Someone who has just converted something they
+        # would rather not leave sitting anywhere should not have to close the tab
+        # and take it on trust.
+        arm_delete(
+            "workspace",
+            "Erases every file in this session right now: input PDFs, the archive, "
+            "finished signatures and drafts.",
+            disabled=busy,
+            label="🗑 Delete my data now",
+        )
+
+        def erase_everything():
+            workspace.discard(st.session_state)
+            return "Erased. Nothing of yours is left on the server."
+
+        confirm_delete("workspace", erase_everything, disabled=busy)
+
+
+# --------------------------------------------------------------------------
+# How the paper is folded — the two settings both flows share
+# --------------------------------------------------------------------------
+# These used to live in the sidebar, because they are the only two settings that
+# mean the same thing whichever screen you are on and the sidebar was the only
+# place that was always drawn. That is no longer a reason: `settings.resolve`
+# reads a value without drawing it, so a setting can now live next to the thing
+# it affects and still be readable from the job runner at the foot of this file.
+#
+# So they sit inside "Advanced paper and printing" on both flows, behind one
+# collapsed expander, under the same two keys. Only one flow is ever on screen,
+# so there is never a second copy holding a different answer — and `carried`
+# keeps the answer through the screens that do not draw it.
+DUPLEX_LABELS = ["Flip on long edge", "Flip on short edge"]
+SHEETS_KEY = "setting-sheets"
+DUPLEX_KEY = "setting-duplex"
+
+settings.register(SHEETS_KEY, DEFAULT_SHEETS_PER_SIGNATURE)
+settings.register(DUPLEX_KEY, DUPLEX_LABELS[0], DUPLEX_LABELS)
+
+
+def printing_options():
+    """The folding settings, drawn into whatever container the caller has open."""
+    sheets = settings.carried(
+        SHEETS_KEY,
+        st.number_input,
         "Sheets of paper per signature",
         min_value=1,
         max_value=25,
-        value=DEFAULT_SHEETS_PER_SIGNATURE,
         step=1,
-        key="setting-sheets",
         disabled=busy,
         help="Physical sheets in one folded gathering. Each sheet is printed on "
              "both sides and folded once, so it carries 4 book pages.",
     )
     st.caption(
-        f"= {sheets_per_signature * 2} printed sides, "
-        f"**{sheets_per_signature * 4} book pages** per signature"
+        f"= {sheets * 2} printed sides, "
+        f"**{sheets * 4} book pages** per signature"
     )
-
-    st.divider()
-
-    duplex = st.radio(
+    settings.carried(
+        DUPLEX_KEY,
+        st.radio,
         "Printer duplex setting",
-        ["Flip on long edge", "Flip on short edge"],
-        key="setting-duplex",
+        DUPLEX_LABELS,
         disabled=busy,
         help="Must match your printer. The wrong one prints every other side "
              "upside down. If a test signature comes out that way, switch this.",
     )
-    flip_on_long_edge = duplex == "Flip on long edge"
+    return sheets
 
 
-# Drawn wherever it is called from, which is now the conversion tab rather than
-# the sidebar: `unit`, `lengths_in` and `busy` are the same on both tabs, so the
-# widget only has to know which container the caller has open.
+# Read rather than drawn, so the runner, the reference tables and the editor all
+# see the same answer on a run where the widget itself is three expanders deep
+# inside a flow — or on a screen that does not draw it at all.
+sheets_per_signature = settings.resolve(SHEETS_KEY)
+flip_on_long_edge = settings.resolve(DUPLEX_KEY) == DUPLEX_LABELS[0]
+
+
+# --------------------------------------------------------------------------
+# The two builds behind the writing screen's download buttons
+# --------------------------------------------------------------------------
+# ⬇️ Download as PDF and ⬇️ Download as signatures are `st.download_button`s
+# whose `data` is one of these. Streamlit calls that when the button is clicked,
+# so the book is typeset — and imposed — inside the click and the bytes go
+# straight to the browser. There is no job to claim and nothing is left on the
+# server; see `Script/book_build.py` for what that costs and why.
+#
+# Everything either one needs is pinned as a default argument, evaluated here, on
+# the run that drew the button. That is not a style choice. These functions run
+# off the script run, on whichever thread served the download, where `main`'s
+# four folder names may already have been re-pointed at another session's
+# workspace and no session state can be read at all.
+def make_pdf(book, file_name, page_size_in, root=SCRATCH_DIR):
+    """The typeset book, as the bytes of a PDF."""
+    return book_build.pdf_bytes(book, file_name, page_size_in, root)
+
+
+def make_signatures(
+    book,
+    file_name,
+    page_size_in,
+    sheet_size_pt,
+    root=SCRATCH_DIR,
+    sheets=sheets_per_signature,
+    long_edge=flip_on_long_edge,
+):
+    """The typeset book, imposed, as the bytes of one zip of signatures."""
+    return book_build.signature_bytes(
+        book, file_name, page_size_in, root,
+        sheet_size_pt=sheet_size_pt,
+        sheets_per_signature=sheets,
+        flip_on_long_edge=long_edge,
+    )
+
+
+# Drawn wherever it is called from, which is the conversion flow rather than the
+# sidebar: `unit`, `lengths_in` and `busy` are the same everywhere, so the widget
+# only has to know which container the caller has open.
 def length_input(label, field, max_in, help_text, min_in=0.0):
     value = st.number_input(
         f"{label} ({unit.name})",
@@ -856,13 +1096,21 @@ def length_input(label, field, max_in, help_text, min_in=0.0):
     return lengths_in[field]
 
 
-def layout_for(info):
-    """The column layout for one book, fitted to its own page unless overridden."""
-    if column_width_in is None:
+def layout_for(info, margin_in, gap_in, width_in):
+    """The column layout for one book, fitted to its own page unless overridden.
+
+    The three measurements are arguments rather than names read from the module,
+    which is not tidiness: they are assigned six hundred lines *below* this
+    function, inside the panel that draws them, so a version of this that read
+    them off the module worked only by the accident of never being called before
+    that panel had run. Moving this function anywhere — into the conversion
+    view's own module, say — would have broken it silently.
+    """
+    if width_in is None:
         return ColumnLayout.fitted(
-            info.page_width_pt / PT_PER_INCH, page_margin_in, column_gap_in
+            info.page_width_pt / PT_PER_INCH, margin_in, gap_in
         )
-    return ColumnLayout(page_margin_in, column_gap_in, column_width_in)
+    return ColumnLayout(margin_in, gap_in, width_in)
 
 
 def book_notes(info):
@@ -922,151 +1170,70 @@ if flash or flash_error:
         if flash_error:
             st.error(flash_error)
 
-# --------------------------------------------------------------------------
-# Convert 2 column formatted PDF into PDF signatures
-# --------------------------------------------------------------------------
-if view == CONVERT_VIEW:
-    # ----------------------------------------------------------------------
-    # Paper to print on — this tab's settings, on this tab
-    # ----------------------------------------------------------------------
-    # Everything in here is about a PDF somebody else made: which paper to put
-    # it on, what to do when it is not that size, and where its two columns sit.
-    # None of it means anything while a book is being typed, which is why it now
-    # sits above the three panels it describes instead of in the sidebar.
-    with st.container(border=True):
-        st.markdown("#### 🖨️ Paper to print on")
-        size_column, choice_column = st.columns(2)
+# One slot for the way back, created on every run for the same reason the flash
+# slot above is: an element that only sometimes exists shifts everything below
+# it by one place on the runs it does exist, and the comment above says what that
+# costs. An unfilled `st.empty()` renders nothing and occupies no space.
+home_slot = st.empty()
+if route != HOME_ROUTE:
+    back_column, title_column = home_slot.columns([1, 5], vertical_alignment="center")
+    if back_column.button(
+        "← Home",
+        key="go-home",
+        use_container_width=True,
+        # The heir of `disabled=busy` on the radio this replaced, and half of
+        # what stops a job being orphaned. The other half is the route pin in
+        # `claim_job`; neither is sufficient alone.
+        disabled=busy,
+        help="Back to the three cards. Your work stays where it is.",
+    ):
+        go(HOME_ROUTE)
+    title_column.markdown(f"### {CARDS_BY_ROUTE[route]['header']}")
 
-        def sheet_label(name):
-            if name in (SAME_AS_INPUT, CUSTOM_SIZE):
-                return name
-            return f"{name} · {unit.size_label(*find_paper_size(name).size_in(False))}"
-
-        sticky("setting-sheet-size", SAME_AS_INPUT)
-        sheet_choice = size_column.selectbox(
-            "Sheet size",
-            [SAME_AS_INPUT] + [size.name for size in SHEET_SIZES] + [CUSTOM_SIZE],
-            format_func=sheet_label,
-            key="setting-sheet-size",
-            disabled=busy,
-            help=f"The paper you will actually load into the printer. Leave it on "
-                 f"“{SAME_AS_INPUT}” to keep each book exactly as it is, which is "
-                 f"the right answer whenever the PDF was already made for your "
-                 f"paper.",
+# Everything a route draws goes inside this one container, and both halves of
+# that line are element-count discipline rather than tidiness.
+#
+# **The container** keeps everything below it — the reference row, the data
+# policy — at a fixed sibling index, whatever the route draws inside. Without it
+# they would sit at one index on a three-card home screen and another on a
+# four-hundred-element conversion screen, and for one run after every route
+# change the older, longer page's tail would be left on screen beside the new
+# one. That is the bug the flash-slot comment above records, in a louder form.
+#
+# **The key** is the other half, and it was learned the hard way: a test caught
+# the half-written book still sitting on the page after the finished one had
+# replaced it. Streamlit reconciles a container's children by position, so an
+# `st.empty()` holding streamed text at index 4 of the AI screen was matched
+# against whatever the writing screen happened to draw at index 4 — and its
+# contents survived a screen that never asked for them. Keying the container per
+# route gives each screen its own identity, so changing route replaces the whole
+# subtree instead of reconciling it against the last one.
+with st.container(key=f"route-{route}"):
+    if route == HOME_ROUTE:
+        home.render(
+            CARDS,
+            go,
+            busy=busy,
+            full=full,
+            ai_ready=ai_ready,
+            resume=resume_strip(),
         )
-        remember("setting-sheet-size")
 
-        if sheet_choice == SAME_AS_INPUT:
-            sheet_size_pt = None
-            scale_mode = FIT
-            st.caption(
-                "Each book keeps its own page size and nothing is scaled."
-            )
-        else:
-            if sheet_choice == CUSTOM_SIZE:
-                with choice_column:
-                    sheet_width_in = length_input(
-                        "Sheet width", "sheet_w", 48.0,
-                        "The full width of the paper, before folding. A book page "
-                        "ends up half this wide.",
-                        min_in=1.0,
-                    )
-                    sheet_height_in = length_input(
-                        "Sheet height", "sheet_h", 48.0,
-                        "The full height of the paper. A book page is this tall.",
-                        min_in=1.0,
-                    )
-            else:
-                sticky("setting-orientation", True)
-                landscape = choice_column.radio(
-                    "Sheet orientation",
-                    [True, False],
-                    format_func=lambda value: (
-                        "Landscape (long edge across)" if value
-                        else "Portrait (short edge across)"
-                    ),
-                    key="setting-orientation",
-                    disabled=busy,
-                    help="A sheet is folded across its width, so the long edge "
-                         "normally goes across. Portrait gives tall, narrow book "
-                         "pages.",
-                )
-                remember("setting-orientation")
-                sheet_width_in, sheet_height_in = find_paper_size(
-                    sheet_choice
-                ).size_in(landscape)
+    elif route == AI_ROUTE:
+        pending_job = ai_view.render(
+            busy=busy, job=job, full=full, claim_job=claim_job,
+        )
 
-            sheet_size_pt = (
-                sheet_width_in * PT_PER_INCH, sheet_height_in * PT_PER_INCH
-            )
-            sticky("setting-scale-mode", FIT)
-            scale_mode = st.radio(
-                "If the book is a different size",
-                [FIT, ACTUAL_SIZE],
-                format_func=lambda mode: SCALE_MODE_LABELS[mode],
-                horizontal=True,
-                key="setting-scale-mode",
-                disabled=busy,
-                help="“Fit” scales each book page up or down until it fills the "
-                     "sheet, keeping its proportions. “Keep the original size” "
-                     "never resizes anything and refuses the job if the book is "
-                     "too big for the paper.",
-            )
-            remember("setting-scale-mode")
-            st.caption(
-                f"Sheet **{describe_size(sheet_width_in, sheet_height_in, unit)}** "
-                f"→ folded book pages of "
-                f"**{unit.size_label(sheet_width_in / 2, sheet_height_in)}**"
-            )
+    # ----------------------------------------------------------------------
+    # Convert a PDF book into printable signatures
+    # ----------------------------------------------------------------------
+    elif route == CONVERT_VIEW:
 
-        # Folded away, because the group reads like a setting that shapes the
-        # book and is nothing of the kind: every page is folded down its own
-        # middle whatever is in here, and the columns are fitted to each book by
-        # default, so most people never need to open it at all.
-        with st.expander("Stamped page number positioning"):
-            st.caption(
-                f"Dictates where **stamped page numbers** are placed."
-            )
-
-            sticky("setting-auto-columns", True)
-            auto_columns = st.checkbox(
-                "Fit the columns to each PDF", key="setting-auto-columns",
-                disabled=busy,
-                help="Works out the column width from each book's own page size, "
-                     "keeping the margin and gap below. Leave this on: a fixed "
-                     "column width is only ever right for the one page size it "
-                     "was measured on.",
-            )
-            remember("setting-auto-columns")
-
-            margin_column, gap_column, width_column = st.columns(3)
-            with margin_column:
-                page_margin_in = length_input(
-                    "Outer page margin", "margin", 5.0,
-                    "From the paper edge to the outer edge of the first column.",
-                )
-            with gap_column:
-                column_gap_in = length_input(
-                    "Gap between the two columns", "gap", 6.0,
-                    "The gutter. The fold runs down the middle of it.",
-                )
-            # None means "work it out per book". Kept out of ColumnLayout
-            # entirely rather than defaulted, so nothing downstream can mistake a
-            # stale A4 number for a measurement of the book actually in hand.
-            column_width_in = None
-            if not auto_columns:
-                with width_column:
-                    column_width_in = length_input(
-                        "Column width", "width", 12.0,
-                        "Width of each of the two columns. Both are the same "
-                        "width. The shipped default fills an A4 landscape page.",
-                        min_in=0.1,
-                    )
-
-    left, middle, right = st.columns(3, gap="large")
-
-    with left:
-        st.header("Available for conversion")
+        st.markdown("#### Step 1 — Add your PDF")
+        st.caption(
+            "A book laid out two columns to a page — the shape a book PDF is "
+            "usually in. Add as many as you like; each gets its own card below."
+        )
 
         # The uploader is rebuilt under a fresh key after each save. Without that it
         # keeps handing back the same files on every rerun, which either re-saves a
@@ -1140,6 +1307,233 @@ if view == CONVERT_VIEW:
                 else "Those PDFs are already here."
             )
 
+
+        st.markdown("#### Step 2 — Choose your paper")
+        # ----------------------------------------------------------------------
+        # The one question on this screen that has to be asked out loud
+        # ----------------------------------------------------------------------
+        # Everything here is about a PDF somebody else made: which paper to put it
+        # on, what to do when it is not that size, and where its two columns sit.
+        # Only the first of those has to be visible — the default answers it
+        # correctly for anybody whose PDF was already made for their paper, which
+        # is most people — so the rest is one expander down.
+        with st.container(border=True):
+            def sheet_label(name):
+                if name in (SAME_AS_INPUT, CUSTOM_SIZE):
+                    return name
+                return f"{name} · {unit.size_label(*find_paper_size(name).size_in(False))}"
+
+            sticky("setting-sheet-size", SAME_AS_INPUT)
+            sheet_choice = st.selectbox(
+                "Sheet size",
+                [SAME_AS_INPUT] + [size.name for size in SHEET_SIZES] + [CUSTOM_SIZE],
+                format_func=sheet_label,
+                key="setting-sheet-size",
+                disabled=busy,
+                help=f"The paper you will actually load into the printer. Leave it on "
+                     f"“{SAME_AS_INPUT}” to keep each book exactly as it is, which is "
+                     f"the right answer whenever the PDF was already made for your "
+                     f"paper.",
+            )
+            remember("setting-sheet-size")
+
+            # Everything below the sheet menu, in one place, closed. Streamlit
+            # will not nest an expander inside an expander, so the stamped page
+            # number group — which used to have one of its own — is a headed
+            # section in here instead. That is no loss: it was already the least
+            # consequential thing on the screen, and it is now one click from
+            # the surface rather than two.
+            with st.expander("⚙️ Advanced paper and printing"):
+                if sheet_choice == SAME_AS_INPUT:
+                    sheet_size_pt = None
+                    scale_mode = FIT
+                elif sheet_choice == CUSTOM_SIZE:
+                    custom_width, custom_height = st.columns(2)
+                    with custom_width:
+                        sheet_width_in = length_input(
+                            "Sheet width", "sheet_w", 48.0,
+                            "The full width of the paper, before folding. A book page "
+                            "ends up half this wide.",
+                            min_in=1.0,
+                        )
+                    with custom_height:
+                        sheet_height_in = length_input(
+                            "Sheet height", "sheet_h", 48.0,
+                            "The full height of the paper. A book page is this tall.",
+                            min_in=1.0,
+                        )
+                else:
+                    sticky("setting-orientation", True)
+                    landscape = st.radio(
+                        "Sheet orientation",
+                        [True, False],
+                        format_func=lambda value: (
+                            "Landscape (long edge across)" if value
+                            else "Portrait (short edge across)"
+                        ),
+                        horizontal=True,
+                        key="setting-orientation",
+                        disabled=busy,
+                        help="A sheet is folded across its width, so the long edge "
+                             "normally goes across. Portrait gives tall, narrow book "
+                             "pages.",
+                    )
+                    remember("setting-orientation")
+                    sheet_width_in, sheet_height_in = find_paper_size(
+                        sheet_choice
+                    ).size_in(landscape)
+
+                if sheet_choice != SAME_AS_INPUT:
+                    sheet_size_pt = (
+                        sheet_width_in * PT_PER_INCH, sheet_height_in * PT_PER_INCH
+                    )
+                    sticky("setting-scale-mode", FIT)
+                    scale_mode = st.radio(
+                        "If the book is a different size",
+                        [FIT, ACTUAL_SIZE],
+                        format_func=lambda mode: SCALE_MODE_LABELS[mode],
+                        horizontal=True,
+                        key="setting-scale-mode",
+                        disabled=busy,
+                        help="“Fit” scales each book page up or down until it fills "
+                             "the sheet, keeping its proportions. “Keep the original "
+                             "size” never resizes anything and refuses the job if the "
+                             "book is too big for the paper.",
+                    )
+                    remember("setting-scale-mode")
+
+                st.divider()
+
+                # The two settings this screen shares with the writing flow. One
+                # pair of keys, drawn in whichever of the two is on screen.
+                printing_options()
+
+                st.divider()
+
+                st.markdown("**Stamped page number positioning**")
+                st.caption(
+                    "Where the two columns sit on a page of the *input* PDF — not "
+                    "on the paper. Used only by **Number the pages**, and never by "
+                    "a conversion: every page is folded down its own middle "
+                    "whatever is set here."
+                )
+
+                sticky("setting-auto-columns", True)
+                auto_columns = st.checkbox(
+                    "Fit the columns to each PDF", key="setting-auto-columns",
+                    disabled=busy,
+                    help="Works out the column width from each book's own page size, "
+                         "keeping the margin and gap below. Leave this on: a fixed "
+                         "column width is only ever right for the one page size it "
+                         "was measured on.",
+                )
+                remember("setting-auto-columns")
+
+                margin_column, gap_column, width_column = st.columns(3)
+                with margin_column:
+                    page_margin_in = length_input(
+                        "Outer page margin", "margin", 5.0,
+                        "From the paper edge to the outer edge of the first column.",
+                    )
+                with gap_column:
+                    column_gap_in = length_input(
+                        "Gap between the two columns", "gap", 6.0,
+                        "The gutter. The fold runs down the middle of it.",
+                    )
+                # None means "work it out per book". Kept out of ColumnLayout
+                # entirely rather than defaulted, so nothing downstream can mistake a
+                # stale A4 number for a measurement of the book actually in hand.
+                column_width_in = None
+                if not auto_columns:
+                    with width_column:
+                        column_width_in = length_input(
+                            "Column width", "width", 12.0,
+                            "Width of each of the two columns. Both are the same "
+                            "width. The shipped default fills an A4 landscape page.",
+                            min_in=0.1,
+                        )
+
+            # Outside the expander on purpose: this is the answer to what the
+            # menu above just did, and reading it should not cost a click.
+            if sheet_choice == SAME_AS_INPUT:
+                st.caption(
+                    "Each book keeps its own page size and nothing is scaled. "
+                    f"Folding {sheets_per_signature} sheets to a signature."
+                )
+            else:
+                st.caption(
+                    f"Sheet **{describe_size(sheet_width_in, sheet_height_in, unit)}** "
+                    f"→ folded book pages of "
+                    f"**{unit.size_label(sheet_width_in / 2, sheet_height_in)}** · "
+                    f"{SCALE_MODE_LABELS[scale_mode].lower()}"
+                )
+
+        st.markdown("#### Step 3 — Create and download")
+
+        # The finished article, at the top of the step that makes it. A
+        # conversion moves its input PDF to the archive, so the card the user
+        # pressed disappears — and signatures anywhere other than here would
+        # mean the one thing they came for is the one thing not on screen.
+        if list_ready_books():
+            st.success("Ready to print", icon="✅")
+        ready = list_ready_books()
+        if not ready:
+            pass  # not drawn at all when there is nothing in it
+        else:
+            for book in ready:
+                with st.container(border=True):
+                    total_kb = sum(s.stat().st_size for s in book.signatures) / 1024
+                    st.markdown(f"**{book.name}**")
+                    st.caption(
+                        f"{len(book.signatures)} signature files · "
+                        + (f"{total_kb / 1024:.1f} MB" if total_kb >= 1024
+                           else f"{total_kb:.0f} KB")
+                    )
+
+                    # One download for the whole book, rather than one per
+                    # signature. These are printed as a set, in order, and
+                    # fetching them one at a time only creates a chance to print
+                    # them out of order or miss one. `data` is the function, not
+                    # its result, so the zip is built when the button is clicked
+                    # rather than on every rerun of the page.
+                    download_col, delete_col = st.columns([2, 1])
+                    # Named for what is in the zip, not for what it came from.
+                    # "Download this book" sat under a card holding signature
+                    # files and read as an offer of the book itself — the PDF
+                    # that went in — which is the one thing it is not.
+                    download_col.download_button(
+                        "⬇️ Download this book's signatures",
+                        data=lambda target=book.folder, name=book.name:
+                            workspace.pack_folder(target, name),
+                        file_name=f"{book.name}.zip",
+                        mime="application/zip",
+                        key=f"download-{book.name}",
+                        type="primary", use_container_width=True, disabled=busy,
+                        help="Every signature file for this book, in print "
+                             "order, with its printing notes, as one zip.",
+                    )
+
+                    arm_delete(
+                        f"ready-{book.name}",
+                        "Deletes this book's signature files and its printing notes.",
+                        container=delete_col, disabled=busy,
+                    )
+
+                    def remove_ready(target=book.folder, name=book.name,
+                                     count=len(book.signatures)):
+                        delete_ready_book(target)
+                        return f"Deleted the {count} signature files for “{name}”."
+
+                    confirm_delete(f"ready-{book.name}", remove_ready, disabled=busy)
+
+                    notes = book.folder / INSTRUCTIONS_NAME
+                    if notes.is_file():
+                        with st.expander("Paper and printing settings used"):
+                            st.code(notes.read_text(encoding="utf-8-sig"), language=None)
+
+                    with st.expander(f"Files in print order ({len(book.signatures)})"):
+                        for signature in book.signatures:
+                            st.markdown(f"`{signature.name}` · {human_size(signature)}")
         available = list_available_books()
         if not available:
             st.info("No PDFs waiting. Upload a 2-column PDF book above.")
@@ -1161,7 +1555,9 @@ if view == CONVERT_VIEW:
                         st.error(str(error))
                         continue
 
-                    layout = layout_for(info)
+                    layout = layout_for(
+                        info, page_margin_in, column_gap_in, column_width_in
+                    )
 
                     # The only thing that can stop a conversion is a sheet the book
                     # physically will not go on. Column measurements never can:
@@ -1344,247 +1740,199 @@ if view == CONVERT_VIEW:
                             f"Already numbered: see `{numbered_copy_path(pdf_path).name}`."
                         )
 
-    # --------------------------------------------------------------------------
-    # Archive of previously converted
-    # --------------------------------------------------------------------------
-    with middle:
-        st.header("Archive of previously converted")
-
-        previous = list_previous_books()
-        if not previous:
-            st.info(
-                "Nothing archived yet. Converted input PDFs are moved here "
-                "automatically, and “Move to archive” puts one here unconverted."
+        # --------------------------------------------------------------------
+        # The two lists, folded away together
+        # --------------------------------------------------------------------
+        # These were two of the three columns this screen used to be, which put
+        # two storage locations on the same footing as the work itself. Keeping
+        # things is not the main path any more: every conversion above ends in a
+        # download button directly under the book it belongs to. What is left in
+        # here is for somebody converting a batch, who wants the lists.
+        with st.expander("📂 This session's files"):
+            st.caption(
+                "Everything here is gone when you close the tab. The download "
+                "buttons above are what you keep."
             )
-        else:
-            for pdf_path in previous:
-                with st.container(border=True):
-                    st.markdown(f"**{pdf_path.name}**")
-                    st.caption(human_size(pdf_path))
+            st.markdown("##### Already converted")
 
-                    restore_col, delete_col = st.columns([2, 1])
-                    if restore_col.button(
-                        "Move back to the list", key=f"restore-{pdf_path.name}",
-                        use_container_width=True, disabled=busy,
-                        help="Puts this book back in the conversion list, e.g. to redo it "
-                             "on a different paper size.",
-                    ):
-                        try:
-                            move_book(pdf_path, INPUT_DIR)
-                        except Exception as error:
-                            st.error(f"Could not move it: {error}")
-                        else:
-                            finish(
-                                f"Moved “{pdf_path.name}” back to the "
-                                f"conversion list."
-                            )
+            previous = list_previous_books()
+            if not previous:
+                st.info(
+                    "Nothing archived yet. Converted input PDFs are moved here "
+                    "automatically, and “Move to archive” puts one here unconverted."
+                )
+            else:
+                for pdf_path in previous:
+                    with st.container(border=True):
+                        st.markdown(f"**{pdf_path.name}**")
+                        st.caption(human_size(pdf_path))
 
-                    arm_delete(
-                        f"archive-{pdf_path.name}",
-                        "Deletes this input PDF from the archive for good.",
-                        container=delete_col, disabled=busy,
-                    )
+                        restore_col, delete_col = st.columns([2, 1])
+                        if restore_col.button(
+                            "Move back to the list", key=f"restore-{pdf_path.name}",
+                            use_container_width=True, disabled=busy,
+                            help="Puts this book back in the conversion list, e.g. to redo it "
+                                 "on a different paper size.",
+                        ):
+                            try:
+                                move_book(pdf_path, INPUT_DIR)
+                            except Exception as error:
+                                st.error(f"Could not move it: {error}")
+                            else:
+                                finish(
+                                    f"Moved “{pdf_path.name}” back to the "
+                                    f"conversion list."
+                                )
 
-                    def remove_archived(path=pdf_path):
-                        delete_book(path)
-                        return f"Deleted “{path.name}” from the archive."
+                        arm_delete(
+                            f"archive-{pdf_path.name}",
+                            "Deletes this input PDF from the archive for good.",
+                            container=delete_col, disabled=busy,
+                        )
 
-                    confirm_delete(
-                        f"archive-{pdf_path.name}", remove_archived, disabled=busy
-                    )
+                        def remove_archived(path=pdf_path):
+                            delete_book(path)
+                            return f"Deleted “{path.name}” from the archive."
+
+                        confirm_delete(
+                            f"archive-{pdf_path.name}", remove_archived, disabled=busy
+                        )
+
 
     # --------------------------------------------------------------------------
-    # Ready to print
+    # Convert inputted text into PDF signatures — the book editor
     # --------------------------------------------------------------------------
-    with right:
-        st.header("Ready to print")
-
-        ready = list_ready_books()
-        if not ready:
-            st.info("Nothing converted yet.")
-        else:
-            for book in ready:
-                with st.container(border=True):
-                    total_kb = sum(s.stat().st_size for s in book.signatures) / 1024
-                    st.markdown(f"**{book.name}**")
-                    st.caption(
-                        f"{len(book.signatures)} signature files · "
-                        + (f"{total_kb / 1024:.1f} MB" if total_kb >= 1024
-                           else f"{total_kb:.0f} KB")
-                    )
-
-                    # One download for the whole book, rather than one per
-                    # signature. These are printed as a set, in order, and
-                    # fetching them one at a time only creates a chance to print
-                    # them out of order or miss one. `data` is the function, not
-                    # its result, so the zip is built when the button is clicked
-                    # rather than on every rerun of the page.
-                    download_col, delete_col = st.columns([2, 1])
-                    download_col.download_button(
-                        "⬇️ Download this book",
-                        data=lambda target=book.folder, name=book.name:
-                            workspace.pack_folder(target, name),
-                        file_name=f"{book.name}.zip",
-                        mime="application/zip",
-                        key=f"download-{book.name}",
-                        type="primary", use_container_width=True, disabled=busy,
-                        help="Every signature file for this book, in print "
-                             "order, with its printing notes, as one zip.",
-                    )
-
-                    arm_delete(
-                        f"ready-{book.name}",
-                        "Deletes this book's signature files and its printing notes.",
-                        container=delete_col, disabled=busy,
-                    )
-
-                    def remove_ready(target=book.folder, name=book.name,
-                                     count=len(book.signatures)):
-                        delete_ready_book(target)
-                        return f"Deleted the {count} signature files for “{name}”."
-
-                    confirm_delete(f"ready-{book.name}", remove_ready, disabled=busy)
-
-                    notes = book.folder / INSTRUCTIONS_NAME
-                    if notes.is_file():
-                        with st.expander("Paper and printing settings used"):
-                            st.code(notes.read_text(encoding="utf-8-sig"), language=None)
-
-                    with st.expander(f"Files in print order ({len(book.signatures)})"):
-                        for signature in book.signatures:
-                            st.markdown(f"`{signature.name}` · {human_size(signature)}")
-
-# --------------------------------------------------------------------------
-# Convert inputted text into PDF signatures — the book editor
-# --------------------------------------------------------------------------
-# The editor is handed the pieces that have to stay app-wide — the display
-# unit, the lock, the flash slot, the armed-delete slot and the two functions
-# that keep a tab's own widgets alive while the other tab is up — rather than
-# reaching for them itself, so "one job at a time" and "one confirmation on
-# screen" still mean what they say now that two views can start work.
-#
-# The paper is not among them: this view sets a book's size rather than fitting
-# an existing book to a sheet, so it asks that question itself, once, in
-# 📐 Book design, and hands the answer back on the job it claims.
-else:
-    pending_job = book_editor.render(
-        book_editor.Editor(
-            unit=unit,
-            busy=busy,
-            job=job,
-            sheets_per_signature=sheets_per_signature,
-            finish=finish,
-            claim_job=claim_job,
-            arm_delete=arm_delete,
-            confirm_delete=confirm_delete,
-            sticky=sticky,
-            remember=remember,
-            build_path=book_pdf_path,
-            pack_folder=workspace.pack_folder,
-            full=full,
-        ),
-        folder=MANUSCRIPT_DIR,
-    )
-
-# The AI job rejoins the others here, below both views, because the assignment
-# just above is unconditional and would otherwise throw it away. Nothing is lost
-# the other way either: while an AI job is in flight `busy` is true, so every
-# build button in the editor is drawn disabled and `render` cannot have returned
-# a job of its own.
-if ai_job is not None:
-    pending_job = ai_job
-
-st.divider()
-
-how_to, choosing, reference = st.columns(3, gap="large")
-
-with how_to:
-    with st.expander("How to print and fold"):
-        # The steps themselves live in `main.printing_steps`, because the note
-        # written beside every converted book says the same five things and the
-        # two used to be kept by hand. Edit them there, not here.
-        st.markdown("\n".join(
-            f"{number}. {step}"
-            for number, step in enumerate(printing_steps(flip_on_long_edge), 1)
-        ))
-        st.markdown(
-            f"Each converted book also gets a `{INSTRUCTIONS_NAME}` file "
-            f"recording the paper size, the scaling and the duplex setting it "
-            f"was made with."
+    # The editor is handed the pieces that have to stay app-wide — the display
+    # unit, the lock, the flash slot, the armed-delete slot and the two functions
+    # that keep a tab's own widgets alive while the other tab is up — rather than
+    # reaching for them itself, so "one job at a time" and "one confirmation on
+    # screen" still mean what they say now that two views can start work.
+    #
+    # It claims no job of its own any more. Its two builds are the data behind
+    # two download buttons, and the pair below is what they call; nothing on this
+    # screen is slow enough to need the lock, and nothing it writes outlives the
+    # click. See `make_pdf` and `make_signatures`.
+    #
+    # The paper is not among them: this view sets a book's size rather than fitting
+    # an existing book to a sheet, so it asks that question itself, once, in
+    # 📐 Book design, and hands the answer to the buttons that use it.
+    elif route == WRITE_VIEW:
+        book_editor.render(
+            book_editor.Editor(
+                unit=unit,
+                busy=busy,
+                sheets_per_signature=sheets_per_signature,
+                finish=finish,
+                arm_delete=arm_delete,
+                confirm_delete=confirm_delete,
+                sticky=sticky,
+                remember=remember,
+                build_path=book_pdf_path,
+                pdf_bytes=make_pdf,
+                signature_bytes=make_signatures,
+                full=full,
+                printing_options=printing_options,
+            ),
+            folder=MANUSCRIPT_DIR,
         )
 
-with choosing:
-    with st.expander("Choosing a paper size"):
-        st.markdown(
-            """
-**A sheet is folded across its width.** One sheet of *W × H* paper gives four
-book pages of *W/2 × H*. So A4 landscape folds to A5 pages, Letter landscape
-folds to Half Letter pages, and a 6 × 9 in book needs 12 × 9 in paper.
 
-**Pick whatever paper you have.** Nothing is scaled here at any size: the book
-is *set* at the size you ask for, half a sheet to a page, so the type is drawn
-into the PDF at its finished size. Changing the size changes how big the
-finished book is, and how many pages it runs to, not how sharp it is.
+# The reference material, on the two screens that can use it. The front page
+# asks one question and should not answer three others underneath it, and the AI
+# screen has nothing to do with paper — so this row is drawn where a paper size
+# is actually being chosen, and nowhere else.
+if route in (CONVERT_VIEW, WRITE_VIEW):
+    st.divider()
 
-**One size, said either way.** In **📐 Book design** you can give the finished
-page or the paper it prints on, whichever you actually care about, and the app
-works out the other. There is no second place to set it.
+    how_to, choosing, reference = st.columns(3, gap="large")
 
-**Watch the outer margin.** Most printers cannot put ink within about 6 mm
-(0.25 in) of the paper edge, so a small page wants small margins to match.
-"""
-            if writing else
-            f"""
-**A sheet is folded across its width.** One sheet of *W × H* paper gives four
-book pages of *W/2 × H*. So A4 landscape folds to A5 pages, Letter landscape
-folds to Half Letter pages, and a 6 × 9 in book needs 12 × 9 in paper.
-
-**Leave it on "{SAME_AS_INPUT}"** unless you have a reason not to. A book laid
-out for A4 landscape prints perfectly on A4 with no scaling at all, and scaling
-always costs a little sharpness.
-
-**Pick a sheet size when** the book was made for paper you do not have (an
-A4 book on a Letter-only printer), when you want a smaller or larger book than
-it was drawn for, or when you want to print two-up on big paper and trim.
-
-**Fit vs. keep the original size.** *Fit* scales each book page until it fills
-the sheet, keeping its proportions; if the sheet is a different shape, the
-leftover appears as extra blank margin. *Keep the original size* never resizes
-anything and refuses the job outright if the book will not fit. Use it when the
-margins matter more than filling the paper.
-
-**Watch the outer margin.** Most printers cannot put ink within about 6 mm
-(0.25 in) of the paper edge. Shrinking a book onto smaller paper shrinks its
-margins too, and the app warns when the text gets that close to the edge.
-"""
-        )
-
-with reference:
-    with st.expander("Paper and book size reference"):
-        st.markdown("**Sheets you can print on**, and what one folds down to:")
-        st.markdown(
-            markdown_table(
-                ("Sheet", "Family", "Size", "Folded book page", "Notes"),
-                [(name, family, size, folded, note)
-                 for family, name, size, folded, note in paper_size_table(unit=unit)],
+    with how_to:
+        with st.expander("How to print and fold"):
+            # The steps themselves live in `main.printing_steps`, because the note
+            # written beside every converted book says the same five things and the
+            # two used to be kept by hand. Edit them there, not here.
+            st.markdown("\n".join(
+                f"{number}. {step}"
+                for number, step in enumerate(printing_steps(flip_on_long_edge), 1)
+            ))
+            st.markdown(
+                f"Each converted book also gets a `{INSTRUCTIONS_NAME}` file "
+                f"recording the paper size, the scaling and the duplex setting it "
+                f"was made with."
             )
-        )
-        st.markdown("")
-        st.markdown("**Finished book sizes**, and the sheet each one needs:")
-        st.markdown(
-            markdown_table(
-                ("Book page", "Family", "Trim size", "Sheet needed", "Nearest stock"),
-                [(name, family, trim, needed, stock)
-                 for family, name, trim, needed, stock, _note in book_page_table(unit=unit)],
+
+    with choosing:
+        with st.expander("Choosing a paper size"):
+            st.markdown(
+                """
+    **A sheet is folded across its width.** One sheet of *W × H* paper gives four
+    book pages of *W/2 × H*. So A4 landscape folds to A5 pages, Letter landscape
+    folds to Half Letter pages, and a 6 × 9 in book needs 12 × 9 in paper.
+
+    **Pick whatever paper you have.** Nothing is scaled here at any size: the book
+    is *set* at the size you ask for, half a sheet to a page, so the type is drawn
+    into the PDF at its finished size. Changing the size changes how big the
+    finished book is, and how many pages it runs to, not how sharp it is.
+
+    **One size, said either way.** In **📐 Book design** you can give the finished
+    page or the paper it prints on, whichever you actually care about, and the app
+    works out the other. There is no second place to set it.
+
+    **Watch the outer margin.** Most printers cannot put ink within about 6 mm
+    (0.25 in) of the paper edge, so a small page wants small margins to match.
+    """
+                if writing else
+                f"""
+    **A sheet is folded across its width.** One sheet of *W × H* paper gives four
+    book pages of *W/2 × H*. So A4 landscape folds to A5 pages, Letter landscape
+    folds to Half Letter pages, and a 6 × 9 in book needs 12 × 9 in paper.
+
+    **Leave it on "{SAME_AS_INPUT}"** unless you have a reason not to. A book laid
+    out for A4 landscape prints perfectly on A4 with no scaling at all, and scaling
+    always costs a little sharpness.
+
+    **Pick a sheet size when** the book was made for paper you do not have (an
+    A4 book on a Letter-only printer), when you want a smaller or larger book than
+    it was drawn for, or when you want to print two-up on big paper and trim.
+
+    **Fit vs. keep the original size.** *Fit* scales each book page until it fills
+    the sheet, keeping its proportions; if the sheet is a different shape, the
+    leftover appears as extra blank margin. *Keep the original size* never resizes
+    anything and refuses the job outright if the book will not fit. Use it when the
+    margins matter more than filling the paper.
+
+    **Watch the outer margin.** Most printers cannot put ink within about 6 mm
+    (0.25 in) of the paper edge. Shrinking a book onto smaller paper shrinks its
+    margins too, and the app warns when the text gets that close to the edge.
+    """
             )
-        )
-        st.caption(
-            f"“Nearest stock” is the smallest standard paper the needed sheet fits on. "
-            f"Print on that with a custom sheet size and trim the finished book down, or "
-            f"pick the stock itself and accept slightly larger pages. "
-            f"{len(SHEET_SIZES)} sheet sizes, and {len(BOOK_PAGE_SIZES)} book sizes "
-            f"across {len(BOOK_PAGE_FAMILIES)} categories."
-        )
+
+    with reference:
+        with st.expander("Paper and book size reference"):
+            st.markdown("**Sheets you can print on**, and what one folds down to:")
+            st.markdown(
+                markdown_table(
+                    ("Sheet", "Family", "Size", "Folded book page", "Notes"),
+                    [(name, family, size, folded, note)
+                     for family, name, size, folded, note in paper_size_table(unit=unit)],
+                )
+            )
+            st.markdown("")
+            st.markdown("**Finished book sizes**, and the sheet each one needs:")
+            st.markdown(
+                markdown_table(
+                    ("Book page", "Family", "Trim size", "Sheet needed", "Nearest stock"),
+                    [(name, family, trim, needed, stock)
+                     for family, name, trim, needed, stock, _note in book_page_table(unit=unit)],
+                )
+            )
+            st.caption(
+                f"“Nearest stock” is the smallest standard paper the needed sheet fits on. "
+                f"Print on that with a custom sheet size and trim the finished book down, or "
+                f"pick the stock itself and accept slightly larger pages. "
+                f"{len(SHEET_SIZES)} sheet sizes, and {len(BOOK_PAGE_SIZES)} book sizes "
+                f"across {len(BOOK_PAGE_FAMILIES)} categories."
+            )
 
 # --------------------------------------------------------------------------
 # Data policy
@@ -1594,10 +1942,14 @@ with reference:
 # visitors never see. The divider is the line it hangs under, run across the foot
 # of the page.
 #
-# On the page rather than behind an expander, and unfolded rather than in a
-# dialog, because the transparency this is written to satisfy is about a person
-# actually being told. A notice nobody can find is not a notice; the GDPR's own
-# word for what it has to be is "easily accessible".
+# In a collapsed expander at the foot of *every* screen, and never in a dialog
+# or on a page of its own. That is a deliberate change from being unfolded: a
+# notice fourteen sections long, printed under a three-card front page, doubled
+# the length of every screen and pushed the work off the bottom of it. The test
+# it still has to meet is the GDPR's own word — "easily accessible" — and one
+# click, from wherever you happen to be, on every screen there is, meets it.
+# What would not meet it is a link to somewhere else, or a policy that only
+# appears on one screen; neither is what this does.
 #
 # The figures are read out of `workspace` rather than typed in here, for the same
 # reason `TAGLINE` is said once at the top of this file and the folding steps
@@ -1844,12 +2196,12 @@ source is one clone away.
 
 st.divider()
 
-st.markdown("#### 🔒 Data policy")
-# Dated, because a policy without one cannot be told from the version it
-# replaced — and section 14 leans on the reader being able to see which they are
-# looking at. Update it when the words above change.
-st.caption(f"Last updated {POLICY_UPDATED}. Applies to both tabs.")
-st.markdown(DATA_POLICY)
+with st.expander("🔒 Data policy — what this app does with your files"):
+    # Dated, because a policy without one cannot be told from the version it
+    # replaced — and section 14 leans on the reader being able to see which they
+    # are looking at. Update it when the words above change.
+    st.caption(f"Last updated {POLICY_UPDATED}. Applies to every screen.")
+    st.markdown(DATA_POLICY)
 
 # --------------------------------------------------------------------------
 # Carrying the appearance choice out to the browser
@@ -2069,6 +2421,11 @@ TYPING_SCRIPT = """
 </script>
 """
 
+# Locked on every screen but the AI one, where the box and the button it works on
+# do not exist at all. The script is drawn regardless — see the element-count
+# discipline above — and simply has nothing to do.
+ai_locked = busy or full or not ai_ready or route != AI_ROUTE
+
 st.iframe(
     TYPING_SCRIPT.replace("__LOCKED__", "true" if ai_locked else "false").replace(
         "__HINT__", AI_HINT
@@ -2113,8 +2470,6 @@ STREAM_BOX_HEIGHT = 260
 FAILURE_LABELS = {
     "convert": "Conversion failed",
     "number": "Numbering failed",
-    "typeset": "Could not build the book",
-    "typeset_convert": "Could not build the book",
     "ai_write": "The AI could not write the book",
 }
 
@@ -2128,12 +2483,8 @@ if pending_job is not None:
 
     kind = pending_job["kind"]
     slot = pending_job["slot"]
-    # What to call it if it throws. ✂️ Create the signatures is two jobs behind
-    # one button, and it moves on to the second only once the PDF is written and
-    # named in the last-build note — so a failure there has to say the book was
-    # built. "Could not build the book", printed under a note saying it had just
-    # been built, is the app disagreeing with itself about a file the user can go
-    # and open.
+    # What to call it if it throws, said in the words of the button that was
+    # pressed rather than in the words of whatever raised.
     failure = FAILURE_LABELS.get(kind, "That did not work")
     bar = slot.progress(0.0, text="Starting…")
 
@@ -2178,11 +2529,11 @@ if pending_job is not None:
         return show
 
     def impose(pdf_path, layout, report=report):
-        """The conversion, shared by the button on a PDF and the one on a book.
+        """The conversion behind the button on an uploaded PDF.
 
-        The paper comes off the job rather than off the page: each tab decides
-        it for itself now, and only one of the two is on screen. Everything else
-        here is a sidebar setting and means the same thing on both.
+        The paper comes off the job rather than off the page, because the runner
+        is shared with the AI screen and only one of them is ever drawn.
+        Everything else here is a sidebar setting.
         """
         return convert_book(
             pdf_path,
@@ -2197,11 +2548,6 @@ if pending_job is not None:
             move_input=True,
             progress=report,
         )
-
-    # Set once the typesetting has finished, so the quota handler below can tell
-    # a book that was never written from one that was written and then had its
-    # imposition stopped. The second is a real result and is kept.
-    built = None
 
     try:
         if kind == "convert":
@@ -2232,6 +2578,14 @@ if pending_job is not None:
                 # A book takes minutes; this is what fills them.
                 on_text=live_writer(pending_job.get("stream")),
             )
+            # The half-written book comes off the screen the moment the finished
+            # one exists. Emptied here rather than left to the next run to
+            # overwrite, because the next run is on a different screen and never
+            # draws this slot at all — so nothing would replace it, and the
+            # reader would land in the editor with a paragraph of the draft they
+            # had just watched being written still sitting above it.
+            if pending_job.get("stream") is not None:
+                pending_job["stream"].empty()
             # Left for the next run rather than adopted here. Every box for the
             # book being replaced was drawn long before this line, and adopting
             # deletes exactly those keys. See `book_editor.hand_over`.
@@ -2243,60 +2597,19 @@ if pending_job is not None:
                 + (f" Your previous book is in the drafts list as “{kept}”." if kept else "")
             )
         else:
-            # Typesetting takes the first part of the bar and, when signatures
-            # were asked for, imposition takes the rest — one bar for what the
-            # user thinks of as one action.
-            whole = kind == "typeset_convert"
-            result = typeset_book(
-                pending_job["manuscript"], pending_job["file_name"],
-                progress=(lambda f, m: report(f * 0.45, m)) if whole else report,
-                # Half the chosen sheet, or None when the size was given as the
-                # book's own page. Setting the type at the size it will be
-                # printed at is what keeps this path free of any scaling.
-                page_size_in=pending_job["page_size_in"],
-            )
-            built = result.path
-            book_editor.remember_build(result, result.path.name)
-            if whole:
-                failure = "The book was built, but the signatures were not"
-                written = impose(
-                    result.path, None,
-                    report=lambda f, m: report(0.45 + f * 0.55, m),
-                )
-                folder = written[0].parent.parent
-                # Recorded again, now that there is something to download: the
-                # writing view has no "Ready to print" panel of its own, so
-                # without this the finished signatures could only be fetched by
-                # switching views.
-                book_editor.remember_build(
-                    result, result.path.name, output_folder=folder
-                )
-                done = (
-                    f"Typeset “{result.path.stem}” into {result.book_pages} book "
-                    f"pages, and created {signature_count(written)} for it."
-                )
-            else:
-                done = (
-                    f"Typeset “{result.path.name}”: {result.book_pages} book "
-                    f"pages. Convert it from "
-                    f"**{VIEW_LABELS[CONVERT_VIEW].strip()}**."
-                )
+            # Unreachable, and deliberately loud rather than silent. Every kind
+            # this runner knows is claimed in exactly one place; a new one that
+            # forgets to add its branch here would otherwise report success
+            # having done nothing at all.
+            raise ValueError(f"No such job: {kind!r}")
     except workspace.QuotaExceeded as error:
         # A job stopped part way has left a half-written file behind, and the
         # whole point of stopping was to stay under the limit — so the wreckage
         # goes too. A conversion cleans up after itself (`convert_book` writes
-        # into a staging folder and removes it on any failure); these are the two
-        # that write a file directly.
-        wreck = None
+        # into a staging folder and removes it on any failure); numbering is the
+        # one that writes a file directly.
         if kind == "number":
-            wreck = numbered_copy_path(pending_job["path"])
-        elif kind in ("typeset", "typeset_convert") and built is None:
-            # `built is None` means the typesetting itself was stopped. A book
-            # that was typeset and then had only its imposition stopped is a
-            # real result and stays; the writing view offers it as a build.
-            wreck = book_pdf_path(pending_job["file_name"])
-        if wreck is not None:
-            Path(wreck).unlink(missing_ok=True)
+            Path(numbered_copy_path(pending_job["path"])).unlink(missing_ok=True)
         finish(error=f"Stopped: {error}")
     except Exception as error:
         finish(error=f"{failure}: {error}")

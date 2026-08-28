@@ -30,7 +30,9 @@ from Script.manuscript import (  # noqa: E402
     load_draft,
 )
 from Script.test_editor import (  # noqa: E402
+    AI_ROUTE,
     CONVERT_VIEW,
+    HOME_ROUTE,
     WRITE_VIEW,
     EditorTestCase,
 )
@@ -81,6 +83,20 @@ class AiEditorTestCase(EditorTestCase):
             self.addCleanup(patcher.stop)
 
         super().setUp()
+        # The writer has a screen of its own now, rather than a box floating
+        # above every screen. `EditorTestCase.setUp` lands on the writing view,
+        # which is where a finished book ends up; these tests start where the
+        # asking happens.
+        self.go(AI_ROUTE)
+
+    def in_editor(self):
+        """Back to the writing screen, where the `bk-` boxes live.
+
+        Called by any test that sets a book up before pressing the button. The
+        boxes are on one screen and the button is on another, which is exactly
+        what these tests are about.
+        """
+        return self.go(WRITE_VIEW)
 
     def fake_write(
         self, prompt, *, design=None, progress=None, on_text=None, config=None
@@ -107,10 +123,16 @@ class AiEditorTestCase(EditorTestCase):
         worse than useless: the flash banner is consumed on the run that draws
         it, and the `set_value` flag that tells a box to show new words is only
         set on that same run. Running again clears both.
+
+        `from_view` is where the *user* was before coming here. The AI screen is
+        always where the button is pressed: its progress bar and its streaming
+        box both live on it, and a job whose screen stops being drawn is a job
+        the runner abandons.
         """
         if from_view is not None:
-            self.at.radio(key="view").set_value(from_view).run()
-        self.at.text_input(key="ai-prompt").set_value(description)
+            self.go(from_view)
+        self.go(AI_ROUTE)
+        self.at.text_area(key="ai-prompt").set_value(description)
         self.at.button(key="ai-write").click().run()
 
     def page_text(self):
@@ -127,7 +149,9 @@ class AiEditorTestCase(EditorTestCase):
 class TestTheButton(AiEditorTestCase):
     def test_the_button_and_the_box_are_both_on_the_page(self):
         # `widget_named` does not look at buttons, so this asks for it directly.
-        self.assertIn("AI", self.at.button(key="ai-write").label)
+        # The button no longer has to say "AI" — the card that opens this screen
+        # says it, and the screen is named at the top. It says what it will do.
+        self.assertIn("Write my", self.at.button(key="ai-write").label)
         self.assertIsNotNone(self.widget_named("ai-prompt"))
 
     def test_the_button_says_how_many_chapters_it_will_write(self):
@@ -165,7 +189,7 @@ class TestTheButton(AiEditorTestCase):
         self.assertIn("**(Please type a description of the book to generate)**", label)
 
     def test_the_asking_goes_away_once_something_is_typed(self):
-        self.at.text_input(key="ai-prompt").set_value("a book").run()
+        self.at.text_area(key="ai-prompt").set_value("a book").run()
         self.assertNotIn("Please type", self.at.button(key="ai-write").label)
 
     def test_pressing_it_with_an_empty_box_starts_nothing(self):
@@ -175,14 +199,14 @@ class TestTheButton(AiEditorTestCase):
         self.assertFalse(self.at.exception, self.at.exception)
 
     def test_pressing_it_with_only_spaces_starts_nothing(self):
-        self.at.text_input(key="ai-prompt").set_value("    ")
+        self.at.text_area(key="ai-prompt").set_value("    ")
         self.at.button(key="ai-write").click().run()
         self.assertEqual(self.asked, [])
         self.assertFalse(self.at.exception, self.at.exception)
 
     def test_a_description_and_one_press_is_enough(self):
         """The whole complaint, as a test: type, press once, get a book."""
-        self.at.text_input(key="ai-prompt").set_value("a book about paperclips")
+        self.at.text_area(key="ai-prompt").set_value("a book about paperclips")
         self.at.button(key="ai-write").click().run()
         self.assertEqual(len(self.asked), 1)
         self.assertEqual(self.asked[0]["prompt"], "a book about paperclips")
@@ -227,12 +251,19 @@ class TestTheButtonKeepsUpWithTyping(AiEditorTestCase):
         """
         self.assertIn("if (window.parent.__bindLocked) return;", self.scripts())
 
-    def test_the_box_is_there_on_both_views(self):
-        """It lives above the view radio, so neither view can hide it."""
-        self.at.text_input(key="ai-prompt").set_value("kept").run()
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
-        self.assertEqual(self.box("ai-prompt"), "kept")
-        self.at.radio(key="view").set_value(WRITE_VIEW).run()
+    def test_a_typed_description_survives_leaving_the_screen(self):
+        """It used to live above the view radio, drawn on every run, so nothing
+        could lose it. It has a screen of its own now — which means Streamlit
+        drops its state the moment another screen is drawn, and only
+        `settings.carried` puts it back. A description somebody spent a minute
+        writing must not be the price of a look at the front page.
+        """
+        self.at.text_area(key="ai-prompt").set_value("kept").run()
+        self.go(HOME_ROUTE)
+        self.assertIsNone(self.box("ai-prompt"), "still drawn off its own screen")
+        self.go(CONVERT_VIEW)
+        self.go(WRITE_VIEW)
+        self.go(AI_ROUTE)
         self.assertEqual(self.box("ai-prompt"), "kept")
 
 
@@ -249,17 +280,31 @@ class TestSwitchedOff(EditorTestCase):
             self.addCleanup(patcher.stop)
         super().setUp()
 
-    def test_the_button_is_disabled_and_says_why(self):
-        self.assertTrue(self.at.button(key="ai-write").disabled)
+    def test_the_card_says_so_before_you_go_in(self):
+        """A copy with no key is a perfectly good copy of this app, so the card
+        is switched off and says why rather than vanishing."""
+        self.go(HOME_ROUTE)
+        self.assertTrue(
+            next(b for b in self.at.button if b.key == "bookcard-go-ai").disabled
+        )
         captions = "\n".join(str(element.value) for element in self.at.caption)
-        self.assertIn("switched off", captions)
-        self.assertIn("OPENROUTER_API_KEY", captions)
+        self.assertIn("no API key", captions)
+
+    def test_the_button_is_disabled_and_says_why(self):
+        self.go(AI_ROUTE)
+        self.assertTrue(self.at.button(key="ai-write").disabled)
+        page = "\n".join(
+            str(element.value)
+            for element in list(self.at.info) + list(self.at.caption)
+        )
+        self.assertIn("switched off", page)
+        self.assertIn("OPENROUTER_API_KEY", page)
 
     def test_both_views_still_work(self):
         self.assertFalse(self.at.exception, self.at.exception)
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
         self.assertFalse(self.at.exception, self.at.exception)
-        self.at.radio(key="view").set_value(WRITE_VIEW).run()
+        self.go(WRITE_VIEW)
         self.assertFalse(self.at.exception, self.at.exception)
 
     def test_the_editor_still_saves(self):
@@ -306,24 +351,71 @@ class TestWatchingItBeWritten(AiEditorTestCase):
 
 
 class TestMovingToTheWritingView(AiEditorTestCase):
-    def test_it_moves_you_there_from_the_conversion_view(self):
-        """The whole reason the button sits above the view radio."""
-        self.generate(from_view=CONVERT_VIEW)
-        self.assertEqual(self.state("view"), WRITE_VIEW)
+    """The hand-off, which is the most carefully sequenced thing in the app.
+
+    The move happens **when the book is finished**, not when the button is
+    pressed — and the difference is not cosmetic. The progress bar goes into the
+    slot the button occupied and the words stream into a box beneath it, so both
+    live on the AI screen; a job whose screen stops being drawn hands the runner
+    no slot, and the runner answers a job it cannot find by releasing the lock
+    and rerunning with the work never started and nothing said.
+
+    So the writing keeps this screen for its whole duration, and `collect()`
+    finding a finished book is what moves the user — at the top of the next run,
+    before a single `bk-` widget exists, which is the other thing that has to be
+    true for `adopt` to be allowed to wipe them.
+    """
+
+    def test_the_job_was_claimed_on_the_screen_that_draws_its_slot(self):
+        """`busy_route` is written once, by `claim_job`, and never cleared — so
+        after the book has arrived it still records where the work was pinned.
+        Anything other than the AI screen here means the progress bar and the
+        streaming box were on a screen the run was not drawing, which is the
+        shape of a job the runner silently abandons.
+        """
+        self.generate()
+        self.assertEqual(self.state("busy_route"), AI_ROUTE)
+
+    def test_a_finished_book_moves_you_to_the_editor(self):
+        self.generate()
+        self.assertEqual(self.state("route"), WRITE_VIEW)
         self.assertFalse(self.at.exception, self.at.exception)
 
-    def test_it_leaves_you_there_when_you_were_already(self):
-        self.generate(from_view=WRITE_VIEW)
-        self.assertEqual(self.state("view"), WRITE_VIEW)
+    def test_it_says_where_the_book_on_screen_came_from(self):
+        self.generate()
+        banner = "\n".join(str(element.value) for element in self.at.success)
+        self.assertIn("The Paperclip", banner)
+        # And where to go next, which is the row of download buttons the
+        # writing screen now opens on rather than a numbered step below.
+        self.assertIn("download buttons at the top", banner)
 
-    def test_the_book_arrives_whichever_view_it_was_started_from(self):
+    def test_the_banner_is_said_once_and_then_stops(self):
+        """It describes how the book arrived, which stops being news the moment
+        the writer starts changing it."""
+        self.generate()
+        self.at.text_input(key="bk-title").set_value("Mine now").run()
+        banner = "\n".join(str(element.value) for element in self.at.success)
+        self.assertNotIn("yours now", banner)
+
+    def test_a_failure_leaves_you_where_you_were_with_what_you_typed(self):
+        """Nothing arrived, so there is nothing to move to — and the
+        description is still worth having."""
+        self.result = ai_book.AIError("nope")
+        self.generate(description="a book about hinges")
+        self.assertEqual(self.state("route"), AI_ROUTE)
+        self.assertEqual(self.box("ai-prompt"), "a book about hinges")
+        self.assertTrue(self.at.error)
+
+    def test_the_book_arrives_whichever_screen_it_was_started_from(self):
         self.generate(from_view=CONVERT_VIEW)
         self.assertEqual(self.book.title, "The Paperclip")
+        self.assertEqual(self.state("route"), WRITE_VIEW)
 
 
 class TestKeepingWhatWasThere(AiEditorTestCase):
     def test_a_book_already_saved_is_left_where_it_is(self):
         """Nothing to write, so nothing is written — but it is still findable."""
+        self.in_editor()
         self.type_title_page()
         self.at.text_area(key=self.first_section_key()).set_value("Once upon a time.")
         self.at.button(key="bk-save").click().run()
@@ -343,6 +435,7 @@ class TestKeepingWhatWasThere(AiEditorTestCase):
         as an edit that has not reached the disk — which is the happier case, and
         the one the test above covers.
         """
+        self.in_editor()
         self.at.checkbox(key="bkpref-autosave").set_value(False).run()
         self.type_title_page()
         self.at.button(key="bk-save").click().run()
@@ -359,6 +452,7 @@ class TestKeepingWhatWasThere(AiEditorTestCase):
 
     def test_the_kept_draft_is_named_in_the_message(self):
         """The banner has to say where the book that was on screen went."""
+        self.in_editor()
         self.type_title_page()
         self.at.button(key="bk-save").click().run()
         self.generate()
@@ -372,6 +466,7 @@ class TestKeepingWhatWasThere(AiEditorTestCase):
 
     def test_an_unsaved_book_is_kept_too(self):
         """Never saved is exactly when there is most to lose."""
+        self.in_editor()
         self.at.text_input(key="bk-title").set_value("Nearly Finished")
         self.at.text_area(key=self.first_section_key()).set_value("Some words.")
         self.at.run()
@@ -395,6 +490,7 @@ class TestTheNewBookReachesTheScreen(AiEditorTestCase):
         Setting the manuscript without going through `adopt` leaves every box
         showing the previous book while the model and the PDF hold the new one.
         """
+        self.in_editor()
         self.at.text_input(key="bk-title").set_value("The Old One").run()
         self.generate()
         self.assertTrue(self.told_to_take_a_new_value("bk-title"))
@@ -430,6 +526,7 @@ class TestTheDesignIsLeftAlone(AiEditorTestCase):
         self.assertIsInstance(self.asked[0]["design"], Design)
 
     def test_a_chosen_page_size_survives(self):
+        self.in_editor()
         self.at.selectbox(key="bk-page-size").set_value("A4").run()
         chosen = self.book.design.page_size_name
 
@@ -443,7 +540,7 @@ class TestTheDesignIsLeftAlone(AiEditorTestCase):
 class TestTheWordsTypedWithTheClick(AiEditorTestCase):
     def test_the_description_typed_in_the_same_message_is_the_one_sent(self):
         """The app's signature bug class, in its newest possible home."""
-        self.at.text_input(key="ai-prompt").set_value("a history of glue")
+        self.at.text_area(key="ai-prompt").set_value("a history of glue")
         self.at.button(key="ai-write").click().run()
         self.at.run()
         self.assertEqual(len(self.asked), 1)
@@ -463,11 +560,16 @@ class TestWhenItGoesWrong(AiEditorTestCase):
     def test_the_editor_still_works_afterwards(self):
         self.result = ai_book.AIError("nope")
         self.generate()
+        # A failure leaves you where you were — on the AI screen, with the
+        # description still in the box — so getting back to the editor is a
+        # step the user takes, and so is this test.
+        self.in_editor()
         self.at.text_input(key="bk-title").set_value("Carrying on").run()
         self.assertFalse(self.at.exception, self.at.exception)
         self.assertEqual(self.book.title, "Carrying on")
 
     def test_a_failure_does_not_lose_the_book_that_was_there(self):
+        self.in_editor()
         self.type_title_page()
         self.at.button(key="bk-save").click().run()
         self.result = ai_book.AIError("nope")
@@ -562,8 +664,19 @@ class TestTheDataPolicySaysSo(AiEditorTestCase):
         self.assertEqual(found, list(range(1, 15)))
 
     def test_the_button_carries_its_own_notice(self):
-        captions = "\n".join(str(element.value) for element in self.at.caption)
-        self.assertIn("OpenRouter", captions)
+        """Beside the button, not under the panel.
+
+        This is the one control in the whole app that sends anything anywhere,
+        and the moment to say so is the moment before it is pressed — so it is a
+        warning next to the button rather than a caption below the box.
+        """
+        self.go(AI_ROUTE)
+        notice = "\n".join(
+            str(element.value)
+            for element in list(self.at.warning) + list(self.at.caption)
+        )
+        self.assertIn("OpenRouter", notice)
+        self.assertIn("Nothing else from your session", notice)
 
 
 if __name__ == "__main__":

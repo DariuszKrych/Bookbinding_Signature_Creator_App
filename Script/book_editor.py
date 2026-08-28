@@ -29,6 +29,7 @@ the runner at the foot of `app.py`, under the same lock as a conversion, so the
 page is painted with every control disabled before a single page is typeset.
 """
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from Script.manuscript import (
     LABEL_CHAPTER_WORD,
     LABEL_NONE,
     LABEL_NUMBER,
+    Manuscript,
     Section,
     blank_manuscript,
     clamp_design,
@@ -86,7 +88,6 @@ BOOK = "book_manuscript"
 DRAFT_PATH = "book_draft_path"
 DRAFT_NAME = "book_draft_name"
 SAVED_JSON = "book_saved_json"
-LAST_BUILD = "book_last_build"
 REMOVED = "book_removed_section"
 ARMED_ACTION = "book_armed_action"
 # Two boxes name things after the book's title until the user overrules them.
@@ -96,6 +97,10 @@ DRAFT_NAME_AUTO = "book_draft_name_follows"
 # A book the AI wrote, waiting for the next run to put it on screen. See
 # `hand_over` and `collect`.
 GENERATED = "book_generated"
+
+# Set by `app.py` on the run a written book is collected, so this view can say
+# once where the book on screen came from. Popped when it is said.
+HANDOFF = "ai_handoff"
 
 FIELD_PREFIX = "bk-"
 LENGTH_PREFIX = "bk-len-"
@@ -149,10 +154,8 @@ class Editor:
 
     unit: object
     busy: bool
-    job: object
     sheets_per_signature: int
     finish: object
-    claim_job: object
     arm_delete: object
     confirm_delete: object
     # Keep one of this view's own widgets alive while the other view is on
@@ -165,14 +168,24 @@ class Editor:
     # than worked out here so the path shown on screen is the same one the
     # build will actually use, sanitised in exactly the same way.
     build_path: object
-    # One folder as the bytes of a zip, for a download. Nothing this app holds
-    # is stored, so handing a file to the browser is the only way out of it;
-    # see `Script.workspace.pack_folder`.
-    pack_folder: object
-    # True when the session has no room left to write anything. Building is the
-    # one thing this view does that makes a file, so it is the one thing that
-    # has to go dead when there is nowhere to put it.
+    # The two ways out that have work to do first: `pdf_bytes(book, file_name,
+    # page_size_in)` typesets the book, and `signature_bytes(book, file_name,
+    # page_size_in, sheet_size_pt)` typesets and imposes it. Both hand back
+    # bytes and both are called by Streamlit when a download button is clicked
+    # — off the script run, so neither may draw or touch session state. See
+    # `Script/book_build.py`, and `_take_away_panel` for why it is worth it.
+    pdf_bytes: object = None
+    signature_bytes: object = None
+    # True when the session has no room left to write anything. Only the drafts
+    # go dead on it: a download writes nothing the session keeps, and a full
+    # session is exactly when being able to take your book away matters most.
     full: bool = False
+    # Draws the two folding settings — sheets per signature, and the printer's
+    # duplex setting — into whatever container is open. Handed in rather than
+    # imported because they are shared with the conversion screen under one pair
+    # of keys, and only one of the two screens is ever drawn: `app.py` owns that
+    # arrangement, and this view only has to say where they go.
+    printing_options: object = None
 
 
 # --------------------------------------------------------------------------
@@ -208,7 +221,6 @@ def adopt(book, path=None, name=""):
     # A book that has never been written to disk has no saved copy to compare
     # against, which is what makes `is_dirty` say "not saved yet".
     st.session_state[SAVED_JSON] = book.to_json() if path else ""
-    st.session_state[LAST_BUILD] = None
     st.session_state[REMOVED] = None
     st.session_state[ARMED_ACTION] = None
     st.session_state[FILE_NAME_AUTO] = True
@@ -538,14 +550,71 @@ def _armed_action_strip(actions, editor, book):
 
 
 # --------------------------------------------------------------------------
-# The drafts strip
+# Which book is on screen, and the drafts behind it
 # --------------------------------------------------------------------------
+# These two used to be one panel — "📚 Draft" — at the top of the screen, and
+# that put the app's session bookkeeping above the book. A first visit opened on
+# a draft-name box, a 💾 Save, a Save a copy and an autosave tick, none of which
+# a visitor needs or can be expected to understand: a draft lives in the browser
+# session and is gone when the tab closes, so saving one is a convenience for
+# somebody coming back to the same tab later, not a way of keeping a book.
+#
+# So they are split by who they are for. `_start_panel` is the one question a new
+# arrival might have — which book am I looking at, and can I see an example? —
+# and stays near the top. `_draft_panel` is everything about the session's own
+# store, and sits folded away at the foot, below the writing.
+#
+# Both are still *executed* before any `bk-` field widget, whatever order they
+# are drawn in: loading a draft calls `adopt`, which deletes exactly those keys,
+# and Streamlit will not have a widget's state changed after the widget exists.
+# `render` keeps that straight with containers — see the note there.
+
+
+def _start_panel(editor, book):
+    """New book, the example, and the warning when either would lose words."""
+    actions = {
+        "new": lambda: _show(editor, blank_manuscript(), None, "",
+                             "Started a new, empty book."),
+        "example": lambda: _show(editor, example_manuscript(), None,
+                                 "Example book",
+                                 "Loaded the example book. Type over any of it."),
+    }
+    new_column, example_column, _spare = st.columns([1, 1, 2])
+    _guarded("📄 New book", "new", actions, editor, book, container=new_column,
+             help_text="Empties the editor and starts again.")
+    _guarded("✨ Load the example", "example", actions, editor, book,
+             container=example_column,
+             help_text="A complete book that shows what every field does. "
+                       "It opens as an unsaved draft, so it cannot "
+                       "overwrite anything.")
+    # Drawn here rather than with the drafts list because these are the two
+    # buttons it can be armed by from this panel. `_armed_action_strip` returns
+    # at once when the armed action is not one of the two it is handed, so the
+    # drafts panel's own copy stays quiet while this one is showing and the
+    # warning always appears beside the button that raised it.
+    _armed_action_strip(actions, editor, book)
 
 
 def _draft_panel(editor, book, folder):
-    """Save, load, duplicate and delete drafts: the "keep my progress" half."""
-    with st.container(border=True):
-        st.markdown("#### 📚 Draft")
+    """Save, load, duplicate and delete drafts: the "keep my progress" half.
+
+    Folded shut, and at the foot of the page. None of it is needed to get a book
+    out of this app — the three buttons at the top do that — and a draft is only
+    ever worth anything for as long as this browser session lasts.
+
+    One expander, and no expander inside it: Streamlit refuses to nest them, and
+    the uploader and the drafts list are plain sections in here now. Nothing is
+    hidden behind two clicks that used to be behind one.
+    """
+    with st.expander(
+        "📚 Drafts kept in this browser session — save, reopen, autosave"
+    ):
+        st.caption(
+            "Optional, and only for coming back to this tab: a draft lives on "
+            "the server for as long as the session does and goes with it. To "
+            "**keep** a book, use one of the download buttons at the top of "
+            "the page — **⬇️ Download as JSON** is the one that opens again."
+        )
 
         name_column, save_column, saveas_column = st.columns(
             [3, 1, 1], vertical_alignment="bottom"
@@ -557,7 +626,7 @@ def _draft_panel(editor, book, folder):
                 editor,
                 placeholder="What to call this draft",
                 help="What this draft is called in the list below. It is only "
-                     "a name; the book's own title is set below it. Empty it "
+                     "a name; the book's own title is set in Step 1. Empty it "
                      "to go back to using the title.",
             )
         # An empty box falls back to the book's title, so somebody who types a
@@ -591,61 +660,155 @@ def _draft_panel(editor, book, folder):
                 f"meant to rename."
             )
 
+        # Sticky like the paper settings: a writer who turned autosave off and
+        # then went to look at the conversion tab must not come back to find it
+        # on again, quietly writing over the draft they were keeping.
+        editor.sticky(f"{PREF_PREFIX}autosave", True)
+        autosave = st.checkbox(
+            "Autosave while I type",
+            key=f"{PREF_PREFIX}autosave",
+            disabled=editor.busy,
+            help="Once a draft has been saved once, every later change is "
+                 "written to the same file as you go. Save a copy first if "
+                 "you want to keep a version.",
+        )
+        editor.remember(f"{PREF_PREFIX}autosave")
+
         status = st.empty()   # filled at the very end of `render`
 
-        actions = {
-            "new": lambda: _show(editor, blank_manuscript(), None, "",
-                                 "Started a new, empty book."),
-            "example": lambda: _show(editor, example_manuscript(), None,
-                                     "Example book",
-                                     "Loaded the example book. Type over any of it."),
-        }
-
-        new_column, example_column, folder_column, autosave_column = st.columns(
-            [1, 1, 1, 1.4], vertical_alignment="center"
-        )
-        _guarded("📄 New book", "new", actions, editor, book, container=new_column,
-                 help_text="Empties the editor and starts again.")
-        _guarded("✨ Load the example", "example", actions, editor, book,
-                 container=example_column,
-                 help_text="A complete book that shows what every field does. "
-                           "It opens as an unsaved draft, so it cannot "
-                           "overwrite anything.")
-        # A draft is one plain JSON file, and this hands over the book as it
-        # stands on screen rather than the last version written — saved or not,
-        # what you see is what you get. `data` is the function, not its result,
-        # so the text is produced when the button is clicked and not on every
-        # keystroke that reruns this page.
-        folder_column.download_button(
-            "⬇️ Download this draft", key=f"{FIELD_PREFIX}download-draft",
-            data=lambda: book.to_json(),
-            file_name=f"{save_name}{DRAFT_SUFFIX}",
-            mime="application/json",
-            type="primary", use_container_width=True, disabled=editor.busy,
-            help="This book as one JSON file, exactly as it is on screen. "
-                 "Keep it, or put it back later with **📥 Load my data**.",
-        )
-        with autosave_column:
-            # Sticky like the paper settings: a writer who turned autosave off
-            # and then went to look at the conversion tab must not come back to
-            # find it on again, quietly writing over the draft they were keeping.
-            editor.sticky(f"{PREF_PREFIX}autosave", True)
-            autosave = st.checkbox(
-                "Autosave while I type",
-                key=f"{PREF_PREFIX}autosave",
-                disabled=editor.busy,
-                help="Once a draft has been saved once, every later change is "
-                     "written to the same file as you go. Save a copy first if "
-                     "you want to keep a version.",
-            )
-            editor.remember(f"{PREF_PREFIX}autosave")
+        _draft_upload(editor)
 
         drafts = list_drafts(folder)
-        with st.expander(f"Saved drafts ({len(drafts)})"):
-            _draft_list(editor, book, folder, drafts, actions)
+        st.markdown(f"**📂 This session's drafts ({len(drafts)})**")
+        actions = {}
+        _draft_list(editor, book, folder, drafts, actions)
 
         _armed_action_strip(actions, editor, book)
         return status, autosave, save_name
+
+
+# A draft is kilobytes of JSON. The session's own 100 MB per-file ceiling is
+# four orders of magnitude out for this, and a limit that never refuses anything
+# is not a limit — so this one is sized for the thing it actually guards.
+MAX_DRAFT_BYTES = 8 * 1024 * 1024
+
+
+def _draft_upload(editor):
+    """Bring a downloaded `.book.json` back in.
+
+    The symmetric half of ⬇️ Download as JSON, and for a long time it did not
+    exist: a draft could only come back inside a whole-session zip, which meant
+    the one file the app hands you as *yours* was the one file it would not take
+    back. A test even asserted its absence as a considered decision. It was the
+    wrong one.
+
+    Two details are load-bearing.
+
+    **It lives here, in the draft panel**, which `render` *runs* before
+    `_title_panel` and before any `bk-` field widget exists — whatever order the
+    two are drawn in. Adopting a book deletes exactly those keys, and Streamlit
+    will not have a widget's state changed after the widget has been
+    instantiated. Moving this into a container filled after the title panel
+    would break it in a way that only shows up on the run somebody uses it.
+
+    **It confirms before replacing.** A `file_uploader` fires the moment a file
+    is *picked*, not on a button, so it cannot go through `_guarded` — which is
+    a button and would never see the click. The inline confirmation below is the
+    same shape the workspace zip uses, and it doubles as a preview: the title,
+    the author and the length of what is about to land.
+
+    A bordered container rather than an expander of its own: the whole draft
+    panel is inside one now, and Streamlit refuses to nest them.
+    """
+    round_key = "book_draft_upload_round"
+    upload_round = st.session_state.setdefault(round_key, 0)
+    with st.container(border=True):
+        st.markdown("**📂 Open a .book.json**")
+        # Keyed on the container so the style block in `app.py` can correct the
+        # dropzone's own limit line, and on a round so a picked file is not
+        # handed back — and re-loaded — on every rerun this page does.
+        with st.container(key="draft-uploader"):
+            incoming = st.file_uploader(
+                "Open a book saved from this app",
+                type=["json"],
+                key=f"{PREF_PREFIX}draft-upload-{upload_round}",
+                disabled=editor.busy,
+                label_visibility="collapsed",
+            )
+        if incoming is None:
+            st.caption(
+                "A file this app downloaded, as **⬇️ Download as JSON**. It "
+                "opens unsaved, so it cannot write over anything already here."
+            )
+            return
+
+        book, problem = _read_draft(incoming)
+        if problem:
+            st.error(problem)
+            return
+
+        st.markdown(
+            f"**{book.display_title}**"
+            + (f" — {book.author}" if book.author else "")
+        )
+        st.caption(
+            f"{book.words:,} words · {len(book.sections)} sections · "
+            f"{len(book.chapters)} chapters"
+        )
+        if st.button(
+            "Put this book in the editor",
+            key=f"{PREF_PREFIX}draft-upload-go",
+            type="primary", use_container_width=True, disabled=editor.busy,
+        ):
+            st.session_state[round_key] = upload_round + 1
+            _show(
+                editor, book, None, clean_draft_name(Path(incoming.name).stem),
+                f"Opened “{book.display_title}”. The download buttons at the "
+                "top of the page take it away again.",
+            )
+
+
+def _read_draft(item):
+    """`(Manuscript, problem)` from an uploaded file. One of the two is always None.
+
+    The `isinstance` check is the important line, and it is not paranoia.
+    `Manuscript.from_dict` opens with `data = data if isinstance(data, dict)
+    else {}`, so a JSON *list*, number or string does not raise — it returns a
+    perfectly valid **empty book**, and adopting one of those would silently
+    wipe whatever the user had. `load_draft` guards this for a file on disk;
+    nothing would guard it here.
+    """
+    size = item.size if item.size is not None else len(item.getbuffer())
+    if size > MAX_DRAFT_BYTES:
+        return None, (
+            f"That file is {size / (1024 * 1024):.1f} MB. A book saved by this "
+            f"app is a few kilobytes of text, so this is not one."
+        )
+    try:
+        text = item.getvalue().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None, "That file is not text this app can read."
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None, (
+            "That file is not valid JSON. It has to be one this app saved with "
+            "**⬇️ Download as JSON**."
+        )
+    if not isinstance(data, dict):
+        return None, (
+            "That JSON file is not a book. It has to be one this app saved."
+        )
+    try:
+        book = Manuscript.from_dict(data)
+    except Exception as error:
+        return None, f"That book could not be read: {error}"
+    if not book.has_content() and not book.title.strip():
+        return None, (
+            "There is nothing in that file — no title, and no text in any "
+            "section."
+        )
+    return book, None
 
 
 def _draft_list(editor, book, folder, drafts, actions):
@@ -962,6 +1125,51 @@ For customisation only these things mean anything special:
 # --------------------------------------------------------------------------
 
 
+def save_name_for(book):
+    """What a downloaded copy of `book` is called.
+
+    The name in the draft box when there is one, and the book's own title when
+    there is not — so the file that lands in somebody's downloads folder is
+    called what the thing on screen is called, whichever of the two ways out
+    they took.
+    """
+    typed = st.session_state.get(f"{FIELD_PREFIX}typed-draft-name")
+    return clean_draft_name(typed or st.session_state.get(DRAFT_NAME)
+                            or book.display_title)
+
+
+def _design_summary(book, editor):
+    """One line describing the design, for the head of a panel that is all closed.
+
+    Three expanders that start folded are three expanders somebody has to open
+    before they know what size book they are about to make. This is the answer
+    to that question, written where the question is asked, so opening one is a
+    decision rather than a search.
+
+    Deliberately forgiving: it is a caption, and a caption that raised would take
+    the whole editor down over a line of description.
+    """
+    design = book.design
+    unit = editor.unit
+    try:
+        pages = f"{unit.size_label(design.page_width_in, design.page_height_in)} pages"
+        if design.page_size_name and design.page_size_name != CUSTOM_PAGE_SIZE:
+            pages = f"{design.page_size_name} pages"
+        face = FONTS[design.font_key].label if design.font_key in FONTS else "—"
+        parts = [
+            pages,
+            f"{face} {design.font_size_pt:g} pt",
+            "justified" if design.justify else "ragged right",
+        ]
+        if not design.page_numbers:
+            parts.append("no page numbers")
+        if not design.contents:
+            parts.append("no contents")
+        return " · ".join(parts)
+    except Exception:  # pragma: no cover - a caption must never break the page
+        return "Page size, type and page furniture."
+
+
 def _design_panel(editor, book):
     """The whole look of the book, including how big it is.
 
@@ -973,9 +1181,15 @@ def _design_panel(editor, book):
     unit = editor.unit
 
     with st.container(border=True):
-        st.markdown("#### 📐 Book design")
+        st.markdown("#### Step 2 — Design it")
 
-        with st.expander("Page size and margins", expanded=True):
+        # A live summary of the three panels below, so the whole of the design
+        # can be read at a glance and none of it has to be opened to find out
+        # what size book is about to be made. That is what lets all three start
+        # closed: the defaults already make a real book, and this says which one.
+        st.caption(_design_summary(book, editor))
+
+        with st.expander("📐 Page size and margins"):
             page_size_in, sheet_size_pt = _size_controls(editor, design, unit)
 
             # Read after the controls above, which may have just changed it.
@@ -1022,7 +1236,7 @@ def _design_panel(editor, book):
                 f"**{unit.size_label(built.text_width_in, built.text_height_in)}**"
             )
 
-        with st.expander("Type"):
+        with st.expander("🔠 Type"):
             keys = list(FONTS)
             font_key = design.font_key if design.font_key in keys else keys[0]
             _seed_choice(f"{FIELD_PREFIX}font", font_key, keys)
@@ -1068,7 +1282,7 @@ def _design_panel(editor, book):
                                   "not both. Leave this at 0 if you are using "
                                   "an indent.")
 
-        with st.expander("Structure and page furniture"):
+        with st.expander("📑 Structure and page furniture"):
             starts = (CHAPTER_START_NEW_PAGE, CHAPTER_START_RECTO)
             _seed_choice(f"{FIELD_PREFIX}chapter-start", design.chapter_start, starts)
             start = st.radio(
@@ -1117,6 +1331,18 @@ def _design_panel(editor, book):
             _text("Scene break marker", design, "scene_break", "scene-break",
                   editor,
                   help="What a line of `***` in the text is printed as.")
+
+        # The two settings this screen shares with the conversion screen, drawn
+        # here under the same keys. They belong to the *printing* rather than to
+        # the book, which is why they are apart from the three panels above and
+        # why they survive a trip to the other screen unchanged.
+        if editor.printing_options is not None:
+            with st.expander("⚙️ Advanced paper and printing"):
+                st.caption(
+                    "How the printed sheets are gathered and folded. The same "
+                    "two settings the conversion screen uses."
+                )
+                editor.printing_options()
 
     return page_size_in, sheet_size_pt
 
@@ -1191,7 +1417,19 @@ def _sheet_menu(editor, unit):
     )
     editor.remember(SHEET_LANDSCAPE_KEY)
 
-    width_in, height_in = find_paper_size(chosen).size_in(landscape)
+    return paper_from_sheet(chosen, landscape)
+
+
+def paper_from_sheet(name, landscape=True):
+    """`(page_size_in, sheet_size_pt)` for one named sheet.
+
+    The rule this whole screen turns on, written once: a sheet is folded across
+    its width, so a book page is half a sheet wide and a full sheet tall. The
+    menu above returns this, and it is what the download buttons are handed —
+    so anything that has to say what a chosen sheet means asks here rather than
+    doing the halving again.
+    """
+    width_in, height_in = find_paper_size(name).size_in(landscape)
     return (
         (width_in / 2, height_in),
         (width_in * PT_PER_INCH, height_in * PT_PER_INCH),
@@ -1302,172 +1540,189 @@ def _paper_for(editor, design, page_size_in, sheet_size_pt):
     )
 
 
-def _build_panel(editor, book, page_size_in, sheet_size_pt):
-    job = editor.job
-    unit = editor.unit
-    with st.container(border=True):
-        st.markdown("#### 📖 Build the book")
+def _figures(book, page_size_in, editor):
+    """One line: how long the book is and roughly what it comes to on paper.
 
-        pages = estimate_book_pages(book, page_size_in)
-        chapters = len(book.chapters)
-        first, second, third = st.columns(3)
-        first.metric("Words", f"{book.words:,}")
-        second.metric("Chapters", chapters)
-        third.metric("Book pages", f"≈ {pages}" if pages else "0")
-        if pages:
-            try:
-                plans = plan_signatures(pages, editor.sheets_per_signature)
-            except ValueError:
-                plans = []
-            if plans:
-                sheets = sum(plan.sheets for plan in plans)
-                st.caption(
-                    f"About **{len(plans)} {_plural(len(plans), 'signature')}** "
-                    f"on {sheets} {_plural(sheets, 'sheet')} of paper, at the "
-                    f"sheets per signature set in the sidebar. These are "
-                    f"estimates; the exact figures come from the built PDF."
-                )
-
-        # The same two sizes, worded the same way, as the card on a book waiting
-        # to be converted: what to put in the printer, and what comes out.
-        fit, problems, notes = _paper_for(
-            editor, book.design, page_size_in, sheet_size_pt
-        )
-        if fit is not None:
-            st.markdown(
-                f"**Paper to load in the printer:** "
-                f"{describe_size(*fit.sheet_size_in, unit)}\n\n"
-                f"**Each page of the finished book:** "
-                f"{unit.size_label(*fit.book_page_size_in)}"
+    Drawn under the three buttons, where it answers "what am I about to get?"
+    without anything having to be opened. Deliberately forgiving — it is a
+    caption, and the estimate is labelled as one everywhere it appears.
+    """
+    pages = estimate_book_pages(book, page_size_in)
+    parts = [f"**{book.words:,}** words",
+             f"**{len(book.chapters)}** {_plural(len(book.chapters), 'chapter')}"]
+    if pages:
+        parts.append(f"≈ **{pages}** book pages")
+        try:
+            plans = plan_signatures(pages, editor.sheets_per_signature)
+        except ValueError:
+            plans = []
+        if plans:
+            sheets = sum(plan.sheets for plan in plans)
+            parts.append(
+                f"≈ **{len(plans)} {_plural(len(plans), 'signature')}** on "
+                f"{sheets} {_plural(sheets, 'sheet')} of paper"
             )
-            # No talk of scaling on the ordinary path, because there is none to
-            # talk about: the type goes into the PDF at its finished size,
-            # whatever paper that is. It is said only in the one case where the
-            # book cannot be set at the sheet's size — a sheet so small that the
-            # page size is clamped — and then it is worth saying.
-            if fit.is_resized:
-                st.caption(
-                    f"Scaled to **{fit.scale * 100:.1f}%**: this sheet is "
-                    f"smaller than the smallest page a book can be set at. "
-                    f"Print at 100% / “Actual size”."
+    return " · ".join(parts)
+
+
+def _take_away_panel(editor, book, page_size_in, sheet_size_pt):
+    """The three ways out, at the top of the screen with nothing above them.
+
+    All three are `st.download_button`s, including the two that have real work
+    to do first. Streamlit calls a download button's `data` when the button is
+    *clicked*, so "make the PDF" and "download the PDF" are one action: the book
+    is typeset — and, for the signatures, imposed — inside that call, and the
+    bytes go straight to the browser.
+
+    It used to be two "📄 Create…" buttons at the foot of the right-hand column.
+    They wrote files into the session and then offered a *second* button to
+    fetch them, which put the one thing a writer came here for behind two clicks
+    and a scroll, underneath a drafts panel that is machinery for people who
+    already know the app. The order is the other way round now: the three files
+    at the top, and the session's own store folded away at the foot.
+
+    Two things are given up for that single click, and both are worth saying.
+    The build runs off the script run (see `Script/book_build.py`), so there is
+    no progress bar, and a failure arrives as a failed download rather than as a
+    banner on the page. Typesetting a book is seconds of work; two clicks and a
+    scroll to earn a progress bar was the wrong trade.
+
+    Nothing here is gated on `editor.full`. These downloads write nothing the
+    session keeps, and a session with no room left is exactly when being able to
+    take your book away matters most.
+    """
+    unit = editor.unit
+    empty = not book.has_content()
+    # The same three answers the conversion screen gets for a PDF: what fits,
+    # what will not, and what is worth a word of warning.
+    fit, problems, notes = _paper_for(
+        editor, book.design, page_size_in, sheet_size_pt
+    )
+
+    with st.container(border=True, key="takeaway"):
+        st.markdown("#### ⬇️ Take your book away")
+        st.caption(
+            "Nothing is kept on the server. Each button makes the file and "
+            "hands it straight to your browser."
+        )
+        # Filled at the end of this function, so the three buttons sit here —
+        # above the details — while still being drawn after the box that names
+        # them.
+        buttons = st.container()
+
+        with st.expander("What these files are called, and the paper they are for"):
+            file_name = _auto_box(
+                "Name the files", "file-name", FILE_NAME_AUTO,
+                book.title.strip() or "Untitled book", editor,
+                help="What the PDF and the zip of signatures are called when "
+                     "they reach your computer. Empty it to go back to using "
+                     "the book's title.",
+            )
+            st.caption(f"→ `{editor.build_path(file_name).name}`")
+
+            # The same two sizes, worded the same way, as the card on a book
+            # waiting to be converted: what to put in the printer, and what
+            # comes out.
+            if fit is not None:
+                st.markdown(
+                    f"**Paper to load in the printer:** "
+                    f"{describe_size(*fit.sheet_size_in, unit)}\n\n"
+                    f"**Each page of the finished book:** "
+                    f"{unit.size_label(*fit.book_page_size_in)}"
+                )
+                # No talk of scaling on the ordinary path, because there is none
+                # to talk about: the type goes into the PDF at its finished
+                # size, whatever paper that is. It is said only in the one case
+                # where the book cannot be set at the sheet's size — a sheet so
+                # small that the page size is clamped — and then it is worth
+                # saying.
+                if fit.is_resized:
+                    st.caption(
+                        f"Scaled to **{fit.scale * 100:.1f}%**: this sheet is "
+                        f"smaller than the smallest page a book can be set at. "
+                        f"Print at 100% / “Actual size”."
+                    )
+                else:
+                    st.caption(
+                        "Set at this size, so nothing is scaled and no "
+                        "sharpness is lost. Chosen under **Step 2 — Design "
+                        "it**, in 📐 Page size and margins."
+                    )
+            for note in notes:
+                st.caption(f"ℹ️ {note}")
+
+        pdf_name = editor.build_path(file_name).name
+        stem = Path(pdf_name).stem
+
+        with buttons:
+            json_column, pdf_column, signature_column = st.columns(3)
+
+            # The editable copy first: it costs nothing, it needs no paper
+            # decision, and it is the only one of the three that can be brought
+            # back in. Somebody who has typed for an hour and wants to stop
+            # should be able to keep their work with one click.
+            json_column.download_button(
+                "⬇️ Download as JSON",
+                # `data` is the function, not its result, so the text is
+                # produced when the button is clicked and not on every keystroke
+                # that reruns this page. It hands over the book as it stands on
+                # screen rather than the last version written — saved or not,
+                # what you see is it.
+                data=lambda: book.to_json(),
+                file_name=f"{save_name_for(book)}{DRAFT_SUFFIX}",
+                mime="application/json",
+                key=f"{FIELD_PREFIX}download-json",
+                type="primary", use_container_width=True,
+                disabled=empty or editor.busy,
+                help="The book exactly as it is on screen, as one file. Open it "
+                     "again with 📂 Open a .book.json at the foot of this "
+                     "screen — this is the only format that comes back in.",
+            )
+
+            pdf_column.download_button(
+                "⬇️ Download as PDF",
+                data=lambda: editor.pdf_bytes(book, file_name, page_size_in),
+                file_name=pdf_name,
+                mime="application/pdf",
+                key=f"{FIELD_PREFIX}download-pdf",
+                type="primary", use_container_width=True,
+                disabled=empty or editor.busy or editor.pdf_bytes is None,
+                help="Typesets the book and downloads it — two book pages to a "
+                     "sheet, set at the size in Step 2. Print it as it is, or "
+                     "put it through 📄 I have a PDF book to fold it into "
+                     "signatures.",
+            )
+
+            signature_column.download_button(
+                "⬇️ Download as signatures",
+                data=lambda: editor.signature_bytes(
+                    book, file_name, page_size_in, sheet_size_pt
+                ),
+                file_name=f"{stem}.zip",
+                mime="application/zip",
+                key=f"{FIELD_PREFIX}download-signatures",
+                type="primary", use_container_width=True,
+                # Gated on the paper as well, unlike the two beside it: this one
+                # goes on to impose, and a sheet the book will not fit is the
+                # one thing that stops an imposition. The PDF is still offered,
+                # because that half would have worked.
+                disabled=(empty or editor.busy or bool(problems)
+                          or editor.signature_bytes is None),
+                help="Typesets the book, folds it into signatures and downloads "
+                     "them as one zip — every signature file in print order, "
+                     "with the note saying how to print and fold them. Uses "
+                     "the folding settings in ⚙️ Advanced paper and printing.",
+            )
+
+            if empty:
+                st.info(
+                    "Nothing to take away yet. Give the book a title, or type "
+                    "something into one of the sections below."
                 )
             else:
-                st.caption(
-                    "Set at this size, so nothing is scaled and no sharpness is "
-                    "lost. Chosen under **Page size and margins**, above."
-                )
-        if notes:
-            with st.expander(f"Notes on the paper ({len(notes)})"):
-                for note in notes:
-                    st.markdown(f"- {note}")
-        for problem in problems:
-            st.error(problem)
-
-        file_name = _auto_box(
-            "Build it as", "file-name", FILE_NAME_AUTO,
-            book.title.strip() or "Untitled book", editor,
-            help="What the built PDF is called. Building again replaces the "
-                 "PDF this editor wrote under that name, and never one you "
-                 "uploaded yourself. Empty it to go back to using the book's "
-                 "title.",
-        )
-        st.caption(f"→ `{editor.build_path(file_name).name}`")
-
-        pending = None
-        empty = not book.has_content()
-        if empty:
-            st.info(
-                "Nothing to build yet. Give the book a title, or type something "
-                "into one of the sections."
-            )
-        if editor.full:
-            st.warning(
-                "This session is full, so there is nowhere to put a built book. "
-                "Save your data and delete something, or start again with "
-                "🗑 Delete my data now.",
-                icon="🚫",
-            )
-
-        building = job == ("typeset", "build")
-        build_slot = st.empty()
-        if build_slot.button(
-            "Building…" if building else "📄 Create the book PDF",
-            key=f"{FIELD_PREFIX}build", use_container_width=True,
-            disabled=empty or editor.busy or editor.full,
-            help="Typesets the book into a PDF, where it appears in "
-                 "“Available for conversion” like any other.",
-        ):
-            editor.claim_job(("typeset", "build"))
-        if building:
-            pending = {"kind": "typeset", "slot": build_slot,
-                       "manuscript": book, "file_name": file_name,
-                       "page_size_in": page_size_in}
-
-        signing = job == ("typeset", "signatures")
-        sign_slot = st.empty()
-        if sign_slot.button(
-            "Working…" if signing else "✂️ Create the signatures",
-            key=f"{FIELD_PREFIX}build-convert", type="primary",
-            # Gated on the paper as well, unlike the button above it: this one
-            # goes on to impose, and a sheet the book will not fit is the one
-            # thing that stops a conversion. Building the PDF is still offered,
-            # because that half would have worked.
-            use_container_width=True,
-            disabled=empty or editor.busy or editor.full or bool(problems),
-            help="Typesets the book and imposes it in one go, using the size in "
-                 "**📐 Book design** and the folding settings in the sidebar.",
-        ):
-            editor.claim_job(("typeset", "signatures"))
-        if signing:
-            pending = {"kind": "typeset_convert", "slot": sign_slot,
-                       "manuscript": book, "file_name": file_name,
-                       "page_size_in": page_size_in,
-                       # The paper this tab chose, carried to the imposition:
-                       # the job runner is shared with the conversion tab and
-                       # only one of the two is ever on screen.
-                       "sheet_size_pt": sheet_size_pt, "scale_mode": FIT}
-
-        _last_build_note(editor)
-        return pending
-
-
-def _last_build_note(editor=None):
-    built = st.session_state.get(LAST_BUILD)
-    if not built:
-        return
-    st.success(
-        f"Last build: **{built['name']}**, {built['book_pages']} book pages on "
-        f"{built['source_pages']} sheet-sides, {built['words']:,} words.",
-        icon="📖",
-    )
-    # The signatures themselves, when this build made any. This view has no
-    # “Ready to print” panel of its own, and a finished set of files nobody can
-    # get hold of is not a finished job.
-    folder = built.get("output_folder")
-    if folder and editor is not None and Path(folder).is_dir():
-        name = Path(folder).name
-        st.download_button(
-            "⬇️ Download the signatures", key=f"{FIELD_PREFIX}download-built",
-            data=lambda target=folder, label=name: editor.pack_folder(target, label),
-            file_name=f"{name}.zip",
-            mime="application/zip",
-            use_container_width=True, disabled=editor.busy,
-            help="Every signature file for this build, in print order, with "
-                 "its printing notes, as one zip.",
-        )
-    for note in built.get("notes", ()):
-        st.warning(note, icon="ℹ️")
-
-
-def remember_build(result, name, extra=(), output_folder=None):
-    st.session_state[LAST_BUILD] = {
-        "name": name,
-        "source_pages": result.source_pages,
-        "book_pages": result.book_pages,
-        "words": result.words,
-        "notes": list(result.notes) + list(extra),
-        "output_folder": str(output_folder) if output_folder else "",
-    }
+                st.caption(_figures(book, page_size_in, editor))
+            for problem in problems:
+                st.error(problem)
 
 
 # --------------------------------------------------------------------------
@@ -1476,7 +1731,14 @@ def remember_build(result, name, extra=(), output_folder=None):
 
 
 def render(editor, folder):
-    """Draw the whole editor. Returns the job it claimed, if it claimed one."""
+    """Draw the whole editor.
+
+    Claims nothing and returns nothing. It used to hand back a long job for the
+    runner at the foot of `app.py` to perform — building the PDF, imposing it —
+    and there is none to hand back any more: the two buttons that did that are
+    download buttons now, and they do their work inside the click. See
+    `_take_away_panel`.
+    """
     book = manuscript()
 
     # Measurements are keyed per unit; when the unit changes the old keys have
@@ -1487,26 +1749,65 @@ def render(editor, folder):
             del st.session_state[key]
         st.session_state[f"{PREF_PREFIX}unit"] = editor.unit.name
 
-    # No heading of its own: the tab this view is on is named at the top of the
-    # page, and repeating it here was the same line twice on one screen.
-    status_slot, autosave, save_name = _draft_panel(editor, book, folder)
+    # The banner for a book that has just been written by a model. Popped rather
+    # than read, so it says so once and then stops — it describes how the book
+    # arrived, which stops being news the moment the user starts editing it.
+    if st.session_state.pop(HANDOFF, False):
+        st.success(
+            f"**{book.display_title}** is yours now — {len(book.chapters)} "
+            f"chapters, {book.words:,} words. Read it, change anything you "
+            "like, and take it away with the download buttons at the top of "
+            "this screen. Nothing is saved yet.",
+            icon="🤖",
+        )
 
-    writing, design = st.columns([2, 1], gap="large")
+    # Four slots, because where a panel is *drawn* and where it is *run* have to
+    # be settled separately, and this is the one place that knows both.
+    #
+    # Drawn, top to bottom: the three downloads, then New book / the example,
+    # then the writing and the design, then the drafts store.
+    #
+    # Run, in this order: `_start_panel` and `_draft_panel` first, because both
+    # can adopt a different book — and `adopt` deletes every `bk-` key, which
+    # Streamlit will not have done after those widgets exist. Then the boxes.
+    # Then the downloads last, so the name box and the paper they describe are
+    # read after every keystroke of this run has reached the manuscript.
+    #
+    # Creating a container reserves its place on the page; filling it later puts
+    # the content there rather than where the code is. Reordering these four
+    # lines is therefore a layout change, and moving `_draft_panel` out of the
+    # first two `with` blocks is a bug of the kind that only shows up on the run
+    # somebody opens a draft.
+    away_slot = st.container()
+    start_slot = st.container()
+    writing_slot = st.container()
+    drafts_slot = st.container()
 
-    with writing:
-        _title_panel(editor, book)
+    with start_slot:
+        _start_panel(editor, book)
 
-        numbers = numbered_sections(book)
-        for part, heading, keys, blurb in PARTS:
-            _sections_panel(editor, book, part, heading, keys, blurb, numbers)
-        _formatting_note()
+    with drafts_slot:
+        status_slot, autosave, save_name = _draft_panel(editor, book, folder)
 
-    with design:
-        page_size_in, sheet_size_pt = _design_panel(editor, book)
-        pending = _build_panel(editor, book, page_size_in, sheet_size_pt)
+    with writing_slot:
+        st.markdown("#### Step 1 — Write it")
+        writing, design = st.columns([2, 1], gap="large")
+
+        with writing:
+            _title_panel(editor, book)
+
+            numbers = numbered_sections(book)
+            for part, heading, keys, blurb in PARTS:
+                _sections_panel(editor, book, part, heading, keys, blurb, numbers)
+            _formatting_note()
+
+        with design:
+            page_size_in, sheet_size_pt = _design_panel(editor, book)
+
+    with away_slot:
+        _take_away_panel(editor, book, page_size_in, sheet_size_pt)
 
     _finish_status(status_slot, editor, book, folder, autosave, save_name)
-    return pending
 
 
 def _finish_status(slot, editor, book, folder, autosave, save_name):

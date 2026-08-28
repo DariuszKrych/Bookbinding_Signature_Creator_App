@@ -33,7 +33,7 @@ from streamlit.testing.v1 import AppTest  # noqa: E402
 
 import main  # noqa: E402
 
-from Script import workspace  # noqa: E402
+from Script import book_build, book_editor, workspace  # noqa: E402
 from Script.book_editor import (  # noqa: E402
     MAX_BOX_HEIGHT_PX,
     MIN_BOX_HEIGHT_PX,
@@ -52,6 +52,8 @@ APP = Path(__file__).resolve().parent.parent / "app.py"
 
 WRITE_VIEW = "write"
 CONVERT_VIEW = "convert"
+HOME_ROUTE = "home"
+AI_ROUTE = "ai"
 
 # Every box on the title page, and something to type into it.
 TITLE_PAGE = {
@@ -92,9 +94,20 @@ class EditorTestCase(unittest.TestCase):
 
         self.at = AppTest.from_file(str(APP), default_timeout=180)
         self.at.run()
-        self.at.radio(key="view").set_value(WRITE_VIEW).run()
-        self.assertFalse(self.at.exception, self.at.exception)
+        self.go(WRITE_VIEW)
         self.drafts = main.MANUSCRIPT_DIR
+
+    def go(self, route):
+        """Move to another screen the way the app does, and run.
+
+        The route is a plain session-state key rather than a widget's, which is
+        what lets the app assign it from anywhere — and what lets a test write it
+        directly instead of hunting for the control that would have set it.
+        """
+        self.at.session_state["route"] = route
+        self.at.run()
+        self.assertFalse(self.at.exception, self.at.exception)
+        return self.at
 
     # ---- reading the app -------------------------------------------------
     @property
@@ -539,26 +552,116 @@ class TestSavingAndNaming(EditorTestCase):
 
 
 class TestTheDraftsPanel(EditorTestCase):
-    def test_a_draft_leaves_by_download_because_nothing_here_is_kept(self):
+    def test_a_draft_leaves_by_download_and_comes_back_the_same_way(self):
         """No button onto a folder: there is no folder anyone can be shown.
 
-        The app holds a draft only while the tab is open, so the way to keep
-        one is to be handed the file. There is no uploader beside it either —
-        a draft comes back in through **📥 Load my data** with everything else,
-        which is one route rather than two that half overlap.
+        The app holds a draft only while the tab is open, so the way to keep one
+        is to be handed the file — and, now, to hand it back. This test used to
+        assert the *opposite* of its second half: that there was deliberately no
+        uploader here, because a draft came back inside the whole-session zip and
+        that was "one route rather than two that half overlap".
+
+        It was the wrong call. It made the one file the app hands you as *yours*
+        the one file it would not take back, and it left the card that offers to
+        "load JSON to continue editing" unable to.
         """
         keys = [button.key for button in self.at.button]
         self.assertNotIn("bk-open-folder", keys)
-        self.assertFalse([key for key in keys
-                          if str(key).startswith("bk-upload")])
-        self.assertIn("bk-download-draft",
+        self.assertIn("bk-download-json",
                       [button.key for button in self.at.download_button])
+        self.assertTrue(
+            [box.key for box in self.at.file_uploader
+             if str(box.key).startswith("bkpref-draft-upload")],
+            "no way to open a downloaded draft",
+        )
 
+    def test_the_book_leaves_from_one_place_rather_than_two(self):
+        """It used to leave as JSON from the draft strip at the top and as a PDF
+        or signatures from the foot of the page — the same three outcomes the
+        card promises, split across two panels, one of them under another name.
+        """
+        downloads = [button.key for button in self.at.download_button]
+        self.assertNotIn("bk-download-draft", downloads)
+        self.assertIn("bk-download-json", downloads)
+
+
+class TestReadingAnUploadedDraft(unittest.TestCase):
+    """`_read_draft` on its own — the parsing, without a browser around it.
+
+    A `file_uploader` cannot be driven by `AppTest`, and this is the half worth
+    testing anyway: what happens when the file is not what it claims to be.
+    """
+
+    class Upload:
+        """The two attributes `_read_draft` uses off an uploaded file."""
+
+        def __init__(self, text, name="A book.book.json"):
+            self._data = text.encode("utf-8") if isinstance(text, str) else text
+            self.name = name
+            self.size = len(self._data)
+
+        def getvalue(self):
+            return self._data
+
+        def getbuffer(self):
+            return self._data
+
+    def read(self, text, **kwargs):
+        return book_editor._read_draft(self.Upload(text, **kwargs))
+
+    def test_a_book_this_app_saved_comes_back_whole(self):
+        original = Manuscript(title="The Paperclip", author="M. Quire")
+        book, problem = self.read(original.to_json())
+        self.assertIsNone(problem)
+        self.assertEqual(book.title, "The Paperclip")
+        self.assertEqual(book.author, "M. Quire")
+
+    def test_a_json_list_is_refused_rather_than_silently_emptying_the_editor(self):
+        """The landmine this guard exists for.
+
+        `Manuscript.from_dict` opens with `data = data if isinstance(data, dict)
+        else {}` — so a JSON list does not raise, it returns a perfectly valid
+        **empty book**. Adopting one of those would wipe whatever the writer had,
+        with no error anywhere and nothing to undo it.
+        """
+        book, problem = self.read('[{"title": "Not a book"}]')
+        self.assertIsNone(book)
+        self.assertIn("not a book", problem)
+
+        for text in ('"a string"', "42", "null", "true"):
+            book, problem = self.read(text)
+            self.assertIsNone(book, text)
+            self.assertIsNotNone(problem, text)
+
+    def test_text_that_is_not_json_is_refused(self):
+        book, problem = self.read("Once upon a time there was a book.")
+        self.assertIsNone(book)
+        self.assertIn("not valid JSON", problem)
+
+    def test_an_empty_book_is_refused(self):
+        book, problem = self.read(Manuscript().to_json())
+        self.assertIsNone(book)
+        self.assertIn("nothing in that file", problem)
+
+    def test_something_far_too_big_to_be_a_book_is_refused(self):
+        book, problem = self.read("x" * (book_editor.MAX_DRAFT_BYTES + 1))
+        self.assertIsNone(book)
+        self.assertIn("not one", problem)
+
+    def test_a_byte_order_mark_does_not_stop_it(self):
+        """Some editors write one. `load_draft` reads round it, so this must."""
+        text = Manuscript(title="Marked").to_json()
+        book, problem = self.read("﻿" + text)
+        self.assertIsNone(problem)
+        self.assertEqual(book.title, "Marked")
+
+
+class TestTheDraftDownload(EditorTestCase):
     def test_the_download_hands_over_the_book_as_it_is_on_screen(self):
         """Not the last version written: saved or not, what you see is it."""
         self.at.text_input(key="bk-title").set_value("Typed, never saved").run()
         download = [button for button in self.at.download_button
-                    if button.key == "bk-download-draft"][0]
+                    if button.key == "bk-download-json"][0]
         self.assertIn("Typed, never saved", self.book.to_json())
         self.assertTrue(download.label.startswith("⬇️"))
 
@@ -635,6 +738,44 @@ class TestSectionsPanel(EditorTestCase):
 # --------------------------------------------------------------------------
 
 
+class TestTheDesignSummary(EditorTestCase):
+    """All three design panels start closed, so one line has to say what is in
+    them — otherwise finding out what size book you are about to make costs a
+    click, and a first-timer has no reason to spend it."""
+
+    def summary(self):
+        for caption in self.at.caption:
+            text = str(caption.value)
+            if " pt" in text and "·" in text:
+                return text
+        return ""
+
+    def test_it_names_the_page_size_the_typeface_and_the_setting(self):
+        line = self.summary()
+        self.assertIn("A5", line)
+        self.assertIn("10.5 pt", line)
+        self.assertIn("justified", line)
+
+    def test_it_follows_what_the_panels_are_changed_to(self):
+        self.at.selectbox(key="bk-page-size").set_value("US trade").run()
+        self.at.checkbox(key="bk-justify").set_value(False).run()
+        line = self.summary()
+        self.assertIn("US trade", line)
+        self.assertIn("ragged right", line)
+
+    def test_the_panels_underneath_it_all_start_closed(self):
+        """The defaults already make a real book."""
+        design = ("📐 Page size and margins", "🔠 Type",
+                  "📑 Structure and page furniture")
+        found = {
+            panel.proto.label: panel.proto.expanded
+            for panel in self.at.expander
+            if panel.proto.label in design
+        }
+        self.assertEqual(sorted(found), sorted(design), "a panel is missing")
+        self.assertEqual([label for label, open_ in found.items() if open_], [])
+
+
 class TestDesignPanel(EditorTestCase):
     def test_choosing_a_page_size_sets_both_measurements(self):
         self.at.selectbox(key="bk-page-size").set_value("US trade").run()
@@ -680,7 +821,23 @@ class TestDesignPanel(EditorTestCase):
 # --------------------------------------------------------------------------
 
 
-class TestBuilding(EditorTestCase):
+class TestTakingTheBookAway(EditorTestCase):
+    """The three download buttons, and the files the two working ones build.
+
+    All three are `st.download_button`s whose `data` is a callable, so the PDF
+    and the signatures are made *inside the click* rather than by a job that
+    writes a file and then offers a second button to fetch it. That is one click
+    instead of two, and it leaves nothing on the server — but it also means
+    `AppTest` cannot press them: Streamlit hands a callable `data` to its media
+    file manager, which only exists behind a real runtime.
+
+    So the two halves are tested separately. Through the app: that the buttons
+    are there, at the top, labelled and gated correctly. Directly: that
+    `Script.book_build`, given the manuscript the app is holding and the paper
+    its menu chose, produces a real book. Between them sits one line in
+    `book_editor._take_away_panel` and one in `app.py`.
+    """
+
     def a_book(self):
         self.at.text_input(key="bk-title").set_value("Bound At Home")
         self.at.text_input(key="bk-author").set_value("A. Writer")
@@ -690,42 +847,140 @@ class TestBuilding(EditorTestCase):
         )
         self.at.run()
 
-    def test_the_build_button_writes_a_pdf_into_input(self):
+    # ---- standing where the download button stands ------------------------
+    def scratch(self):
+        """The folder the app builds a download in, worked out its way."""
+        return workspace.scratch_root({"Input": main.INPUT_DIR})
+
+    def paper(self, sheet=None, landscape=True):
+        """`(page_size_in, sheet_size_pt)`, as the size menu would return them.
+
+        `None` for the book's own page size, which is what the menu returns
+        while the size is being given from that end.
+        """
+        if sheet is None:
+            return None, None
+        return book_editor.paper_from_sheet(sheet, landscape)
+
+    def download_pdf(self, name="Bound At Home", sheet=None):
+        page_size_in, _sheet_pt = self.paper(sheet)
+        return book_build.pdf_bytes(self.book, name, page_size_in, self.scratch())
+
+    def download_signatures(self, name="Bound At Home", sheet=None):
+        page_size_in, sheet_size_pt = self.paper(sheet)
+        return book_build.signature_bytes(
+            self.book, name, page_size_in, self.scratch(),
+            sheet_size_pt=sheet_size_pt,
+        )
+
+    def pages_of(self, data):
+        return pypdf.PdfReader(io.BytesIO(data)).pages
+
+    # ---- the buttons ------------------------------------------------------
+    def test_all_three_ways_out_are_offered_together(self):
+        """The card promises "a PDF book, signatures for printing or JSON".
+        All three are downloads now, and all three are on one row."""
         self.a_book()
-        self.at.button(key="bk-build").click().run()
-        self.assertFalse(self.at.exception, self.at.exception)
+        downloads = [b.key for b in self.at.download_button]
+        self.assertIn("bk-download-json", downloads)        # the editable copy
+        self.assertIn("bk-download-pdf", downloads)         # the PDF
+        self.assertIn("bk-download-signatures", downloads)  # the signatures
 
-        built = main.INPUT_DIR / "Bound At Home.pdf"
-        self.assertTrue(built.is_file())
-        self.assertTrue(built.read_bytes().startswith(b"%PDF"))
-        self.assertIn(built, main.list_available_books())
-        # The lock is released and the last-build note is on the page.
-        self.assertIsNone(self.state("busy_job"))
-        self.assertIsNotNone(self.state("book_last_build"))
+        # And nothing is called "create" any more: the two buttons that wrote a
+        # file into the session and left it there are gone.
+        buttons = [b.key for b in self.at.button]
+        self.assertNotIn("bk-build", buttons)
+        self.assertNotIn("bk-build-convert", buttons)
 
-    def test_the_signatures_button_goes_all_the_way_to_output(self):
+    def test_the_three_downloads_come_before_the_writing(self):
+        """The point of the panel, and the one thing the container order in
+        `render` exists to do. They used to be at the foot of the right-hand
+        column, under the design and under a drafts panel — which is the last
+        place a first-time visitor looks."""
         self.a_book()
-        self.at.button(key="bk-build-convert").click().run()
-        self.assertFalse(self.at.exception, self.at.exception)
+        headings = [str(block.value) for block in self.at.markdown
+                    if str(block.value).startswith("####")]
+        away = next(i for i, text in enumerate(headings) if "Take your book away" in text)
+        write = next(i for i, text in enumerate(headings) if "Step 1" in text)
+        drafts = [i for i, text in enumerate(headings) if "Draft" in text]
+        self.assertLess(away, write, headings)
+        # And the session's own store is below the writing, not above it.
+        self.assertTrue(all(index > write for index in drafts), headings)
 
-        ready = main.list_ready_books()
-        self.assertEqual([book.name for book in ready], ["Bound At Home"])
-        self.assertTrue(ready[0].signatures)
-        for signature in ready[0].signatures:
-            self.assertTrue(signature.read_bytes().startswith(b"%PDF"))
-        self.assertIsNone(self.state("busy_job"))
+    def test_a_book_with_nothing_in_it_cannot_be_taken_away(self):
+        for key in ("bk-download-json", "bk-download-pdf", "bk-download-signatures"):
+            self.assertTrue(self.at.download_button(key=key).disabled, key)
 
-    def test_a_book_with_nothing_in_it_cannot_be_built(self):
-        for key in ("bk-build", "bk-build-convert"):
-            button = self.at.button(key=key)
-            self.assertTrue(button.disabled, key)
+    def test_the_name_typed_after_a_save_is_the_one_the_downloads_use(self):
+        """The save reruns from the top of the page and never redraws the name
+        box, and Streamlit throws away the state of every widget the interrupted
+        run did not reach."""
+        self.a_book()
+        self.at.text_input(key="bk-file-name").set_value("Print version 2").run()
+        self.at.button(key="bk-save").click().run()
 
-    def test_the_title_typed_with_the_click_is_the_book_that_gets_built(self):
-        # The build buttons sit below every box, so this has always worked —
-        # it is here so that it keeps working if the panels are ever reordered.
-        self.at.text_input(key="bk-title").set_value("Named At The Last Moment")
-        self.at.button(key="bk-build").click().run()
-        self.assertTrue((main.INPUT_DIR / "Named At The Last Moment.pdf").is_file())
+        self.assertEqual(self.box("bk-file-name"), "Print version 2")
+        self.assertIn("→ `Print version 2.pdf`",
+                      [caption.value for caption in self.at.caption])
+
+    # ---- what the buttons build -------------------------------------------
+    def test_the_pdf_download_hands_over_a_real_book(self):
+        self.a_book()
+        data = self.download_pdf()
+        self.assertTrue(data.startswith(b"%PDF"))
+        self.assertGreater(len(self.pages_of(data)), 0)
+
+    def test_the_signature_download_hands_over_the_files_and_the_note(self):
+        """A signature file is not much use without the note saying what paper
+        it wants and that it must not be scaled again on the way out."""
+        self.a_book()
+        with zipfile.ZipFile(io.BytesIO(self.download_signatures())) as archive:
+            names = archive.namelist()
+            self.assertIn("Bound At Home/print_instructions.txt", names)
+            signatures = [name for name in names
+                          if name.startswith("Bound At Home/book_signatures/")]
+            self.assertTrue(signatures, names)
+            for name in signatures:
+                self.assertTrue(archive.read(name).startswith(b"%PDF"), name)
+
+    def test_a_download_leaves_nothing_at_all_on_the_server(self):
+        """The whole reason these are downloads rather than builds. The old
+        buttons wrote the PDF into Input/, imposed it into Output/ and archived
+        it into Previously_Converted/, and every one of those counted against
+        the session's limit for the rest of the visit."""
+        self.a_book()
+        self.download_pdf()
+        self.download_signatures()
+
+        for folder in (main.INPUT_DIR, main.OUTPUT_DIR, main.PREVIOUS_DIR):
+            self.assertEqual(list(folder.rglob("*")), [], str(folder))
+        # Including the scratch folder they were built in.
+        self.assertFalse(list(self.scratch().glob("*")))
+
+    def test_the_book_is_set_at_the_size_of_the_paper_it_was_given(self):
+        """Chosen in Step 2, read back out of the finished signature.
+
+        Both halves matter: the signature is Letter because that is the paper,
+        and the *book PDF* is Letter too — which is what makes the imposition a
+        1:1 copy rather than a resize.
+        """
+        self.a_book()
+        self.choose_sheet("Letter")
+        self.assertEqual(self.at.selectbox(key="bkpref-sheet").value, "Letter")
+
+        built = self.pages_of(self.download_pdf(sheet="Letter"))[0]
+        self.assertAlmostEqual(float(built.mediabox.width), 11.0 * 72, places=1)
+        self.assertAlmostEqual(float(built.mediabox.height), 8.5 * 72, places=1)
+
+        with zipfile.ZipFile(
+            io.BytesIO(self.download_signatures(sheet="Letter"))
+        ) as archive:
+            first = sorted(name for name in archive.namelist()
+                           if name.endswith(".pdf"))[0]
+            page = self.pages_of(archive.read(first))[0]
+        # Letter, landscape: 11 x 8.5 in, and not the A5 book's own 11.65 x 8.27.
+        self.assertAlmostEqual(float(page.mediabox.width), 11.0 * 72, places=1)
+        self.assertAlmostEqual(float(page.mediabox.height), 8.5 * 72, places=1)
 
     def test_any_paper_size_can_be_chosen_and_nothing_is_ever_scaled(self):
         """Words have no size until the type is drawn, so nothing is resized.
@@ -741,7 +996,9 @@ class TestBuilding(EditorTestCase):
             with self.subTest(sheet=sheet):
                 self.at.selectbox(key="bkpref-sheet").set_value(sheet).run()
                 self.assertFalse(self.at.exception, self.at.exception)
-                self.assertFalse(self.at.button(key="bk-build-convert").disabled)
+                self.assertFalse(
+                    self.at.download_button(key="bk-download-signatures").disabled
+                )
                 self.assertEqual([error.value for error in self.at.error], [])
                 # Nothing anywhere on the page says the book is being resized.
                 shown = " ".join(
@@ -756,64 +1013,19 @@ class TestBuilding(EditorTestCase):
         # The choice the conversion view needs is not asked anywhere here.
         self.assertIsNone(self.widget_named("setting-scale-mode"))
 
-    def test_the_book_is_set_at_the_size_of_the_paper_it_was_given(self):
-        """Chosen in 📐 Book design, read back out of the finished signature.
-
-        Both halves matter: the signature is Letter because that is the paper,
-        and the *book PDF* is Letter too — which is what makes the imposition a
-        1:1 copy rather than a resize.
-        """
-        self.a_book()
-        self.choose_sheet("Letter")
-        self.at.button(key="bk-build-convert").click().run()
-        self.assertFalse(self.at.exception, self.at.exception)
-
-        built = pypdf.PdfReader(
-            str(main.PREVIOUS_DIR / "Bound At Home.pdf")
-        ).pages[0]
-        self.assertAlmostEqual(float(built.mediabox.width), 11.0 * 72, places=1)
-        self.assertAlmostEqual(float(built.mediabox.height), 8.5 * 72, places=1)
-
-        ready = main.list_ready_books()
-        self.assertEqual([book.name for book in ready], ["Bound At Home"])
-        page = pypdf.PdfReader(str(ready[0].signatures[0])).pages[0]
-        # Letter, landscape: 11 x 8.5 in, and not the A5 book's own 11.65 x 8.27.
-        self.assertAlmostEqual(float(page.mediabox.width), 11.0 * 72, places=1)
-        self.assertAlmostEqual(float(page.mediabox.height), 8.5 * 72, places=1)
-
     def test_the_paper_chosen_for_one_build_never_reaches_the_draft(self):
         """Giving the size as paper decides the build, not the saved book."""
         self.a_book()
         self.at.selectbox(key="bk-page-size").set_value("US trade").run()
         self.choose_sheet("A4")
-        self.at.button(key="bk-build").click().run()
-        self.assertFalse(self.at.exception, self.at.exception)
 
         # Built at half an A4 landscape sheet — A5 — and not at 6 x 9 in.
-        built = pypdf.PdfReader(str(main.INPUT_DIR / "Bound At Home.pdf")).pages[0]
+        built = self.pages_of(self.download_pdf(sheet="A4"))[0]
         self.assertAlmostEqual(float(built.mediabox.width), 297 / 25.4 * 72,
                                places=1)
         # The book on screen still says what the writer chose.
         self.assertEqual(self.book.design.page_size_name, "US trade")
         self.assertAlmostEqual(self.book.design.page_width_in, 6.0, places=6)
-
-    def test_a_finished_run_hands_the_signatures_over(self):
-        """This view has no “Ready to print” panel, and there is no folder.
-
-        Pointing at a path on the server would be pointing at somewhere nobody
-        can reach and that will not exist in a minute. The signatures leave the
-        same way everything else does: as a file the browser is given.
-        """
-        self.a_book()
-        self.at.button(key="bk-build-convert").click().run()
-
-        folder = main.OUTPUT_DIR / "Bound At Home"
-        self.assertEqual(self.state("book_last_build")["output_folder"], str(folder))
-        self.assertIn("bk-download-built",
-                      [button.key for button in self.at.download_button])
-        # And no path anywhere on the page.
-        self.assertFalse([block for block in self.at.code
-                          if str(folder) in block.value])
 
     def test_the_example_book_goes_all_the_way_to_signatures(self):
         """The one button that shows what the editor can do has to work.
@@ -825,48 +1037,176 @@ class TestBuilding(EditorTestCase):
         self.at.button(key="bk-act-example").click().run()
         self.assertEqual(len(self.book.chapters), 5)
 
-        self.at.button(key="bk-build-convert").click().run()
+        with zipfile.ZipFile(
+            io.BytesIO(self.download_signatures("The Folded Sheet"))
+        ) as archive:
+            signatures = [name for name in archive.namelist()
+                          if name.startswith("The Folded Sheet/book_signatures/")]
+        self.assertTrue(signatures)
+
+    def test_a_book_that_will_not_fit_its_paper_closes_only_the_signatures(self):
+        """The PDF half would still have worked, so it stays open. Only
+        imposition has a sheet it can refuse."""
+        self.a_book()
+        with mock.patch.object(book_editor, "_paper_for",
+                               return_value=(None, ["Too small."], [])):
+            self.at.run()
+        self.assertTrue(
+            self.at.download_button(key="bk-download-signatures").disabled
+        )
+        self.assertFalse(self.at.download_button(key="bk-download-pdf").disabled)
+        self.assertIn("Too small.", [error.value for error in self.at.error])
+
+
+# --------------------------------------------------------------------------
+# The front page and the screens behind it
+# --------------------------------------------------------------------------
+
+
+class TestTheThreeCards(EditorTestCase):
+    """The front page asks one question, in words about the reader's own book.
+
+    It used to be a radio with two labels written in the app's vocabulary —
+    "Convert 2 Column Formatted PDF into PDF Signatures" — which asked somebody
+    to know what a signature was before they could get anywhere.
+    """
+
+    def cards(self):
+        self.go(HOME_ROUTE)
+        return "\n".join(str(element.value) for element in self.at.markdown)
+
+    def test_each_card_says_what_the_reader_wants_not_what_the_app_does(self):
+        text = self.cards()
+        self.assertIn("I have a PDF book", text)
+        self.assertIn("I want to start/continue writing my own book", text)
+        self.assertIn("I want AI to generate a 5 chapter mini-novel book", text)
+
+    def test_each_card_says_what_comes_out_of_it(self):
+        text = self.cards()
+        self.assertIn("Convert to signatures for printing from the input PDF.", text)
+        self.assertIn("Or load JSON to continue editing.", text)
+
+    def test_a_card_opens_its_screen(self):
+        self.go(HOME_ROUTE)
+        self.at.button(key="bookcard-go-convert").click().run()
+        self.assertEqual(self.state("route"), CONVERT_VIEW)
+
+    def test_the_front_page_explains_what_a_signature_is(self):
+        """The one word the whole app is named after, and nowhere on the old
+        front page was it defined."""
+        self.go(HOME_ROUTE)
+        text = "\n".join(str(element.value) for element in self.at.markdown)
+        self.assertIn("nested one inside another", text)
+        self.assertIn("One sheet gives four book pages", text)
+
+    def test_there_is_a_way_back_from_every_screen(self):
+        for route in (CONVERT_VIEW, WRITE_VIEW, AI_ROUTE):
+            self.go(route)
+            self.assertIsNotNone(
+                next((b for b in self.at.button if b.key == "go-home"), None),
+                f"no way home from {route}",
+            )
+        self.go(HOME_ROUTE)
+        self.assertIsNone(
+            next((b for b in self.at.button if b.key == "go-home"), None),
+            "the front page offers a way to itself",
+        )
+
+    def test_the_front_page_offers_a_way_back_to_work_in_progress(self):
+        """A returning visitor should not have to remember which card they
+        came in through."""
+        self.at.text_input(key="bk-title").set_value("Half-written").run()
+        self.go(HOME_ROUTE)
+        resume = next((b for b in self.at.button if b.key == "resume-writing"), None)
+        self.assertIsNotNone(resume)
+        resume.click().run()
+        self.assertEqual(self.state("route"), WRITE_VIEW)
+
+
+class TestAJobOwnsItsScreen(EditorTestCase):
+    """A job reports into the slot its button occupied. A job whose screen is
+    not drawn hands the runner no slot at all — and the runner's answer to a job
+    it cannot find is to release the lock and rerun, silently, with the work
+    never started and nothing said. Before routing, that branch could only fire
+    for a book renamed between click and run; with four screens it would be the
+    ordinary consequence of pressing ← Home mid-conversion.
+
+    Two guards, and neither is sufficient alone.
+    """
+
+    def a_conversion(self, pages=8):
+        """Claim the one long job a screen still starts, on the screen that
+        starts it. The writing view claims nothing any more: its two builds are
+        the data behind download buttons and happen inside the click."""
+        from Script.test_imposition import build_source_pdf
+        self.go(CONVERT_VIEW)
+        build_source_pdf(main.INPUT_DIR / "Big.pdf", pages)
+        self.at.run()
+        self.at.button(key="convert-Big.pdf").click().run()
         self.assertFalse(self.at.exception, self.at.exception)
 
-        ready = main.list_ready_books()
-        self.assertEqual([book.name for book in ready], ["The Folded Sheet"])
-        self.assertTrue(ready[0].signatures)
+    def test_claiming_a_job_records_the_screen_it_belongs_to(self):
+        """The pin is set at the one moment the route is certainly right: the
+        click. Recording it later would be recording wherever the user had got
+        to since."""
+        self.a_conversion()
+        self.assertEqual(self.state("busy_route"), CONVERT_VIEW)
 
-    def test_a_build_name_typed_after_a_save_is_the_one_that_is_used(self):
-        self.a_book()
-        self.at.text_input(key="bk-file-name").set_value("Print version 2").run()
-        # The save reruns from the top of the page and never redraws the name
-        # box; the build after it must still use the name that was typed.
+    def test_a_running_job_pins_the_screen_it_was_claimed_on(self):
+        """The half that catches everything the disabled button cannot: a stray
+        rerun, a restored session, anything that writes the route directly."""
+        self.at.session_state["busy_job"] = ("typeset", "build")
+        self.at.session_state["busy_route"] = WRITE_VIEW
+        self.at.session_state["route"] = HOME_ROUTE
+        self.at.run()
+        self.assertEqual(self.state("route"), WRITE_VIEW)
+
+    def test_the_pin_lets_go_the_moment_the_job_does(self):
+        self.at.session_state["busy_job"] = ("typeset", "build")
+        self.at.session_state["busy_route"] = WRITE_VIEW
+        self.at.run()
+        self.at.session_state["busy_job"] = None
+        self.go(HOME_ROUTE)
+        self.assertEqual(self.state("route"), HOME_ROUTE)
+
+    def test_finishing_a_job_leaves_nothing_stale_on_the_page(self):
+        """The sidebar's busy warning must not change its element count.
+
+        Streamlit identifies an element by its position among its siblings and
+        only drops the previous run's surplus once a run finishes, so a warning
+        that exists while a job runs and not afterwards leaves the older, longer
+        page's tail on screen for exactly one run. The visible symptom was a
+        second "📤 Save my data" button in the sidebar after every build.
+        """
+        self.a_conversion()
+        keys = [button.key for button in self.at.download_button]
+        self.assertEqual(len(keys), len(set(keys)), f"duplicated: {keys}")
+
+    def test_arming_a_delete_does_not_survive_leaving_the_screen(self):
+        """`confirm_delete` only draws its two buttons under the card that armed
+        it, so an armed request left behind on another screen could never be
+        answered — it would just sit there for the rest of the session."""
+        self.at.text_input(key="bk-title").set_value("Doomed").run()
         self.at.button(key="bk-save").click().run()
-        self.at.button(key="bk-build").click().run()
+        name = list_drafts(self.drafts)[0].name
+        self.at.button(key=f"arm-delete-draft-{name}").click().run()
+        self.assertEqual(self.state("armed_delete"), f"draft-{name}")
 
-        self.assertTrue((main.INPUT_DIR / "Print version 2.pdf").is_file())
-        self.assertFalse((main.INPUT_DIR / "Bound At Home.pdf").exists())
-
-
-# --------------------------------------------------------------------------
-# The two views
-# --------------------------------------------------------------------------
+        self.at.button(key="go-home").click().run()
+        self.assertIsNone(self.state("armed_delete"))
 
 
 class TestTheTwoViews(EditorTestCase):
-    def test_the_tabs_are_named_after_what_they_do(self):
-        labels = self.at.radio(key="view").options
-        self.assertEqual(labels, [
-            "📚  Convert 2 Column Formatted PDF into PDF Signatures",
-            "✍️  Convert Inputted Text into PDF Signatures",
-        ])
-
     def test_a_book_survives_a_trip_through_the_other_view(self):
         self.type_title_page()
         self.at.text_area(key=self.first_section_key()).set_value("Words.")
         self.at.run()
 
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
         self.assertFalse(self.at.exception, self.at.exception)
         self.assertEqual(self.box("bk-title"), None)  # not drawn at all
 
-        self.at.radio(key="view").set_value(WRITE_VIEW).run()
+        self.go(WRITE_VIEW)
         self.assert_title_page(self.book, "the editor after a view switch")
         self.assertEqual(self.box("bk-title"), "Demon Noble Girl")
         self.assertEqual(self.box(self.first_section_key()), "Words.")
@@ -875,8 +1215,8 @@ class TestTheTwoViews(EditorTestCase):
         self.at.text_input(key="bk-title").set_value("The Title").run()
         self.at.text_input(key="bk-file-name").set_value("Print version 2").run()
 
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
-        self.at.radio(key="view").set_value(WRITE_VIEW).run()
+        self.go(CONVERT_VIEW)
+        self.go(WRITE_VIEW)
         self.assertEqual(self.box("bk-file-name"), "Print version 2")
 
 
@@ -886,28 +1226,30 @@ class TestTheTwoViews(EditorTestCase):
 
 
 class TestSettingsAreNotAskedTwice(EditorTestCase):
-    """The sidebar holds what both tabs share, and each tab holds its own.
+    """Every setting lives next to the thing it affects, and is asked once.
 
-    It used to hold the paper as well, which meant one measurement had two
-    menus: the sheet in the sidebar and the finished page size in 📐 Book
-    design, either of which decided how big the book came out. The column
-    measurements were worse — they describe a PDF somebody else made, and were
-    on screen, in the sidebar, while a book was being typed.
+    The sidebar used to be where anything shared had to go, because it was the
+    only container drawn on every run. `Script/settings.py` removed that
+    constraint: `resolve` reads a value without drawing it, so a setting can sit
+    inside a collapsed expander on one screen and still be read by the job
+    runner on another. What is left in the sidebar is the two things that change
+    no book at all — the theme and the display units.
 
-    What moved must still be *held*: Streamlit throws away the state of every
-    widget a run did not draw, so a paper size that only exists on one tab has
-    to come back with the value it was given after a trip through the other.
+    What moved must still be *held*, and the bar is higher than it was:
+    Streamlit throws away the state of every widget a run did not draw, and a
+    setting is now undrawn on three screens out of four rather than one out of
+    two.
     """
 
+    # Shared between the two working screens, and drawn on whichever is up —
+    # inside ⚙️ Advanced paper and printing, under one pair of keys.
     SHARED = {
-        "setting-units": "Millimetres (mm)",
         "setting-sheets": 3,
         "setting-duplex": "Flip on short edge",
     }
-    # Not one of the shared settings: it says nothing about the book, only about
-    # the light the app is read in. It is in the sidebar because that is where
-    # the ⋮ menu's switcher moved to when the corner was taken away.
-    APPEARANCE = ("setting-theme",)
+    # In the sidebar, because neither changes any book: one is the light the app
+    # is read in, the other the units its measurements are shown in.
+    PREFERENCES = ("setting-theme", "setting-units")
     CONVERT_ONLY = ("setting-sheet-size", "setting-orientation",
                     "setting-scale-mode", "setting-auto-columns")
     WRITE_ONLY = ("bkpref-size-from", "bkpref-sheet", "bkpref-sheet-landscape")
@@ -921,23 +1263,45 @@ class TestSettingsAreNotAskedTwice(EditorTestCase):
             for element in kind
         )
 
-    def test_the_sidebar_is_the_settings_both_tabs_share_and_no_more(self):
-        expected = sorted([*self.SHARED, *self.APPEARANCE])
-        self.assertEqual(self.sidebar_keys(), expected, "in the writing view")
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
-        self.assertEqual(self.sidebar_keys(), expected, "in the conversion view")
+    def test_the_sidebar_is_preferences_and_the_session_zip_and_no_more(self):
+        """Nothing that shapes a book is in here any more."""
+        expected = sorted(self.PREFERENCES)
+        for route in (WRITE_VIEW, CONVERT_VIEW, HOME_ROUTE, AI_ROUTE):
+            self.go(route)
+            self.assertEqual(self.sidebar_keys(), expected, f"on {route}")
 
-    def test_a_shared_setting_chosen_in_one_tab_is_still_chosen_in_the_other(self):
+    def test_a_shared_setting_chosen_on_one_screen_is_still_chosen_on_the_other(self):
+        """The load-bearing test of `settings.carried`.
+
+        These two are drawn inside an expander on one screen at a time, so on
+        any given run at least three of the four screens have not drawn them.
+        """
         for key, value in self.SHARED.items():
-            self.sidebar_widget(key).set_value(value).run()
-        chosen = {key: self.sidebar_widget(key).value for key in self.SHARED}
-        self.assertEqual(chosen, self.SHARED)
+            self.widget_named(key).set_value(value).run()
+        self.assertEqual({key: self.widget_named(key).value for key in self.SHARED},
+                         self.SHARED)
 
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
-        self.assertFalse(self.at.exception, self.at.exception)
-        self.assertEqual({key: self.sidebar_widget(key).value
-                          for key in self.SHARED}, self.SHARED,
-                         "in the conversion view")
+        # Out through the front page and the AI screen, which draw neither.
+        self.go(HOME_ROUTE)
+        self.go(AI_ROUTE)
+        self.go(CONVERT_VIEW)
+        self.assertEqual({key: self.widget_named(key).value for key in self.SHARED},
+                         self.SHARED, "on the conversion screen")
+        self.go(WRITE_VIEW)
+        self.assertEqual({key: self.widget_named(key).value for key in self.SHARED},
+                         self.SHARED, "back on the writing screen")
+
+    def test_a_shared_setting_is_read_on_a_screen_that_does_not_draw_it(self):
+        """`settings.resolve` — the whole reason these could leave the sidebar.
+
+        The folding steps at the foot of the conversion screen are written from
+        the duplex setting, which on that screen is three expanders deep, and on
+        the writing screen is not drawn at all.
+        """
+        self.widget_named("setting-duplex").set_value("Flip on short edge").run()
+        self.go(CONVERT_VIEW)
+        text = "\n".join(str(element.value) for element in self.at.markdown)
+        self.assertIn("short edge", text)
 
     def test_neither_tab_shows_the_other_tab_s_paper_controls(self):
         for key in self.CONVERT_ONLY:
@@ -945,7 +1309,7 @@ class TestSettingsAreNotAskedTwice(EditorTestCase):
         self.assertIsNotNone(self.widget_named("bkpref-size-from"))
         self.assertIsNotNone(self.widget_named("bk-page-size"))
 
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
         for key in self.WRITE_ONLY:
             self.assertIsNone(self.widget_named(key), f"{key} in the other view")
         self.assertIsNotNone(self.widget_named("setting-sheet-size"))
@@ -963,14 +1327,14 @@ class TestSettingsAreNotAskedTwice(EditorTestCase):
         self.assertIsNone(self.widget_named("bk-page-size"))
 
     def test_the_conversion_paper_survives_a_trip_through_the_writing_tab(self):
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
         self.at.selectbox(key="setting-sheet-size").set_value("Letter").run()
         self.at.radio(key="setting-orientation").set_value(False).run()
         self.at.radio(key="setting-scale-mode").set_value("actual").run()
         self.at.checkbox(key="setting-auto-columns").set_value(False).run()
 
-        self.at.radio(key="view").set_value(WRITE_VIEW).run()
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(WRITE_VIEW)
+        self.go(CONVERT_VIEW)
         self.assertFalse(self.at.exception, self.at.exception)
         self.assertEqual(self.widget_named("setting-sheet-size").value, "Letter")
         self.assertIs(self.widget_named("setting-orientation").value, False)
@@ -981,8 +1345,8 @@ class TestSettingsAreNotAskedTwice(EditorTestCase):
         self.choose_sheet("Letter", landscape=False)
         self.at.checkbox(key="bkpref-autosave").set_value(False).run()
 
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
-        self.at.radio(key="view").set_value(WRITE_VIEW).run()
+        self.go(CONVERT_VIEW)
+        self.go(WRITE_VIEW)
         self.assertFalse(self.at.exception, self.at.exception)
         self.assertEqual(self.widget_named("bkpref-size-from").value, "sheet")
         self.assertEqual(self.widget_named("bkpref-sheet").value, "Letter")
@@ -998,7 +1362,7 @@ class TestSettingsAreNotAskedTwice(EditorTestCase):
         self.assertIn("12.00 × 9.00 in", captions)
 
     def test_the_column_measurements_say_whose_page_they_describe(self):
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
         captions = " ".join(caption.value for caption in self.at.caption)
         self.assertIn("Where the two columns sit on a page of the *input* PDF",
                       captions)
@@ -1372,7 +1736,7 @@ class TestAJobStoppedByTheLimit(EditorTestCase):
 
     def convert_view_with_a_book(self, pages=40):
         from Script.test_imposition import build_source_pdf
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
         build_source_pdf(main.INPUT_DIR / "Big.pdf", pages)
         self.at.run()
         return "Big.pdf"
@@ -1418,13 +1782,26 @@ class TestTheZipControls(EditorTestCase):
                 archive.writestr(name, content)
         return ("my-books.zip", buffer.getvalue(), "application/zip")
 
-    def test_both_ways_out_are_offered_above_the_settings(self):
+    def test_both_ways_out_are_still_offered_though_no_longer_first(self):
+        """Portability and erasure are rights, so they stay; they are not the
+        headline any more, because every screen now ends in a download of its
+        own and the session zip is no longer the only door out."""
         headers = [header.value for header in self.at.sidebar.header]
-        self.assertEqual(headers[:2], ["Your data", "Settings"])
+        self.assertEqual(headers, ["Preferences"])
         self.assertIn("workspace-save",
                       [button.key for button in self.at.sidebar.download_button])
         self.assertIn("workspace-zip-0",
                       [box.key for box in self.at.sidebar.file_uploader])
+        self.assertIn("arm-delete-workspace",
+                      [button.key for button in self.at.sidebar.button])
+
+    def test_the_session_zip_is_not_the_loudest_thing_on_the_page(self):
+        """It was `type="primary"` and first in the sidebar, above a header
+        reading "Your data" — before the visitor had any."""
+        saves = [button for button in self.at.sidebar.download_button
+                 if button.key == "workspace-save"]
+        self.assertEqual(len(saves), 1)
+        self.assertNotEqual(saves[0].proto.type, "primary")
 
     def test_the_paragraph_on_the_page_is_the_one_in_the_source(self):
         """There were two copies of it, and only one was ever displayed.
@@ -1512,14 +1889,20 @@ class TestTheZipControls(EditorTestCase):
         """
         self.addCleanup(setattr, workspace, "LIMIT_BYTES", workspace.LIMIT_BYTES)
         workspace.LIMIT_BYTES = 1
-        self.at.run()
+        self.at.text_input(key="bk-title").set_value("Something").run()
         self.assertFalse(self.at.exception, self.at.exception)
 
-        self.assertTrue(self.at.button(key="bk-build").disabled)
-        self.assertTrue(self.at.button(key="bk-build-convert").disabled)
+        # Saving a draft writes into the session, so it goes dead.
         self.assertTrue(self.at.button(key="bk-save").disabled)
+        self.assertTrue(self.at.button(key="bk-save-as").disabled)
         warnings = " ".join(w.value for w in self.at.warning)
         self.assertIn("full", warnings)
+
+        # The three ways out do not, and must not: they build in a scratch
+        # folder that counts against nothing and delete it again, and a session
+        # with no room left is exactly when taking your book away matters most.
+        for key in ("bk-download-json", "bk-download-pdf", "bk-download-signatures"):
+            self.assertFalse(self.at.download_button(key=key).disabled, key)
 
         # The way out is still open: saving and erasing are never blocked.
         self.assertFalse(self.at.sidebar.download_button(key="workspace-save").disabled)
@@ -1529,7 +1912,7 @@ class TestTheZipControls(EditorTestCase):
         """Streamlit prints one upload ceiling for the whole app, and it is the
         zip's. The book uploader corrects that line for itself — and says the
         figure nowhere else, so a reader sees one rule rather than three."""
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
 
         uploader = self.at.file_uploader(key="uploader-0")
         self.assertNotIn("100", uploader.label)
@@ -1547,7 +1930,7 @@ class TestTheZipControls(EditorTestCase):
     def test_how_much_room_is_left_is_answered_in_one_place(self):
         """The sidebar's bar is the readout. The conversion view had a second
         one under the uploader, saying the same thing a scroll away."""
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
         captions = " ".join(caption.value for caption in self.at.caption)
         self.assertNotIn("left of", captions)
 
@@ -1571,7 +1954,7 @@ class TestTheZipControls(EditorTestCase):
         self.addCleanup(setattr, workspace, "MAX_UPLOAD_BYTES",
                         workspace.MAX_UPLOAD_BYTES)
         workspace.MAX_UPLOAD_BYTES = 100
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
 
         self.at.file_uploader(key="uploader-0").set_value(
             ("Enormous.pdf", b"%PDF-1.4" + b"x" * 500, "application/pdf")
@@ -1584,7 +1967,7 @@ class TestTheZipControls(EditorTestCase):
         self.assertIn("over the", errors)
 
     def test_a_book_that_fits_is_still_taken(self):
-        self.at.radio(key="view").set_value(CONVERT_VIEW).run()
+        self.go(CONVERT_VIEW)
         self.at.file_uploader(key="uploader-0").set_value(
             ("Small.pdf", b"%PDF-1.4 small", "application/pdf")
         ).run()

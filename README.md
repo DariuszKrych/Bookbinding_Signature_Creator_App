@@ -23,7 +23,7 @@
 
 > **The short version.** Hand-binding a book means printing it as *signatures* — small stacks of sheets, each printed double-sided, folded once and nested inside one another. Getting the page order right by hand is tedious and easy to ruin. This app does the imposition for you, on any paper a printer will accept, and hands back one zip per book in print order.
 >
-> **Nothing is stored.** Your books exist on the server only while the tab is open. The one copy that lasts is the zip you download yourself. The single thing that ever leaves the server is the description you type into the AI box, and only when you press that button — [what that involves](#-the-ai-writer-and-where-its-key-lives).
+> **Nothing is stored.** Your books exist on the server only while the tab is open, so every screen ends in a download and that copy is the one that lasts. The single thing that ever leaves the server is the description you type on the AI screen, and only when you press that button — [what that involves](#-the-ai-writer-and-where-its-key-lives).
 
 I built it because I wanted to print signatures for a series of nine books for a bookbinding hobby, and writing the tool is more enjoyable than manually setting up the signature format for the mountain of pages which those nine books come to. It was fun and ended up saving me some time too.
 
@@ -31,22 +31,28 @@ I built it because I wanted to print signatures for a series of nine books for a
 
 ## ✨ What it does
 
+**Three cards on the front page, and one linear flow behind each.** You arrive at a
+question in your own words — *I have a PDF book*, *I want to start or continue writing my
+own book*, *I want AI to generate a 5 chapter mini-novel book* — and each card says what
+you get out of it before you commit to anything. Every screen carries a **← Home**, three
+numbered steps, and a download at the end of them.
+
 <table>
 <tr>
 <td width="50%" valign="top">
 
-### 📚 Convert an existing PDF
+### 📄 I have a PDF book
 
-Upload a 2-column book PDF. Pick the paper you'll actually load in the printer. Get back one PDF per signature plus a `print_instructions.txt` recording the paper size, scaling and duplex setting used — all as a single zip, in print order.
+Add a 2-column book PDF. Pick the paper you'll actually load in the printer — or leave it on *Same as the PDF*, which is right whenever the book was already made for your paper. Get back one PDF per signature plus a `print_instructions.txt` recording the paper size, scaling and duplex setting used, all as a single zip in print order.
 
-Books that aren't numbered yet can be **page-numbered first**, as a separate step that leaves the original untouched. 
+Books that aren't numbered yet can be **page-numbered first**, as a separate step that leaves the original untouched.
 
 </td>
 <td width="50%" valign="top">
 
-### ✍️ Write the book in the app
+### ✍️ I want to write my own book
 
-Type a book straight into the browser — title, author, dedication, chapters, appendix — and it is typeset into exactly the kind of 2-column PDF the converter reads, then folded into signatures without ever leaving the page.
+Type a book straight into the browser — title, author, dedication, chapters, appendix — and take it away three ways: **as JSON** to keep editing, **as a PDF book**, or **as signatures** ready to print. JSON comes back in, so a book can be put down and picked up again.
 
 **Nothing is ever scaled here.** The paper isn't something to fit a finished book onto afterwards; it's the size the book is *set* at.
 
@@ -54,22 +60,28 @@ Type a book straight into the browser — title, author, dedication, chapters, a
 </tr>
 </table>
 
-### 🤖 Or have one written
+### 🤖 I want AI to generate a 5 chapter mini-novel book
 
-A one-line description — *"a warm, plain-English beginner's guide to hand bookbinding"* — fills the editor in with a five-chapter mini-novel of about 1,800 words, which you then edit like anything else you typed. The words appear **as they are written** rather than after a silent wait, and every book is held to a hard ceiling of 8,000 tokens. Optional, off unless a key is configured, and it writes the **words only**: your page size, type and margins are left exactly as you set them. [How it works, and where its key lives.](#-the-ai-writer-and-where-its-key-lives)
+A one-line description — *"a warm, plain-English beginner's guide to hand bookbinding"* — becomes a five-chapter mini-novel of about 1,800 words, and hands you into the writing screen with it in the editor, to change and export like anything you typed. The words appear **as they are written** rather than after a silent wait, and every book is held to a hard ceiling of 8,000 tokens. Optional, off unless a key is configured, and it writes the **words only**: your page size, type and margins are left exactly as you set them. [How it works, and where its key lives.](#-the-ai-writer-and-where-its-key-lives)
 
 ```mermaid
 flowchart LR
+    H["🗺 Front page<br/><i>three cards</i>"] --> A
+    H --> B
+    H --> G
     B["✍️ Type a book<br/>in the editor"] --> T["typesetting.py<br/><i>sets the type at final size</i>"]
     G["🤖 Describe a book"] --> AI["ai_book.py<br/><i>outline, then chapters</i>"]
     AI --> B
-    A["📤 Upload a<br/>2-column PDF"] --> C
+    A["📄 Add a<br/>2-column PDF"] --> C
     T --> C["print_formatting.py<br/><b>imposition</b>"]
+    B -.-> J["⬇️ JSON"]
+    T -.-> P["⬇️ PDF book"]
     C --> D["📄 One PDF per signature<br/>+ print_instructions.txt"]
     D --> E["⬇️ One zip,<br/>in print order"]
+    J -.-> B
 ```
 
-The AI writer joins at the *editor*, not at the pipeline: it produces a `Manuscript`, the same object the editor holds, so everything downstream of it is the one code path a typed book takes.
+**The two writing cards converge.** The AI writer joins at the *editor*, not at the pipeline: it produces a `Manuscript`, the same object the editor holds, so everything downstream of it is the one code path a typed book takes. There is one editor, one design panel and one set of export buttons, whichever card you came in through.
 
 The bridge between the two halves is deliberately narrow: the editor writes an **ordinary input PDF**, and from that moment a typed book is indistinguishable from one that came from anywhere else. There is no second pipeline to keep in step with the first.
 
@@ -133,7 +145,7 @@ Render spins free Docker instances down after **15 minutes** of inactivity, whic
 
 ### 🤖 The AI writer, and where its key lives
 
-**🤖 Generate 5 chapter mini-novel for printing with AI** takes a one-line description and fills the writing view in with a whole book: title, author, dedication and every chapter.
+The third card, **🤖 I want AI to generate a 5 chapter mini-novel book**, takes a one-line description and hands you into the writing screen with a whole book in the editor: title, author, dedication and every chapter.
 
 All of it is in [`Script/ai_book.py`](./Script/ai_book.py), which imports LangChain and nothing from Streamlit, and [`Script/ai_config.py`](./Script/ai_config.py).
 
@@ -151,7 +163,13 @@ request 3   chapters 4-5
 
 Batching is only safe because of `salvage_chapters`. A reply that runs past its output limit is truncated JSON — but the chapters that *did* finish are complete objects inside it, so they are mined out and kept. Recovering three good chapters costs nothing; asking again costs a request the book does not have.
 
+**The outline is read the same way**, and it matters more there than anywhere: the plan is the one reply everything else is written from, so losing it costs the book its title, its author, its dedication and every heading at once. `close_json` closes off the brackets a truncated object never reached, and `salvage_outline` keeps the fields and the whole chapter entries that arrived. The cap has room in it too — an ordinary five-chapter plan measures about 280 tokens against a real tokenizer, against an `OUTLINE_CAP` of 640 — and that headroom costs the book nothing, because the ledger refunds whatever a reply did not use before a single chapter is priced.
+
 **A cut-off reply does not arrive as a reply.** The OpenAI client will not hand over a completion whose `finish_reason` is `length` — it raises `LengthFinishReasonError` and discards the words. Since every request carries a `max_tokens`, filling the cap is the *ordinary* way a full batch ends rather than a rare mishap, so `_is_cut_off` recognises that exception and `_cut_off_reply` takes the chapters back out of it before anything downstream can mistake a short book for a broken one. Such a reply is never *repaired*: a repair carries a cap no bigger, runs out in the same place, and spends a request the remaining chapters need.
+
+A reply that ran out is recognised in both the shapes it comes in. A **streamed** one raises only after the last piece has arrived, so `_read_stream` keeps the words *and* reports the fact; on the bottom rung of the JSON ladder there is no `response_format` at all, nothing raises, and the reply simply stops — which is what `ran_out` is for. Streaming is the default, so both paths carry the same guarantee: a reply that merely ran out never buys a repair that would run out in the same place.
+
+**And a book always has a name.** When no title arrives at all, `title_from` takes one from the description the writer typed — a book about a lighthouse keeper is a better thing to find in the drafts list than "Untitled book". It is a working title, sitting in the first box on the writing screen, waiting to be typed over.
 
 #### The 8,000-token ceiling
 
@@ -248,13 +266,13 @@ That is the whole setup. `OPENROUTER_MODEL` and the rest have working defaults; 
 
 #### Checking it worked
 
-Open the app after the deploy finishes. The button under the title tells you which state you are in, without needing the logs:
+Open the app after the deploy finishes. The third card, and the screen behind it, tell you which state you are in without needing the logs:
 
 | What you see | What it means |
 | --- | --- |
-| **🤖 Generate 5 chapter mini-novel for printing with AI** is clickable once you type a description | The key arrived. Done. |
-| Button greyed out, caption reads *"…No `OPENROUTER_API_KEY` is set…"* | The variable is missing or misnamed. Check the spelling in Render — it is case-sensitive. |
-| Button greyed out, caption mentions **langchain-openai** | The key is fine but the image is stale. Redeploy with **Clear build cache**, since `conda-lock.yml` changed. |
+| The **🤖** card is live, and **🤖 Write my 5 chapter mini-novel** is clickable once you type a description | The key arrived. Done. |
+| The card is greyed out and reads *"Switched off on this copy — no API key is set"*; the screen behind it says *"…No `OPENROUTER_API_KEY` is set…"* | The variable is missing or misnamed. Check the spelling in Render — it is case-sensitive. |
+| Card greyed out, the screen behind it mentions **langchain-openai** | The key is fine but the image is stale. Redeploy with **Clear build cache**, since `conda-lock.yml` changed. |
 | *"…is not a free model, and this copy is set to free models only"* | `OPENROUTER_FREE_ONLY` is at 1 while the model is a paid one — the app's own default included. Switch the flag off, or set `OPENROUTER_MODEL` to `openrouter/free`. |
 
 #### Every setting
@@ -308,9 +326,16 @@ If it ever *did* reach a commit, rotate the key rather than trying to rewrite hi
 
 ## 🧠 Engineering highlights
 
-The six design decisions that shape the rest of the codebase.
+The seven design decisions that shape the rest of the codebase.
 
 <table>
+<tr><td>
+
+**🗺 One question on the front page, one flow behind each answer**
+
+Three cards, each naming a thing somebody might arrive wanting and what they get out of it. Behind each is a single screen of three numbered steps ending in a download, and a **← Home** to leave by. Every setting lives on the screen it affects, in one of three tiers: the input that defines the job, one collapsed expander named for what it changes, and the rare things nested inside that. `Script/settings.py` is what makes that possible — it reads a setting's value *without drawing it*, so nothing has to sit in the sidebar merely to be readable.
+
+</td></tr>
 <tr><td>
 
 **🔒 Privacy by construction, not by policy**
@@ -329,21 +354,21 @@ A sheet is folded across its width, so one sheet of *W × H* gives four book pag
 
 **🧪 Tests that refuse to mark their own homework**
 
-489 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, derive expected coordinates by hand rather than importing them from the code under test, and feed the AI writer the malformed JSON small models really send. [Details below.](#-testing)
+551 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, derive expected coordinates by hand rather than importing them from the code under test, drive the real interface through Streamlit's own `AppTest`, and feed the AI writer the malformed JSON small models really send. [Details below.](#-testing)
 
 </td></tr>
 <tr><td>
 
 **⚙️ Concurrency-safe UI in a framework that reruns your script on every click**
 
-Streamlit restarts the script whenever a widget changes. A click landing mid-conversion doesn't just redraw the page with stale numbers — it *kills the job*. So a job is claimed, the script reruns immediately to paint the entire interface locked, and only then does the first page get imposed. The progress bar takes over the exact slot its button was in, so nothing on the page moves.
+Streamlit restarts the script whenever a widget changes. A click landing mid-conversion doesn't just redraw the page with stale numbers — it *kills the job*. So a job is claimed, the script reruns immediately to paint the entire interface locked, and only then does the first page get imposed. The progress bar takes over the exact slot its button was in, so nothing on the page moves. A job also **pins the screen it was claimed on**: it reports into that slot, so the route cannot change out from under it.
 
 </td></tr>
 <tr><td>
 
 **📊 A quota enforced in five places, because four of them aren't enough**
 
-A per-file cap isn't a cap (nothing stops the next file); a pre-flight check isn't a cap either (nothing knows how big a set of signatures will be until it has written them). So the limit is enforced before upload, before a zip loads, *during* the conversion via a progress-hook watcher, at Streamlit's own `maxUploadSize`, and in the app code the config option cannot reach. [The reasoning.](#how-much-one-session-may-hold)
+A per-file cap isn't a cap (nothing stops the next file); a pre-flight check isn't a cap either (nothing knows how big a set of signatures will be until it has written them). So the limit is enforced before upload, before a zip loads, *during* the conversion via a progress-hook watcher, at Streamlit's own `maxUploadSize`, and in the app code the config option cannot reach. [The reasoning.](#-your-data-in-and-out-as-one-zip)
 
 </td></tr>
 <tr><td>
@@ -414,22 +439,103 @@ python main.py --list-paper      # print the paper and book size tables
 
 <br/>
 
-Two tabs, chosen at the top of the page: **📚 Convert 2 Column Formatted PDF into PDF Signatures** and **✍️ Convert Inputted Text into PDF Signatures**.
+**Three cards, and one flow behind each.** The front page asks *what would you like to
+do?* and answers in the reader's own words rather than the app's: **📄 I have a PDF book**,
+**✍️ I want to start/continue writing my own book**, **🤖 I want AI to generate a 5 chapter
+mini-novel book**. Each card names what comes out of it, and the whole card is the click
+target. A card this copy cannot offer — the AI one, on a copy with no key — is drawn
+switched off and says why, rather than disappearing. Underneath, **New here?** explains what
+a signature is, which is the one word the whole app is named after.
 
-**The sidebar's Settings are only what both tabs share** — four controls: the units (inches, centimetres or millimetres), the sheets per signature, the printer's duplex setting, and whether the PDF is moved to the archive once converted. They hold their values when you switch tabs and mean the same thing on either one.
+**Hovering a card moves nothing**, and that is a fix rather than a preference. The hover
+style used to lift each card two pixels with a CSS `transform`, which moves the element's
+hit area with it: a cursor near the bottom edge hovered the card, the card slid out from
+under the cursor, the hover ended, the card slid back — several times a second. What that
+looked like was the pointer flickering between a hand and an arrow with *Start →* strobing
+underneath it, and cards that were very hard to actually click. Hover is colour, shadow and
+outline only now, and the pointer stays a hand across the whole card, border included.
 
-**Everything about the paper is set on the tab that decides it.** The sheet an existing PDF is printed on and the size a book being typed is set at are two different questions whose answers are not interchangeable, so each is asked in one place only:
+Come back to the front page with work in progress and it offers a way back into it:
+*You have a book in progress*, *2 books ready to print*.
 
-- The conversion tab has **🖨️ Paper to print on** above the three panels: the sheet size (or a custom one), its orientation, and what to do when the book is not that size. Folded away underneath is the **column layout**, which only places stamped page numbers on a PDF somebody else made and cannot change a conversion at all.
-- The writing tab asks it once, in **📐 Book design**, under *Page size and margins*: give the size as **the finished page** or as **the paper it prints on**, whichever you actually care about, and the other is worked out and printed underneath. Only the menu you chose is on screen.
+Every screen behind a card carries **← Home** and numbered steps:
 
-*If the book is a different size* is asked on the conversion tab only — a book being typed is **set** at the size you asked for, so nothing is ever scaled. Each tab's paper settings survive a trip through the other.
+| Screen | Step 1 | Step 2 | Step 3 |
+| --- | --- | --- | --- |
+| 📄 Convert a PDF | Add your PDF | Choose your paper | Create and download |
+| ✍️ Write your book | Write it | Design it | — |
+| 🤖 Mini-novel | Describe the book — then it hands you into the writing screen with the book in the editor | | |
 
-The conversion view has three panels: **Available for conversion**, **Archive of previously converted** and **Ready to print**. No paths are shown anywhere. Each book waiting to be converted names the two sizes you act on — the **paper to load in the printer** and **each page of the finished book** — so there is no guessing which number describes what. A finished book gets one **⬇️ Download this book** button handing over every signature in print order with its printing notes, as a single zip: they are printed as a set, and fetching them one at a time only creates a chance to print them out of order.
+The writing screen has no third step, because the thing a third step would lead to is at
+the *top*: **⬇️ Take your book away**, three download buttons on one row above everything
+else. Writing and design are the two steps; taking the book away is the outcome, and it is
+the first thing on the screen rather than the last.
 
-**🗑 Delete** in the archive removes an input PDF for good; in Ready to print it removes one book's signatures and notes. Deleting is the only thing here that cannot be undone, so it always asks first — **Yes, delete** and **Keep it**, under the card naming the file.
+**Everything is on the screen it belongs to, in one of three tiers.** Tier one is the one
+input that defines the job and the one button that produces the output, and nothing else.
+Tier two is a single collapsed expander named for *what it affects* — never "advanced
+settings". Tier three nests inside that.
 
-The interface ships a light-green paper-and-foliage theme in `.streamlit/config.toml`, in a light and a dark version; **Theme**, at the top of the sidebar, switches between them.
+So the conversion screen shows **Sheet size** and nothing else about paper, with the
+orientation, the fitting mode, the sheets per signature, the duplex setting and the stamped
+page-number positioning one click down in **⚙️ Advanced paper and printing** — and a live
+caption under it saying what the choice came to. The writing screen shows a one-line
+summary — *A5 pages · Times 10.5 pt · justified* — above three closed panels, so nothing
+has to be opened to see what size book is about to be made.
+
+**The sidebar is preferences only**: the theme and the display units, neither of which
+changes any book. Everything that shapes one — *sheets per signature*, *printer duplex* —
+sits beside the thing it affects, on whichever screen is up, under one shared pair of keys.
+`Script/settings.py` is what allows that: `resolve()` reads a setting without drawing it,
+so a control can live three expanders deep on one screen and still be read by the job
+runner on another.
+
+**Everything ends in a download.** A converted book gets **⬇️ Download this book's
+signatures** — every signature in print order with its printing notes, as one zip, because
+they are printed as a set and fetching them one at a time only creates a chance to print
+them out of order. A typed book gets all three of the things its card offers, side by side
+at the top of the screen: **⬇️ Download as JSON**, **⬇️ Download as PDF** and **⬇️ Download
+as signatures**. JSON is the format that comes back in, through **📂 Open a .book.json** at
+the foot of the same screen, so a book can be put down and picked up again.
+
+**All three are one click, and none of them keeps anything.** The PDF and the signatures
+used to be "📄 Create the book PDF" and "✂️ Create the signatures": buttons that wrote files
+into the session and then offered a *second* button to fetch them, at the foot of the
+right-hand column, underneath the drafts panel. They are `st.download_button`s now, and
+Streamlit calls a download button's `data` when it is clicked — so the book is typeset, and
+imposed, inside the click, and the bytes go straight to the browser. The build happens in a
+scratch folder that is deleted as soon as the download is served, so nothing counts against
+the session's limit and there is nothing left to find afterwards. `Script/book_build.py` is
+that code, and its docstring says what the single click costs: no progress bar, and a
+failure that arrives as a failed download rather than as a banner.
+
+No paths are shown anywhere. Each book waiting to be converted names the two sizes you act
+on — the **paper to load in the printer** and **each page of the finished book** — so there
+is no guessing which number describes what.
+
+**The archive and the finished-signature list are folded away** into **📂 This session's
+files**, and the drafts list into **📂 This session's drafts** — there for a batch, out of
+the way otherwise. Nothing here is kept past the tab, so the download is the point and the
+lists are the footnote.
+
+**The data policy sits behind a 🔒 expander at the foot of every screen**, home included.
+Fourteen sections of notice printed under three cards would be a page of legal text with
+the work at the bottom of it; folded, the page stays clean and the notice is still one
+click away wherever you happen to be standing.
+
+**🗑 Delete** in the archive removes an input PDF for good; in Ready to print it removes one
+book's signatures and notes. Deleting is the only thing here that cannot be undone, so it
+always asks first — **Yes, delete** and **Keep it**, under the card naming the file. Walking
+away from a screen clears anything armed on it, since the two buttons that answer a delete
+are only drawn under the card that armed it.
+
+**Nothing can be walked away from mid-job.** ← Home and the three cards go dead while a job
+runs, and the job additionally *pins* the screen it was claimed on — because a job reports
+into the slot its button occupied, and one whose screen is not drawn would be released
+silently with the work never started and nothing said.
+
+The interface ships a light-green paper-and-foliage theme in `.streamlit/config.toml`, in a
+light and a dark version; **Theme**, at the top of the sidebar, switches between them.
 
 </details>
 
@@ -444,7 +550,7 @@ By default the output sheet is **the input PDF's own page size**, so nothing is 
 
 #### Sheets you can print on
 
-`--paper <name>`, or the **Sheet size** menu on the conversion tab. 21 sizes:
+`--paper <name>`, or the **Sheet size** menu in Step 2 of the conversion screen. 21 sizes:
 
 | Family | Sizes |
 | --- | --- |
@@ -484,11 +590,11 @@ Pages carrying a `/Rotate` flag, a crop box smaller than the paper, or a media b
 
 <br/>
 
-**✍️ Convert Inputted Text into PDF Signatures** opens an editor that produces the same kind of 2-column PDF the converter reads. Nothing about the imposition is special-cased for it.
+**✍️ I want to start/continue writing my own book** opens an editor that produces the same kind of 2-column PDF the converter reads. Nothing about the imposition is special-cased for it.
 
 **Nothing is ever scaled here, at any paper size.** Words have no size until the type is drawn, so the paper is not something to fit a finished book onto afterwards; it is the size the book is *set* at, half a sheet to a page. Pick any paper you own and the type goes into the PDF at its final size, at 100%. Changing the size changes how big the book is and how many pages it runs to, and nothing else.
 
-**One menu, either way round.** *Page size and margins* in 📐 Book design starts with **Give the size as**: *The finished page* offers the book sizes in the reference table plus a custom one, *The paper it prints on* offers the sheets. Whichever you pick, the other figure is worked out and printed under the menu, and the menu you did not pick is not on the page at all. Giving the size as paper belongs to that build and never reaches the saved draft.
+**One menu, either way round.** *📐 Page size and margins*, in Step 2, starts with **Give the size as**: *The finished page* offers the book sizes in the reference table plus a custom one, *The paper it prints on* offers the sheets. Whichever you pick, the other figure is worked out and printed under the menu, and the menu you did not pick is not on the page at all. Giving the size as paper belongs to that build and never reaches the saved draft.
 
 #### What you can type
 
@@ -517,9 +623,20 @@ Five typefaces are available: Times, Helvetica, Courier, Bitstream Vera, and the
 
 #### Having one written for you
 
-The **🤖 Generate 5 chapter mini-novel for printing with AI** button sits above both tabs. Until you have typed something it is greyed out and says **(Please type a description of the book to generate)** on itself; type the first character and it goes live there and then, without your having to click away first.
+The third card, **🤖 I want AI to generate a 5 chapter mini-novel book**, opens a screen with
+one question on it. Until you have typed something the button is greyed out and says
+**(Please type a description of the book to generate)** on itself; type the first character
+and it goes live there and then, without your having to click away first. The one thing in
+this app that sends anything anywhere says so beside that button, not in a caption
+underneath it.
 
-Describe the book in the box beside it — subject, voice, who it is for, what should happen — and press it. It moves you to the writing tab and **the book appears in a box under the button as it is written**, a sentence at a time. When it finishes, the title, author, dedication and five chapters are in the editor, as an ordinary unsaved draft: edit it, save it, build it, convert it.
+Describe the book — subject, voice, who it is for, what should happen — and press it. **The
+book appears under the button as it is written**, a sentence at a time. The screen stays put
+while it writes, and that is deliberate: the progress bar and the streaming box both live
+here, and a job whose screen stops being drawn is a job the runner abandons. When it
+finishes you land in the **writing** screen with the title, author, dedication and five
+chapters in the editor and a banner saying so — an ordinary unsaved draft: edit it, save it,
+build it, convert it.
 
 **It is always five chapters**, whatever the description says, so describe *what happens* rather than how long it should be. "A short novel" or "an epic" changes the voice and the pacing, not the count.
 
@@ -536,13 +653,32 @@ If the button is greyed out, this copy has no key configured — see [the AI wri
 
 #### Keeping your progress
 
-Drafts are one JSON file each, kept for the session only. Save as many as you like and switch between them; **Autosave** keeps writing to the open draft once it has been saved once. Saving goes through a temp file and a rename, so a crash part way cannot leave a half-written draft on top of the one it replaced, and anything that would throw away unsaved words asks first.
+To keep a book past the session, **⬇️ Download as JSON** at the top of the screen hands over
+the book as it is on screen — saved or not — and **📂 Open a .book.json** takes it back.
+JSON is the only format that comes back in, which is the round trip the second card
+promises. **✨ Load the example** fills the editor with a complete lorem-ipsum book (five
+chapters, a part divider, an interlude, a dedication, an epigraph and a spread of back
+matter) to type straight over.
 
-To keep a book past the session, **⬇️ Download this draft** hands over the JSON as it is on screen — saved or not — and **📤 Save my data** takes all of them at once. **✨ Load the example** fills the editor with a complete lorem-ipsum book (five chapters, a part divider, an interlude, a dedication, an epigraph and a spread of back matter) to type straight over.
+Drafts are the *other* thing, and they are deliberately further down the page now, folded
+into **📚 Drafts kept in this browser session** below the writing. They are one JSON file
+each, kept for the session only: save as many as you like and switch between them, and
+**Autosave** keeps writing to the open draft once it has been saved once. Saving goes
+through a temp file and a rename, so a crash part way cannot leave a half-written draft on
+top of the one it replaced, and anything that would throw away unsaved words asks first.
+**📤 Save my data** takes every draft at once, for carrying a whole session somewhere else.
 
-Building writes `<name>.pdf` into the session, and building again replaces the PDF **the editor wrote** — a PDF you uploaded is never overwritten whatever the book is called, because the editor stamps its own name into `/Creator` and checks for it first. **✂️ Create the signatures** typesets and imposes in one go.
+None of that is needed to get a book out, which is why it is no longer the first thing on
+the screen. It used to open on a draft-name box, **💾 Save**, **Save a copy** and an
+autosave tick — session bookkeeping, above the book, for a visitor who has not typed a word
+yet and whose drafts will be gone when the tab closes.
 
-**📖 Build the book** names the same two sizes the conversion tab puts on every card, worked out from *Page size and margins*, before anything is built. Every paper size can be built on, since the book is set at half of whatever sheet you pick; on the rare sheet a book could not physically go on, **✂️ Create the signatures** is disabled and says why while **📄 Create the book PDF** stays available, because that half would have worked.
+**What these files are called, and the paper they are for** — the expander under the three
+buttons — names the same two sizes the conversion screen puts on every card, worked out from
+*Page size and margins* before anything is built. Every paper size can be used, since the
+book is set at half of whatever sheet you pick; on the rare sheet a book could not physically
+go on, **⬇️ Download as signatures** is disabled and says why, while **⬇️ Download as PDF**
+stays available because that half would have worked.
 
 </details>
 
@@ -582,9 +718,11 @@ One Streamlit reflex survives all of this: pressing **R** outside a text field r
 
 **Nothing this app holds is stored.** Whatever you upload or write exists on the server only while you are working on it, and is erased when you close the tab. The one copy that lasts is the zip you download yourself. That is a position, not an accident of hosting: whatever somebody uploads is theirs, and the way not to be answerable for it is not to keep it.
 
-**The one exception, stated plainly:** pressing **🤖 Generate 5 chapter mini-novel for printing with AI** sends the sentence you typed in its box — and nothing else from your session — to OpenRouter. Never press it and nothing you do here ever leaves the server. The app's own data policy, at the foot of every page, says the same in more detail.
+**The one exception, stated plainly:** pressing **🤖 Write my 5 chapter mini-novel** sends the sentence you typed in its box — and nothing else from your session — to OpenRouter. Never press it and nothing you do here ever leaves the server. The screen says so beside the button, and the app's own data policy says the same in more detail.
 
-At the top of the sidebar sit the controls that make that workable:
+**The policy is behind a 🔒 expander at the foot of every screen**, the front page included. It is fourteen sections long, and unfolded under three cards it would be a page of legal text with the work underneath it — so it is folded, the page stays clean, and the notice is one click away from wherever you are standing rather than somewhere else entirely.
+
+**Every screen ends in a download**, and that is the ordinary way work leaves: **⬇️ Download this book's signatures** on a finished conversion, and **⬇️ Download as JSON**, **⬇️ Download as PDF** and **⬇️ Download as signatures** at the top of the editor. Under **💾 This session's data** in the sidebar are the three controls for a whole session at once:
 
 | Control | What it does |
 | --- | --- |
@@ -592,7 +730,7 @@ At the top of the sidebar sit the controls that make that workable:
 | **📥 Load my data (.zip)** | Puts one of those zips back at the start of your next visit. It *replaces* the session rather than adding to it, so it asks for a second click first. A zip holding none of the app's folders is refused before anything is touched, and the zip is checked end to end first, so a half-finished download cannot leave you half-emptied. A folder you zipped by hand is read too. |
 | **🗑 Delete my data now** | Erases the session immediately, without waiting for the tab to close. Two clicks, like every other delete here. |
 
-Single files leave the same way: **⬇️ Download this book** on a finished conversion, and **⬇️ Download this draft** in the editor.
+A single book comes back the same way it left: **📂 Open a .book.json** in the editor takes a file **⬇️ Download as JSON** handed you.
 
 <details>
 <summary><b>How the erasure actually works</b></summary>
@@ -681,7 +819,7 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
                    Script.test_ai_book Script.test_ai_editor -v
 ```
 
-**489 tests across five modules**, and they go out of their way not to mark their own homework:
+**551 tests across five modules**, and they go out of their way not to mark their own homework:
 
 **The imposition**
 
@@ -694,7 +832,11 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
 
 - Driven through Streamlit's own `AppTest`: real clicks on the real page, then the draft file read off the disk. The words a click carries are typed and clicked in a *single* run, because that is what a browser sends and it is the case a two-run test cannot see.
 - Loading a draft is checked at the **message the server sends**, not the value it holds. A keyed box keeps its identity across a rerun, so a fresh `value=` changes the model and nothing on screen; every box must come back carrying `set_value`, and must stop carrying it on the run after, or typing would fight the cursor.
-- Which tab a setting lives on is asserted: the sidebar is exactly the four controls both tabs share, neither tab shows the other's paper controls, and the writing tab never has both size menus up at once. Each tab's paper must survive a trip through the other, since Streamlit discards the state of any widget a run did not draw — and the paper chosen must reach the finished signature, read back out of the built PDF's page size.
+- **Where every setting lives is asserted**, on all four screens: the sidebar is preferences and the session zip and nothing else, neither working screen shows the other's paper controls, and the writing screen never has both size menus up at once. A shared setting has to survive a trip out through the front page *and* the AI screen — Streamlit discards the state of any widget a run did not draw, and a setting is undrawn on three screens out of four — and has to be readable on a screen that never draws it. The paper chosen must reach the finished signature, read back out of the built PDF's page size.
+- **A job owns its screen.** ← Home goes dead while one runs, and the job pins the route it was claimed on, since a job whose slot is not drawn would be released with the work never started. Walking away disarms anything armed, because the buttons that answer a delete are drawn only under the card that armed it.
+- **Nothing stale is left on the page.** Finishing a job must not duplicate a button, and the half-written book must be gone the moment the finished one arrives — both are the same hazard, Streamlit matching elements by position when a container's contents change.
+- **The uploaded-draft parser is tested against what it is handed**, not against what it hopes for: a JSON list, a bare number, a string and `null` are each refused. `Manuscript.from_dict` opens with `data = data if isinstance(data, dict) else {}`, so any of them would otherwise return a valid *empty* book, and adopting one would wipe the writer's work with no error anywhere.
+- **The three cards are tested as the front door**: each says what the reader wants and what comes out of it, each opens its screen, the AI one is drawn switched off with its reason when no key is set, and the front page offers a way back into work already in progress.
 - The table of contents is checked against reality: a marker word is planted at the start of every chapter, the finished PDF searched for where it landed, and the printed number has to agree. Page numbers, running heads and right-hand-page starts are read out the same way — and both halves of the app are asked, in the same terms, where their folios ended up.
 
 **Attack, not exercise**
@@ -710,6 +852,7 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
 - **The token ceiling is measured, not argued.** A `GreedyChat` fills every reply to exactly the `max_tokens` it was sent — the worst legal case, which no real model reaches — and the cost is rebuilt from what was actually sent and said. Three ways: a real tokenizer (nine runs counted with `tiktoken` the way the account is billed, including descriptions of pure punctuation, Chinese, emoji and Cyrillic); the assumption underneath (the estimators held against that tokenizer over sixteen scripts plus every prompt the app sends, since the limit rests on the input estimate never reading low); and fuzzing (200 seeded books crossing eight alphabets with eight ways a reply can go wrong, at five limits and four chapter counts). The limit is read from `ai_config` rather than written out, so moving it cannot leave forty assertions checking a stale number.
 - **The floor too**: a limit of 50 tokens makes *no requests at all* and still returns five chapters and no error, and walking the limit down gives a shorter book rather than a broken one.
 - **A busy provider is tested without waiting for one.** `time.sleep` is replaced with a list, so the waits are recorded rather than taken and the assertions are about their length: a `Retry-After: 17` is waited for seventeen seconds, an hour-long one is capped, and a wait that would outlast `AI_TOTAL_BUDGET_SECONDS` is never started. A 429 then a good reply has to give a whole book on **three** requests, not four — the refused one does not come out of the budget — and a 429 on every attempt has to give five chapters from the plan on a batch and the readable banner on the outline.
+- **A plan cut at every character it has.** The outline is truncated at all 400-odd positions in turn, and two things have to hold at every one: nothing raises, and what comes back is a plan rather than half of one — no chapter entry without a heading, since the book is numbered from what it is given. Once the title has finished arriving it must survive every later cut. `close_json` is pinned on its own against the shapes a cut lands in: after a value, inside a string, after a key, inside a `\u` escape, and on a brace that was inside a sentence all along.
 - **Truncation, three ways.** By actually truncating — a two-chapter reply cut mid-string, both chapters surviving without another request, the lost one filled from its outline summary. By the exception the OpenAI client raises *instead* of the reply, faked in the test file so nothing imports the client, and fed both ways a real one lands: before a word arrives, and after a whole reply has streamed onto the page. And by a `DutifulChat` that reads the length off the prompt, writes it fifteen percent over as models do, and is chopped wherever `max_tokens` falls — the assertion being that no chapter exceeds half again the shortest. What `paragraph_plan` asks for is pinned separately: it must cost less than the allowance it was given, at every allowance from a full one down to sixty tokens.
 
 **The key, and the words about it**
@@ -725,7 +868,7 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
 
 ```text
 Bookbinding_Signature_Creator_App/
-├── app.py                       Streamlit GUI — panels, uploads, job locking, theming
+├── app.py                       Routing, the conversion screen, job locking, theming
 ├── main.py                      Headless CLI and the shared folder contract
 ├── Dockerfile                   micromamba base, env built from the lock file
 ├── conda-lock.yml               Pinned linux-64 environment (the deploy source of truth)
@@ -738,9 +881,13 @@ Bookbinding_Signature_Creator_App/
     ├── print_formatting.py      Imposition: source pages → signatures, folios
     ├── typesetting.py           Manuscript → 2-column PDF, at final size
     ├── manuscript.py            Book model, section kinds, drafts (JSON)
-    ├── book_editor.py           The writing tab
+    ├── home.py                  The front page: three cards, and a way back to work
+    ├── book_editor.py           The writing screen
+    ├── book_build.py            A typed book → the bytes of a download, inside the click
+    ├── ai_view.py               The screen that asks a model for a book
     ├── ai_book.py               The only file that knows what a language model is
     ├── ai_config.py             Where the AI settings and the key come from
+    ├── settings.py              Settings that outlive the screen they are set on
     ├── paper_sizes.py           Sheet and book-page catalogues, unit parsing
     ├── workspace.py             Per-session temp workspace, sweeper, quotas
     ├── Baskervville-Regular.ttf The app's own typeface

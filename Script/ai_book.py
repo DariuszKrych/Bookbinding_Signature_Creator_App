@@ -44,6 +44,16 @@ makes batching safe is `salvage_chapters`: a truncated reply is mined for the
 chapters that did finish, which costs nothing and is worth more than a retry the
 budget cannot afford.
 
+**Every reply is read for what arrived, the outline most of all.** That last part
+was missing, and it cost a book its name. The plan has a cap of its own, and a
+plan that went one character past it was thrown away whole — title, author,
+dedication and every heading — after the reader had watched all of it arrive on
+screen. The book that came out was called "Untitled book" with no front page at
+all, which is not what a limit meant to shorten a book is for. So a truncated
+object is now closed off and read (`close_json`, `salvage_outline`), the plan's
+cap has room in it (`OUTLINE_CAP`), and a reply that merely ran out never buys a
+repair that would run out in the same place (`ran_out`).
+
 A reply that ran out does not arrive as a reply, though, and that is worth
 knowing before reading `_invoke`. The OpenAI client refuses to hand over a
 completion whose `finish_reason` is "length" — it raises instead, and throws the
@@ -452,6 +462,180 @@ def salvage_chapters(text):
     return {"chapters": rescued} if rescued else None
 
 
+def _closers(stack):
+    """The brackets that would balance `stack`, innermost first."""
+    return "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+
+
+# How many places a truncated reply is tried at before giving up. Every one is a
+# `json.loads` of the whole fragment, and the useful ones are all at the end —
+# the last thing to arrive whole is the last thing that was written. A book-sized
+# reply has thousands of them and trying every one would be work with no answer
+# in it.
+_CUT_ATTEMPTS = 64
+
+
+def _cut_points(text):
+    """Every place a truncated JSON object could be closed off, in order.
+
+    Each is `(index, closers)`: `text[:index] + closers` is balanced. A point is
+    recorded wherever a *value* has just finished inside a container — the end of
+    a string that is not a key, or the `}`/`]` that closes a nested value — so
+    cutting at one always leaves whole entries behind and never half of one.
+
+    The end of a key is deliberately not a cut point. `{"heading"` closed with a
+    `}` is not an object with a missing value, it is invalid JSON, and the point
+    before it is the one that gives a whole entry.
+    """
+    points = []
+    stack = []
+    in_string = False
+    escaped = False
+    is_key = False
+    wants_key = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+                if not is_key and stack:
+                    points.append((index + 1, _closers(stack)))
+            continue
+        if char == '"':
+            in_string = True
+            escaped = False
+            is_key = wants_key
+        elif char in "{[":
+            stack.append(char)
+            wants_key = char == "{"
+        elif char in "}]":
+            if stack:
+                stack.pop()
+            wants_key = bool(stack) and stack[-1] == "{"
+            # Recorded at the outermost bracket too, where the closers are none
+            # at all. That is the point an object which was whole after the cap
+            # landed on it closes at, and without it a complete reply would be
+            # the one shape this could not read.
+            points.append((index + 1, _closers(stack)))
+        elif char == ":":
+            wants_key = False
+        elif char == ",":
+            # Back to a key inside an object; still a value inside an array.
+            wants_key = bool(stack) and stack[-1] == "{"
+    if in_string and not is_key and stack:
+        # The reply stopped in the middle of a string. Closing it keeps the half
+        # sentence that had arrived, which is worth having in a summary and is
+        # the most that was ever written.
+        #
+        # The tail may be half an escape — a lone `\`, or `\u12` — because the
+        # cut landed inside one, and a string ending that way will not parse. So
+        # every tail from six characters shorter up to the whole of it is offered
+        # and the caller takes the longest that `json` accepts. Six is the length
+        # of the longest escape there is, which is why this cannot eat a word.
+        closers = '"' + _closers(stack)
+        for cut in range(6, -1, -1):
+            if len(text) - cut > 0:
+                points.append((len(text) - cut, closers))
+    return points
+
+
+def close_json(text):
+    """Whatever arrived of a JSON object that stopped part-way, parsed.
+
+    Returns `None` when there is nothing in `text` that can be closed into an
+    object. This is what a reply that filled its output cap needs: it is not
+    nonsense, it is a good object with its last brace missing, and everything
+    before the cut is exactly what the model meant to say.
+
+    The cut points are tried from the last backwards, so the answer is the most
+    that survived rather than the first thing that happens to parse. Each attempt
+    also gets `strict=False`, for the same reason `extract_json` does — a real
+    newline inside a string is the commonest thing a model puts there.
+    """
+    text = str(text or "")
+    start = text.find("{")
+    if start < 0:
+        return None
+    body = text[start:]
+    points = _cut_points(body)
+    for index, closers in reversed(points[-_CUT_ATTEMPTS:]):
+        candidate = body[:index] + closers
+        for attempt in (candidate, _TRAILING_COMMA.sub(r"\1", candidate)):
+            for strict in (True, False):
+                try:
+                    data = json.loads(attempt, strict=strict)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(data, dict):
+                    return data
+    return None
+
+
+def ran_out(text):
+    """Whether this reply is an object that simply stops, rather than a bad one.
+
+    The difference decides whether a repair is worth a request. A model that sent
+    prose can be told to send JSON instead and often will; a reply that reached
+    its output cap will reach it again in exactly the same place, and the request
+    spent finding that out is one the chapters after it needed.
+
+    The client says so by raising — but only when the request carried a
+    `response_format`, which the bottom rung of the ladder does not. There the
+    reply just ends, and this is the only thing that can tell. It asks the
+    question directly: there is an object in here, it does not parse as it
+    stands, and it does parse once its brackets are closed. That is what having
+    run out means, and nothing else looks like it.
+    """
+    sliced = _first_object(str(text or ""))
+    if not sliced:
+        return False
+    try:
+        json.loads(sliced, strict=False)
+    except (ValueError, TypeError):
+        return close_json(text) is not None
+    return False
+
+
+def salvage_outline(text):
+    """The plan rebuilt from an outline reply that ran out of room.
+
+    The outline is the one request everything else is written from, and it used
+    to be all or nothing: a reply chopped one character before its last brace
+    threw away the title, the author, the dedication and every chapter heading,
+    and the reader watched all of it arrive on screen and then got a book called
+    "Untitled book". That is what this exists to stop.
+
+    It is the same bargain `salvage_chapters` makes for a batch — take what
+    arrived whole, cost nothing, ask for nothing again — and the plan is worth
+    more of it, because a missing chapter costs the book a chapter while a
+    missing plan costs it its name.
+
+    Returns `None` when nothing usable survived, so the caller can still fall
+    back to a repair.
+    """
+    data = close_json(text)
+    if not isinstance(data, dict):
+        return None
+    # Every entry has to be an object with a heading on it. `build_outline`
+    # numbers the chapters it is given, so an entry that is half a chapter would
+    # take the place of one — and a `"chapters"` that came back as a number
+    # rather than a list is a thing a model does about as often.
+    raw = data.get("chapters")
+    chapters = [
+        entry for entry in (raw if isinstance(raw, list) else [])
+        if isinstance(entry, dict) and clean_line(entry.get("heading"))
+    ]
+    if chapters:
+        data["chapters"] = chapters
+    elif "chapters" in data:
+        del data["chapters"]
+    named = any(clean_line(data.get(field)) for field in ("title", "author"))
+    return data if named or chapters else None
+
+
 def extract_json(text):
     """The JSON object in `text`, however it has been wrapped up.
 
@@ -804,10 +988,11 @@ def _cut_off_reply(error):
 def _read_stream(runnable, messages, live):
     """One request, read a piece at a time, reported as it goes.
 
-    The pieces are joined and handed back as one string, so everything after this
-    line — `extract_json`, `salvage_chapters`, the repair — sees precisely what it
-    would have seen from `.invoke()`. Streaming is a way of watching the reply
-    arrive, not a different kind of reply.
+    Returns `(text, usage, cut_off)`. The pieces are joined and handed back as
+    one string, so everything after this line — `extract_json`,
+    `salvage_chapters`, the repair — sees precisely what it would have seen from
+    `.invoke()`. Streaming is a way of watching the reply arrive, not a different
+    kind of reply.
 
     That holds for a reply that fills its cap too, and it takes this `try` to
     make it hold. Such a reply streams to the very last piece and then raises,
@@ -815,9 +1000,19 @@ def _read_stream(runnable, messages, live):
     out — so every word is already in `parts` and on screen by the time the
     exception arrives. Losing them to it would be losing chapters that had been
     written, read, and paid for.
+
+    `cut_off` is the third thing it hands back, and it is not decoration. The
+    caller decides whether to spend a request repairing an unreadable reply, and
+    a reply that merely ran out of room must never earn one — the repair carries
+    the same cap and stops in the same place. Swallowing the exception here
+    without saying so made every streamed cut-off look like a model that had
+    answered badly, so a truncated outline quietly spent the request that the
+    chapters after it needed. Streaming is the default, so that was the ordinary
+    path rather than a corner of it.
     """
     parts = []
     usage = None
+    cut_off = False
     try:
         for chunk in runnable.stream(messages):
             usage = _usage(chunk) or usage
@@ -829,6 +1024,7 @@ def _read_stream(runnable, messages, live):
     except Exception as error:
         if not _is_cut_off(error):
             raise
+        cut_off = True
         # The completion on the exception should say the same as the pieces
         # already gathered. Preferred when it says more, since a stream that
         # failed early is the one case where it can.
@@ -837,7 +1033,7 @@ def _read_stream(runnable, messages, live):
         if len(said) > len("".join(parts)):
             parts = [said]
             live.feed(said)
-    return "".join(parts), usage
+    return "".join(parts), usage, cut_off
 
 
 def _usage(reply):
@@ -972,17 +1168,23 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
         cut_off = False
 
         def send():
-            """This request, once. Retried by the caller while the service is busy."""
+            """This request, once. Retried by the caller while the service is busy.
+
+            `(text, usage, cut_off)` whichever way the reply came back, so the
+            two paths cannot disagree about what a cut-off reply is. A streamed
+            one says so in its third value; an ordinary one says so by raising,
+            and is caught below.
+            """
             if pace:
                 pace.wait()
             runnable = _bind(chat, config, rung, schema_name, schema, allowed)
             if live and config.stream:
                 return _read_stream(runnable, messages, live)
             answered = runnable.invoke(messages)
-            return _content(answered), _usage(answered)
+            return _content(answered), _usage(answered), False
 
         try:
-            reply, usage = _wait_out_rate_limits(send, config, note, started)
+            reply, usage, cut_off = _wait_out_rate_limits(send, config, note, started)
         except Exception as error:
             if _is_cut_off(error):
                 # Not a failure. The reply reached the cap this very request
@@ -1085,7 +1287,19 @@ SETTLE_FACTOR = 1.5 * ASK_FOR
 
 # The most the outline may have. It is a page of headings, not prose, and every
 # token it does not take is a token of the book itself.
-OUTLINE_CAP = 320
+#
+# It is a cap and not an allowance, which is the thing to hold on to when reading
+# the number: what the outline actually spends is what it writes, because
+# `_Charge.settle` hands back the rest before a single chapter is priced. So this
+# costs the book nothing until an outline really is this long.
+#
+# It was 320, and 320 was too near. A perfectly ordinary five-chapter plan — a
+# title, a subtitle, an author, a dedication, a note on the voice and five
+# headings with a sentence each — measures about 280 tokens against a real
+# tokenizer, so a description with named characters in it went over the cap and
+# was chopped. Before `salvage_outline` that lost the whole plan; now it loses
+# only the tail, and at this number it does not usually lose anything.
+OUTLINE_CAP = 640
 
 # Added per message for the role framing the wire format puts around it.
 MESSAGE_OVERHEAD = 8
@@ -1380,7 +1594,13 @@ def _asker(chat, config, budget, live=None, ledger=None,
             # just filled, so it would run out in the same place — and the
             # request it spent is one the chapters after this one needed. What
             # could not be salvaged is written from the plan instead.
-            if data is None and not cut_off:
+            #
+            # Asked two ways because it arrives two ways. `cut_off` is the client
+            # having refused the reply, which it only does when the request
+            # carried a `response_format`; on the bottom rung there is no
+            # exception and the reply simply ends, and `ran_out` is what
+            # recognises that one.
+            if data is None and not cut_off and not ran_out(reply):
                 data = repair(reply)
         if keep and data is not None:
             live.keep()
@@ -1613,6 +1833,66 @@ def shorten(text, tokens):
     return (spaced or cut).rstrip(" ,;:—-") + "…"
 
 
+# The longest a title taken from the description may be, in words and then in
+# characters. A title is a line on a title page, not a paragraph.
+TITLE_WORDS = 8
+TITLE_CHARS = 60
+
+# What people put in front of what the book is actually about, and what makes it
+# a preamble rather than part of the story. "Write a short book about a lighthouse
+# keeper" should give "A lighthouse keeper"; "A quiet novel set on a canal boat
+# that says something about grief" should give the boat, not the grief.
+#
+# So both tests have to pass: the words before it are few, and one of them says
+# this is somebody asking for a book. Position alone was not enough — "about"
+# turns up in the middle of an ordinary sentence about as often as it introduces
+# one.
+_ABOUT = (" about ", " concerning ", " telling of ", " on the subject of ")
+_ASKING = {
+    "book", "novel", "novella", "story", "tale", "mini-novel", "write", "writing",
+    "generate", "create", "make", "please", "want", "like",
+}
+_LEAD_WORDS = 8
+
+
+def title_from(prompt):
+    """A working title taken from the description. `""` when there is none in it.
+
+    Used only when the model's own title never arrived — see `build_outline`.
+    Something the writer typed themselves, on the title page of a book about the
+    thing they asked for, beats "Untitled book" by a distance: it names the book
+    in the drafts list, in the file name of a build, and in the note the app
+    prints when the writing is done.
+
+    It does not pretend to be the model's title, and it is not meant to be kept.
+    It is the first thing in the box on the writing view, ready to be typed over.
+    """
+    text = clean_line(prompt)
+    if not text:
+        return ""
+    lowered = text.lower()
+    for lead in _ABOUT:
+        at = lowered.find(lead)
+        if at < 0:
+            continue
+        before = lowered[:at].split()
+        if len(before) <= _LEAD_WORDS and any(
+            word.strip(".,;:!?-") in _ASKING for word in before
+        ):
+            text = text[at + len(lead) :]
+            break
+    # One clause. A description is often a paragraph of instructions and only
+    # the first breath of it is a title.
+    text = re.split(r"[.!?;:,\n]", text, maxsplit=1)[0]
+    words = text.split()[:TITLE_WORDS]
+    text = " ".join(words)[:TITLE_CHARS].strip(" ,;:—-")
+    # Cut at a word rather than mid-word when the character limit was the one
+    # that bit. Trimming the last word of a two-word title would leave one.
+    if len(" ".join(words)) > TITLE_CHARS and " " in text:
+        text = text.rsplit(" ", 1)[0]
+    return (text[:1].upper() + text[1:]) if text else ""
+
+
 def clean_text(paragraph):
     """One paragraph, with the markup the typesetter cannot print removed.
 
@@ -1658,6 +1938,11 @@ def build_outline(prompt, ask, config):
         prompt,
         "book_outline",
         outline_schema(wanted),
+        # A reply that ran out of room is read for what did arrive rather than
+        # thrown away. The plan is the one answer the whole book is written from,
+        # so losing all of it over a missing brace cost more than losing any
+        # chapter could — see `salvage_outline`.
+        salvage_outline,
         # A plan is a page of headings. Anything more is taken out of the book
         # the plan is for.
         ceiling=OUTLINE_CAP,
@@ -1699,7 +1984,15 @@ def build_outline(prompt, ask, config):
             chapter["heading"] = f"Chapter {number}"
 
     return {
-        "title": clean_line(data.get("title"), "Untitled book"),
+        # The model's own title, then one taken from the description, and only
+        # then the placeholder. A book whose plan never arrived is still a book
+        # about something, and the writer said what — "Untitled book" is what
+        # the app says when even that is gone.
+        "title": (
+            clean_line(data.get("title"))
+            or title_from(prompt)
+            or "Untitled book"
+        ),
         "subtitle": clean_line(data.get("subtitle")),
         "author": clean_line(data.get("author")),
         "series": clean_line(data.get("series")),

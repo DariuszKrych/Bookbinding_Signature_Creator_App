@@ -262,6 +262,22 @@ def activate(root):
     return folders
 
 
+def scratch_root(folders):
+    """Somewhere to build a file that is only going to be downloaded.
+
+    A sibling of the four data folders rather than one of them, and that is the
+    whole point of it:
+
+    * it is not in `DATA_FOLDERS`, so it counts against nothing in `usage` and
+      is never carried in the session zip — nothing here is the visitor's data,
+      it is a file on its way to their browser;
+    * it is under the same root, so the sweeper, the shutdown hook and
+      `discard` all take it away with everything else. A build that dies half
+      way therefore leaves nothing behind for longer than the session lasts.
+    """
+    return Path(folders["Input"]).parent / "_scratch"
+
+
 def reassert(folders):
     """Say once more, right before any file is written, where it is to go.
 
