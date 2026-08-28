@@ -70,6 +70,11 @@ CHAPTERS_VAR = "AI_CHAPTERS"
 MAX_CALLS_VAR = "AI_MAX_CALLS_PER_BOOK"
 STREAM_VAR = "AI_STREAM"
 TOKEN_LIMIT_VAR = "AI_TOKEN_LIMIT"
+RETRIES_VAR = "AI_RATE_LIMIT_RETRIES"
+GAP_VAR = "AI_REQUEST_GAP_SECONDS"
+PROVIDER_SORT_VAR = "OPENROUTER_PROVIDER_SORT"
+PROVIDER_ORDER_VAR = "OPENROUTER_PROVIDER_ORDER"
+PROVIDER_IGNORE_VAR = "OPENROUTER_PROVIDER_IGNORE"
 
 DEFAULT_TITLE = "Bookbinding Signature Creator"
 
@@ -127,6 +132,38 @@ DEFAULT_MAX_CALLS = 3
 # still well under a penny a book.
 DEFAULT_TOKEN_LIMIT = 8000
 
+# How OpenRouter should choose between the providers serving this model.
+#
+# A paid model has no request cap of OpenRouter's own — a 429 on one comes from
+# the provider upstream, which is out of capacity. Left unsorted, OpenRouter
+# load-balances by cost, and for a model this cheap that means the endpoints
+# most likely to be saturated get the traffic.
+#
+# Sorting by anything at all turns that load-balancing off. `throughput` is the
+# useful one here: a book is a long reply and tokens per second is what the wait
+# is made of. `price` restores the cost-first behaviour, `latency` optimises for
+# the first token instead.
+#
+# `allow_fallbacks` is deliberately not set. It defaults to true, which is
+# exactly what is wanted: a busy provider should fall through to the next.
+DEFAULT_PROVIDER_SORT = "throughput"
+PROVIDER_SORTS = ("price", "throughput", "latency")
+
+# How many more times one request may be sent while the service says it is busy.
+#
+# Not retries of a failed book — retries of a single refused request, which
+# generated nothing and was not billed. They cost time and nothing else, so they
+# are counted against the whole-book clock rather than against the request
+# budget. See `ai_book._wait_out_rate_limits`.
+DEFAULT_RETRIES = 2
+
+# The least time between one request and the next.
+#
+# Three requests fired back to back is the pattern most likely to trip a
+# provider's burst limit. A second between them costs three seconds on a book
+# that takes minutes.
+DEFAULT_GAP = 1.0
+
 # The repository root, i.e. the folder holding `app.py`.
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT_DIR / ".env"
@@ -154,6 +191,11 @@ class Settings:
     # `Settings` is built by hand.
     stream: bool = True
     token_limit: int = DEFAULT_TOKEN_LIMIT
+    retries: int = DEFAULT_RETRIES
+    gap: float = DEFAULT_GAP
+    provider_sort: str = DEFAULT_PROVIDER_SORT
+    provider_order: tuple = ()
+    provider_ignore: tuple = ()
 
     @property
     def batches(self):
@@ -171,6 +213,27 @@ class Settings:
         would be no guard at all.
         """
         return self.model == FREE_MODEL or self.model.endswith(":free")
+
+    @property
+    def provider(self):
+        """The `provider` block the request carries, or `None` for none at all.
+
+        Routing metadata rather than prompt content: OpenRouter reads it and
+        strips it, so it costs no tokens and the ledger is right to ignore it.
+
+        Empty keys are left out rather than sent empty, because an empty `order`
+        is not the same request as no `order` — and `None` here means the block
+        itself is not sent, which is what a copy that wants OpenRouter's own
+        cost-weighted balancing asks for by clearing every one of these.
+        """
+        block = {}
+        if self.provider_sort:
+            block["sort"] = self.provider_sort
+        if self.provider_order:
+            block["order"] = list(self.provider_order)
+        if self.provider_ignore:
+            block["ignore"] = list(self.provider_ignore)
+        return block or None
 
 
 def load_env(path=None):
@@ -216,6 +279,28 @@ def _number(name, default, cast):
     return value if value > 0 else default
 
 
+def _allowance(name, default, cast):
+    """A numeric setting where zero is a real answer rather than a mistake.
+
+    `_number` treats zero as a typo, which is right for a timeout and wrong for
+    a retry count: "do not retry" and "do not pause between requests" are both
+    things a copy might legitimately ask for. Only a negative is refused.
+    """
+    raw = _text(name)
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _list(name):
+    """A comma-separated setting, as a tuple with the blanks taken out."""
+    return tuple(piece.strip() for piece in _text(name).split(",") if piece.strip())
+
+
 def _flag(name, default=True):
     raw = _text(name).lower()
     if not raw:
@@ -237,7 +322,27 @@ def settings():
         max_calls=int(_number(MAX_CALLS_VAR, DEFAULT_MAX_CALLS, int)),
         stream=_flag(STREAM_VAR, True),
         token_limit=int(_number(TOKEN_LIMIT_VAR, DEFAULT_TOKEN_LIMIT, int)),
+        retries=int(_allowance(RETRIES_VAR, DEFAULT_RETRIES, int)),
+        gap=float(_allowance(GAP_VAR, DEFAULT_GAP, float)),
+        provider_sort=_sort(),
+        provider_order=_list(PROVIDER_ORDER_VAR),
+        provider_ignore=_list(PROVIDER_IGNORE_VAR),
     )
+
+
+def _sort():
+    """The provider sort, or the default when the name is not one OpenRouter has.
+
+    A misspelling falls back rather than being sent on. OpenRouter rejects a
+    `sort` it does not recognise, and a typo in an environment variable should
+    not be the reason every book comes back with a banner.
+    """
+    asked = _text(PROVIDER_SORT_VAR, DEFAULT_PROVIDER_SORT).lower()
+    if asked in ("none", "off", "-"):
+        # An explicit "let OpenRouter balance as it likes", which is what an
+        # empty `provider` block means. See `Settings.provider`.
+        return ""
+    return asked if asked in PROVIDER_SORTS else DEFAULT_PROVIDER_SORT
 
 
 def configured():

@@ -257,6 +257,69 @@ def scrub(text, key=""):
     return _KEY_SHAPE.sub("«api key»", text)
 
 
+def _status(error):
+    """The HTTP status on whatever the client raised, if there is one."""
+    return getattr(error, "status_code", None) or getattr(
+        getattr(error, "response", None), "status_code", None
+    )
+
+
+def _is_rate_limited(error):
+    """Whether the service refused this request because it is busy.
+
+    On a paid model this is not a limit of OpenRouter's own — those apply to the
+    free variants — it is the provider upstream being out of capacity. Which
+    matters, because it means waiting works: the request was refused, not
+    rejected, and the same request a moment later usually goes through.
+    """
+    if _status(error) == 429:
+        return True
+    low = str(error).lower()
+    return "rate limit" in low or "too many requests" in low
+
+
+def _is_busy(error):
+    """Whether waiting could plausibly help.
+
+    A rate limit, a gateway that is having a moment, or a connection that did
+    not open. Everything else — a bad key, a refused model, a request this app
+    got wrong — is answered the same way however long it is left.
+    """
+    status = _status(error)
+    if _is_rate_limited(error):
+        return True
+    if status and 500 <= int(status) < 600:
+        return True
+    return status is None and "connect" in str(error).lower()
+
+
+# The longest a service's own `Retry-After` is believed. Past this it is not a
+# busy moment any more, and a reader waiting on a progress bar is owed an answer
+# rather than another two minutes of nothing.
+MAX_RETRY_WAIT = 30.0
+
+# What to wait when the service asked for nothing in particular. Doubled each
+# time, so three attempts come to about twenty seconds in all.
+RETRY_WAIT = 3.0
+
+
+def _retry_after(error, fallback):
+    """How long the service asked to be left alone, in seconds.
+
+    Only the plain-seconds form is read. `Retry-After` may also carry an HTTP
+    date, and parsing one means trusting a clock this app has no reason to
+    trust — the fallback is a better answer than a wrong one.
+    """
+    headers = getattr(getattr(error, "response", None), "headers", None) or {}
+    try:
+        asked = float(headers.get("retry-after") or headers.get("Retry-After") or 0)
+    except (TypeError, ValueError):
+        return fallback
+    if asked <= 0:
+        return fallback
+    return min(asked, MAX_RETRY_WAIT)
+
+
 def _readable(error, config):
     """Turn whatever the client raised into an `AIError` worth reading.
 
@@ -265,9 +328,7 @@ def _readable(error, config):
     it, and this app runs at a public URL.
     """
     text = scrub(error, config.api_key)
-    status = getattr(error, "status_code", None) or getattr(
-        getattr(error, "response", None), "status_code", None
-    )
+    status = _status(error)
     low = text.lower()
 
     if status in (401, 403) or "invalid api key" in low or "no auth" in low:
@@ -277,7 +338,7 @@ def _readable(error, config):
         )
     if status == 402 or "credit" in low or "quota" in low:
         return AIError("This copy has no credit left for the AI writer.")
-    if status == 429 or "rate limit" in low or "too many requests" in low:
+    if _is_rate_limited(error):
         return AIError(
             "The AI writer has been asked for too much at once. Try again in a "
             "few minutes — the rate limit is on this copy as a whole, so a busy "
@@ -605,21 +666,22 @@ def _make_chat(config):
     """
     from langchain_openai import ChatOpenAI
 
-    # No `provider` block. Several providers serve this model and which of them
-    # answers is OpenRouter's decision, not this app's: its own routing already
-    # weighs cost heavily, and that is the behaviour wanted here.
+    # `max_retries=0` on purpose. The client's own retry is invisible: it honours
+    # a `Retry-After` for up to two minutes, and it does that inside one call, so
+    # nothing here can report the wait, count it against the book's clock, or
+    # decide it is not worth having. `_wait_out_rate_limits` does all three.
     return ChatOpenAI(
         model=config.model,
         api_key=config.api_key,
         base_url=config.base_url,
         temperature=TEMPERATURE,
         timeout=config.timeout,
-        max_retries=1,
+        max_retries=0,
         default_headers={"X-Title": config.app_title},
     )
 
 
-def _bind(chat, rung, schema_name, schema, cap):
+def _bind(chat, config, rung, schema_name, schema, cap):
     """`chat`, told how firmly to insist on JSON and how long it may go on for.
 
     Bound onto the runnable rather than built into the client so that one chat
@@ -632,8 +694,17 @@ def _bind(chat, rung, schema_name, schema, cap):
     `max_tokens` is the half of the token limit this app does not enforce
     itself. The service enforces it, which is what makes it a limit rather than
     an intention.
+
+    The `provider` block goes through `extra_body` rather than as a keyword,
+    because it is OpenRouter's own field and not part of the OpenAI wire format
+    the client knows: a keyword would be renamed or dropped, and `extra_body` is
+    copied into the request body verbatim. It is routing metadata rather than
+    prompt content — OpenRouter reads it and strips it — so it costs no tokens
+    and `estimate_request` is right not to count it.
     """
     bound = {"max_tokens": int(cap)}
+    if config.provider:
+        bound["extra_body"] = {"provider": config.provider}
     if rung == "json_schema":
         bound["response_format"] = {
             "type": "json_schema",
@@ -784,7 +855,82 @@ def _usage(reply):
     return None
 
 
-def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, cap):
+class _Pace:
+    """The least time between one request and the next.
+
+    Three requests fired back to back is the pattern most likely to trip a
+    provider's burst limit, and three back to back is exactly what a book is.
+    A second between them costs three seconds on something that takes minutes.
+
+    Held per book rather than on a module global, because two visitors writing
+    at once are two separate conversations with the service and neither should
+    be made to wait on the other.
+    """
+
+    def __init__(self, gap):
+        self.gap = max(0.0, float(gap))
+        self.last = 0.0
+
+    def wait(self):
+        """Hold until this request is allowed to go.
+
+        A pace of nothing reads no clock at all, rather than reading one and
+        finding it has nothing to wait for. It is the same answer either way,
+        and not asking is the honest way to say "this does not apply".
+        """
+        if not self.gap:
+            return
+        if self.last:
+            due = self.last + self.gap
+            now = time.monotonic()
+            if now < due:
+                time.sleep(due - now)
+        self.last = time.monotonic()
+
+
+def _wait_out_rate_limits(send, config, note=None, started=None):
+    """`send()`, tried again for as long as the service is only busy.
+
+    A 429 is not the request being wrong, it is the provider being full — so the
+    same request a moment later usually goes through, and giving up on the first
+    one turns a busy minute into a book that could not be written.
+
+    Three things bound the waiting, and all three matter:
+
+    * `config.retries` caps how many times one request is re-sent. Re-sent, not
+      re-charged: a refused request generated nothing and was not billed, so the
+      caller's `budget.take()` covers every attempt and no second request is
+      claimed for it.
+    * `config.budget` is the whole book's clock, and a wait that would run past
+      it is not started at all. Waiting is only worth it if there is still time
+      to use what comes back.
+    * `MAX_RETRY_WAIT` caps what a service's own `Retry-After` can ask for.
+
+    `note` is told about the wait. Somebody watching a progress bar deserves to
+    know the difference between a slow model and a stopped one — and it is the
+    app's quota check as well, which is why nothing here swallows its exception.
+    """
+    for attempt in range(max(0, config.retries) + 1):
+        try:
+            return send()
+        except Exception as error:
+            if attempt >= config.retries or not _is_busy(error):
+                raise
+            wait = _retry_after(error, RETRY_WAIT * (2**attempt))
+            if started is not None and time.monotonic() - started + wait > config.budget:
+                raise
+            if note:
+                note(
+                    f"The AI service is busy. Waiting {int(round(wait))}s and "
+                    "trying again…"
+                )
+            time.sleep(wait)
+    # Unreachable: the loop either returns or raises on its last pass.
+    raise AIError("The AI service is busy.")  # pragma: no cover
+
+
+def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, cap,
+            pace=None, note=None, started=None, essential=False):
     """One request, starting at the strongest format this model has accepted.
 
     `cap` is the output ceiling the ledger has allowed this request, and it is
@@ -800,6 +946,12 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
     Returns `(None, False)` when there were no requests left to make one with —
     which the caller turns into chapters written from the outline, not into an
     error. A service that answered badly still raises; only a budget goes quiet.
+
+    `essential` says whether this request is one the book cannot go on without.
+    The outline is: there is no plan to write the chapters from if it never
+    arrives, so a service that stays busy through every retry has to be reported.
+    A batch of chapters is not, and goes quiet the same way a spent budget does —
+    those chapters come from the plan and the reader gets a book.
     """
     live = live or _Live()
     start = _RUNG.get(config.model, RUNGS[0])
@@ -818,13 +970,19 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
             return None, False
         charge = ledger.take(cost, allowed)
         cut_off = False
-        try:
-            runnable = _bind(chat, rung, schema_name, schema, allowed)
+
+        def send():
+            """This request, once. Retried by the caller while the service is busy."""
+            if pace:
+                pace.wait()
+            runnable = _bind(chat, config, rung, schema_name, schema, allowed)
             if live and config.stream:
-                reply, usage = _read_stream(runnable, messages, live)
-            else:
-                answered = runnable.invoke(messages)
-                reply, usage = _content(answered), _usage(answered)
+                return _read_stream(runnable, messages, live)
+            answered = runnable.invoke(messages)
+            return _content(answered), _usage(answered)
+
+        try:
+            reply, usage = _wait_out_rate_limits(send, config, note, started)
         except Exception as error:
             if _is_cut_off(error):
                 # Not a failure. The reply reached the cap this very request
@@ -841,13 +999,17 @@ def _invoke(chat, config, messages, schema_name, schema, budget, live, ledger, c
                     # loop and back with nothing. A model that will not answer in
                     # JSON at any of the three is not something the reader can
                     # act on, and the chapters it did not write can be written
-                    # from the plan for nothing. This used to raise, and raising
-                    # is what turned a stubborn model into a broken book; a
-                    # bigger token budget only made it easier to reach, because
-                    # a request that used to be priced out now gets sent.
+                    # from the plan for nothing.
                     continue
-                # Everything else is a bad key, a rate limit, a service that is
-                # not answering. Those the reader has to be told about.
+                if _is_busy(error) and not essential:
+                    # Still busy after every retry, on a request the book can do
+                    # without. The chapters it would have carried are written
+                    # from the plan instead — a shorter book rather than a
+                    # banner, which is what every other limit here does too.
+                    return None, False
+                # A bad key, no credit, a service that is not answering, or a
+                # rate limit on the one request there is no plan without. Those
+                # the reader has to be told about.
                 failure = _readable(error, config)
         # Raised out here rather than inside the `except`, which matters more
         # than it looks. `raise ... from None` only stops Python *printing* the
@@ -1085,6 +1247,12 @@ class _Budget:
     limit: every attempt costs one, including a rung downgrade and including a
     repair.
 
+    A request the service *refused* does not, and that is the one exception.
+    It generated nothing, it was not billed, and it did not come off any daily
+    ration — so the retries in `_wait_out_rate_limits` all happen inside the one
+    claim the caller already made. What is rationed here is work asked for, not
+    packets sent.
+
     Running out is not an error, and this is the one thing worth being careful
     about. It used to raise, and raising is what turned a budget into a broken
     book: a model that spent a request working out which JSON format it accepts
@@ -1110,7 +1278,8 @@ class _Budget:
         return True
 
 
-def _asker(chat, config, budget, live=None, ledger=None):
+def _asker(chat, config, budget, live=None, ledger=None,
+           pace=None, note=None, started=None):
     """A function that asks one question and gets one dictionary back.
 
     A repair is allowed only when both budgets can pay for it. A model that has
@@ -1129,6 +1298,7 @@ def _asker(chat, config, budget, live=None, ledger=None):
     """
     live = live or _Live()
     ledger = ledger if ledger is not None else _Ledger(10**9)
+    pace = pace or _Pace(0)
 
     def ask(
         system,
@@ -1140,6 +1310,7 @@ def _asker(chat, config, budget, live=None, ledger=None):
         share=1.0,
         later=0,
         ceiling=None,
+        essential=False,
     ):
         # `system` may be a function of the output cap rather than a string. A
         # chapter request tells the model how long to make a chapter, and a
@@ -1172,6 +1343,7 @@ def _asker(chat, config, budget, live=None, ledger=None):
             mended, _ = _invoke(
                 chat, config, again, schema_name, schema,
                 budget, live, ledger, cap,
+                pace=pace, note=note, started=started,
             )
             if mended is None:
                 return None
@@ -1189,7 +1361,8 @@ def _asker(chat, config, budget, live=None, ledger=None):
             messages = [("system", sized(cap)), ("human", user)]
 
         reply, cut_off = _invoke(
-            chat, config, messages, schema_name, schema, budget, live, ledger, cap
+            chat, config, messages, schema_name, schema, budget, live, ledger, cap,
+            pace=pace, note=note, started=started, essential=essential,
         )
         if reply is None:
             return None
@@ -1488,6 +1661,11 @@ def build_outline(prompt, ask, config):
         # A plan is a page of headings. Anything more is taken out of the book
         # the plan is for.
         ceiling=OUTLINE_CAP,
+        # The one request the book cannot be written without. A budget that
+        # cannot afford it still goes quiet — headings alone make a thin book
+        # but they make one — while a service that stays busy through every
+        # retry is a passing condition worth telling the reader to wait out.
+        essential=True,
     )
     # `None` is the ledger saying there was not enough left even for this, and an
     # unreadable reply is the model saying the same thing differently. Neither is
@@ -1774,15 +1952,34 @@ def to_manuscript(plan, chapters, design=None):
 # --------------------------------------------------------------------------
 
 
-def _say(progress, fraction, message):
-    """Report progress.
+class _Progress:
+    """How far along the book is, and where the bar was left.
 
-    No `try`/`except` around the call, deliberately. The progress callback the
-    app passes in is also what enforces the session's disk quota, and it reports
-    that by raising. Swallowing it here would quietly turn the quota off.
+    No `try`/`except` anywhere in here, deliberately. The callback the app passes
+    in is also what enforces the session's disk quota, and it reports that by
+    raising. Swallowing it would quietly turn the quota off — and a wait loop is
+    a good place for it to still be able to fire.
     """
-    if progress:
-        progress(fraction, message)
+
+    def __init__(self, report=None):
+        self.report = report
+        self.at = 0.0
+
+    def say(self, fraction, message):
+        """The book has got this far."""
+        self.at = fraction
+        if self.report:
+            self.report(fraction, message)
+
+    def note(self, message):
+        """Something worth saying that is not progress.
+
+        Waiting out a busy service is the book standing still on purpose, so the
+        message goes out at the position the bar already holds rather than
+        dragging it backwards or inventing a step it has not taken.
+        """
+        if self.report:
+            self.report(self.at, message)
 
 
 def _check_allowed(config):
@@ -1839,10 +2036,15 @@ def write_book(prompt, *, design=None, progress=None, on_text=None, config=None)
     ledger = _Ledger(config.token_limit)
     chat = _make_chat(config)
     live = _Live(on_text)
-    ask = _asker(chat, config, budget, live, ledger)
+    bar = _Progress(progress)
+    pace = _Pace(config.gap)
+    ask = _asker(
+        chat, config, budget, live, ledger,
+        pace=pace, note=bar.note, started=started,
+    )
 
     total = config.chapters
-    _say(progress, 0.0, f"Planning {total} chapters…")
+    bar.say(0.0, f"Planning {total} chapters…")
     plan = build_outline(prompt, ask, config)
 
     # One request for the outline, and the rest shared out between the chapters —
@@ -1852,7 +2054,7 @@ def write_book(prompt, *, design=None, progress=None, on_text=None, config=None)
     # batch has spent or refused its share it is too late to be fair about it.
     sizes = split_batches(total, affordable_batches(ledger, plan, budget.left, total))
     allowance = chapter_allowance(ledger, plan, sizes)
-    _say(progress, 0.12, f"{total} chapters planned. Writing them now.")
+    bar.say(0.12, f"{total} chapters planned. Writing them now.")
 
     written = {}
     done = 0
@@ -1864,8 +2066,7 @@ def write_book(prompt, *, design=None, progress=None, on_text=None, config=None)
             # costs the reader prose and not the book.
             break
         first, last = numbers[0], numbers[-1]
-        _say(
-            progress,
+        bar.say(
             0.12 + 0.85 * done / total,
             f"Writing chapter{'s' if size > 1 else ''} {first}"
             + (f"–{last}" if size > 1 else "")
@@ -1891,7 +2092,7 @@ def write_book(prompt, *, design=None, progress=None, on_text=None, config=None)
         for number in range(1, total + 1)
     ]
 
-    _say(progress, 0.98, "Putting the book together…")
+    bar.say(0.98, "Putting the book together…")
     book = to_manuscript(plan, chapters, design)
-    _say(progress, 1.0, "Done.")
+    bar.say(1.0, "Done.")
     return book

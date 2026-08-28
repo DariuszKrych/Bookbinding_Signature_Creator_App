@@ -48,6 +48,14 @@ LIMIT = ai_config.DEFAULT_TOKEN_LIMIT
 
 
 def settings(**changes):
+    """The app's settings, with the two that only cost time turned off.
+
+    `gap` and `retries` are real defaults in production and would be real
+    seconds here: a second between requests is three seconds a test, and a
+    retry is a scripted reply consumed by an attempt the test never wrote. Both
+    are switched off so a test measures what it is about, and the ones that are
+    about waiting switch them back on themselves.
+    """
     base = ai_config.Settings(
         api_key=FAKE_KEY,
         model=DEFAULT_MODEL,
@@ -60,6 +68,8 @@ def settings(**changes):
         budget=60.0,
         chapters=5,
         max_calls=3,
+        retries=0,
+        gap=0.0,
     )
     return replace(base, **changes) if changes else base
 
@@ -129,6 +139,21 @@ def cut_off_error(text="", total=0, name="LengthFinishReasonError"):
         + (f" - CompletionUsage(total_tokens={total})" if total else "")
     )
     error.completion = completion
+    return error
+
+
+def busy_error(status=429, retry_after=None, message="429 Too Many Requests"):
+    """What the client raises when the provider upstream is out of capacity.
+
+    Shaped like the real one — a `status_code`, and a `response` carrying the
+    headers — because that is where `_is_rate_limited` and `_retry_after` look,
+    and a fake that is easier to read than the real thing would be testing
+    something the app never meets.
+    """
+    error = type("RateLimitError", (Exception,), {})(message)
+    error.status_code = status
+    headers = {} if retry_after is None else {"retry-after": str(retry_after)}
+    error.response = SimpleNamespace(status_code=status, headers=headers)
     return error
 
 
@@ -926,11 +951,15 @@ class TestAReplyThatFilledItsCap(AiTestCase):
         self.assertFalse(ai_book._is_cut_off(RuntimeError("429 rate limit exceeded")))
 
     def test_a_real_failure_still_reaches_the_reader(self):
-        """The catch is for one exception, not for every exception."""
-        chat = FakeChat(outline_reply(1), RuntimeError("429 rate limit exceeded"))
+        """The catch is for one exception, not for every exception.
+
+        A bad key is the kind that waiting cannot help and a shorter book cannot
+        paper over, so it is reported however it arrives.
+        """
+        chat = FakeChat(outline_reply(1), RuntimeError("401 invalid api key"))
         with self.assertRaises(ai_book.AIError) as caught:
             self.run_book(chat, config=settings(chapters=1))
-        self.assertIn("too much at once", str(caught.exception))
+        self.assertIn("would not accept this copy's key", str(caught.exception))
 
 
 class TestReadingAHalfArrivedReply(AiTestCase):
@@ -1252,6 +1281,168 @@ class TestEveryChapterGetsTheSameRoom(AiTestCase):
         book = self.run_book(chat, config=settings(chapters=12, max_calls=10))
         self.assertEqual(len(book.chapters), 12)
         self.assertLess(len(chat.calls), 10)
+
+
+class TestWhenTheServiceIsBusy(AiTestCase):
+    """A provider out of capacity is a wait, not the end of a book.
+
+    On a paid model a 429 is the provider upstream being full rather than any
+    limit of OpenRouter's own, so the same request a moment later usually goes
+    through. Everything below is about making that moment survivable: waiting it
+    out where waiting helps, spending no extra request on it, and coming back
+    with a shorter book rather than a banner when it does not pass.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Nothing here may actually sleep. The waits are what is being asserted,
+        # so they are recorded instead of taken.
+        self.waited = []
+        patch = mock.patch.object(ai_book.time, "sleep", self.waited.append)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    # ---- knowing one when it sees one -------------------------------------
+
+    def test_a_rate_limit_is_recognised_by_status_and_by_words(self):
+        self.assertTrue(ai_book._is_rate_limited(busy_error()))
+        self.assertTrue(ai_book._is_rate_limited(RuntimeError("Rate limit exceeded")))
+        self.assertTrue(ai_book._is_rate_limited(RuntimeError("too many requests")))
+        self.assertFalse(ai_book._is_rate_limited(RuntimeError("401 invalid api key")))
+
+    def test_waiting_helps_for_a_busy_service_and_not_for_a_bad_key(self):
+        self.assertTrue(ai_book._is_busy(busy_error()))
+        self.assertTrue(ai_book._is_busy(busy_error(status=503, message="502 bad gateway")))
+        self.assertFalse(ai_book._is_busy(busy_error(status=401, message="no auth")))
+
+    def test_the_services_own_wait_is_the_one_taken(self):
+        self.assertEqual(ai_book._retry_after(busy_error(retry_after=12), 99), 12)
+
+    def test_a_wait_with_no_number_on_it_falls_back(self):
+        self.assertEqual(ai_book._retry_after(busy_error(), 7), 7)
+        self.assertEqual(ai_book._retry_after(RuntimeError("busy"), 7), 7)
+
+    def test_an_unreasonable_wait_is_capped(self):
+        """A reader on a progress bar is owed an answer, not another hour."""
+        asked = ai_book._retry_after(busy_error(retry_after=3600), 5)
+        self.assertEqual(asked, ai_book.MAX_RETRY_WAIT)
+
+    # ---- waiting it out ---------------------------------------------------
+
+    def test_a_busy_moment_passes_and_the_book_is_whole(self):
+        chat = FakeChat(outline_reply(5), busy_error(), batch_reply(1, 2, 3),
+                        batch_reply(4, 5))
+        book = self.run_book(chat, config=settings(retries=2))
+        self.assertEqual(len(book.chapters), 5)
+        self.assertEqual(book.chapters[0].text.split("\n")[0], "Chapter 1, first.")
+        self.assertEqual(book.chapters[4].text.split("\n")[0], "Chapter 5, first.")
+        self.assertEqual(len(self.waited), 1)
+
+    def test_waiting_does_not_cost_a_second_request(self):
+        """The budget rations work asked for, not packets sent.
+
+        A refused request generated nothing and was not billed, so all of its
+        attempts sit inside the one claim the caller already made — and the book
+        still gets its three.
+        """
+        chat = FakeChat(outline_reply(5), busy_error(), batch_reply(1, 2, 3),
+                        batch_reply(4, 5))
+        book = self.run_book(chat, config=settings(retries=2))
+        # Four sends, three of them requests: the refused one is the extra.
+        self.assertEqual(len(chat.calls), 4)
+        self.assertTrue(all(chapter.text.strip() for chapter in book.chapters))
+
+    def test_the_wait_the_service_asked_for_is_the_wait_taken(self):
+        chat = FakeChat(outline_reply(1), busy_error(retry_after=17), batch_reply(1))
+        self.run_book(chat, config=settings(chapters=1, retries=2))
+        self.assertEqual(self.waited, [17])
+
+    def test_somebody_watching_is_told_why_nothing_is_happening(self):
+        chat = FakeChat(outline_reply(1), busy_error(retry_after=9), batch_reply(1))
+        seen = []
+        self.run_book(
+            chat,
+            config=settings(chapters=1, retries=2),
+            progress=lambda fraction, message: seen.append(message),
+        )
+        self.assertTrue(any("busy" in message for message in seen))
+        self.assertTrue(any("9s" in message for message in seen))
+
+    def test_the_bar_does_not_go_backwards_while_it_waits(self):
+        """A wait is the book standing still, not the book losing ground."""
+        chat = FakeChat(outline_reply(1), busy_error(), batch_reply(1))
+        seen = []
+        self.run_book(
+            chat,
+            config=settings(chapters=1, retries=2),
+            progress=lambda fraction, message: seen.append(fraction),
+        )
+        self.assertEqual(seen, sorted(seen))
+
+    def test_a_wait_that_would_outlast_the_book_is_not_started(self):
+        """The whole-book clock has to keep meaning something."""
+        chat = FakeChat(outline_reply(5), busy_error(retry_after=30),
+                        batch_reply(4, 5))
+        book = self.run_book(chat, config=settings(retries=3, budget=5.0))
+        self.assertEqual(self.waited, [])
+        self.assertEqual(len(book.chapters), 5)
+
+    # ---- when it does not pass --------------------------------------------
+
+    def test_a_busy_batch_gives_a_shorter_book_not_an_error(self):
+        chat = FakeChat(outline_reply(5), *[busy_error()] * 6)
+        book = self.run_book(chat, config=settings(retries=1))
+        self.assertEqual(len(book.chapters), 5)
+        # Every chapter came from its own plan entry, and none from a banner.
+        self.assertEqual(book.chapters[0].text, "What happens in 1.")
+        self.assertEqual(book.chapters[4].text, "What happens in 5.")
+
+    def test_a_busy_outline_is_reported(self):
+        """There is no plan to write the chapters from, so this one is told."""
+        chat = FakeChat(*[busy_error()] * 6)
+        with self.assertRaises(ai_book.AIError) as caught:
+            self.run_book(chat, config=settings(retries=1))
+        self.assertIn("too much at once", str(caught.exception))
+
+    def test_every_retry_is_used_before_giving_up(self):
+        chat = FakeChat(outline_reply(1), *[busy_error()] * 6)
+        self.run_book(chat, config=settings(chapters=1, retries=3))
+        self.assertEqual(len(self.waited), 3)
+
+    def test_no_retries_means_no_waiting(self):
+        chat = FakeChat(outline_reply(1), *[busy_error()] * 3)
+        book = self.run_book(chat, config=settings(chapters=1, retries=0))
+        self.assertEqual(self.waited, [])
+        self.assertEqual(len(book.chapters), 1)
+
+    # ---- not arriving all at once -----------------------------------------
+
+    def test_requests_are_spaced_out(self):
+        """Three requests back to back is what trips a burst limit."""
+        pace = ai_book._Pace(2.0)
+        # Sent at 100, asked for again at 100.5, and allowed at 102.
+        clock = iter([100.0, 100.5, 102.0])
+        with mock.patch.object(ai_book.time, "monotonic", lambda: next(clock)):
+            pace.wait()   # the first goes straight out
+            pace.wait()   # half a second later, so it waits the other 1.5
+        self.assertEqual(self.waited, [1.5])
+
+    def test_a_request_that_is_already_late_does_not_wait(self):
+        pace = ai_book._Pace(1.0)
+        # Five seconds between them: the gap has long since passed.
+        clock = iter([100.0, 105.0, 105.0])
+        with mock.patch.object(ai_book.time, "monotonic", lambda: next(clock)):
+            pace.wait()
+            pace.wait()
+        self.assertEqual(self.waited, [])
+
+    def test_no_gap_reads_no_clock_at_all(self):
+        """Off means off, rather than on and finding nothing to do."""
+        pace = ai_book._Pace(0)
+        with mock.patch.object(ai_book.time, "monotonic", side_effect=AssertionError):
+            pace.wait()
+            pace.wait()
+        self.assertEqual(self.waited, [])
 
 
 def _schema_of(binding):
@@ -1744,16 +1935,54 @@ class TestTheRequestOpenRouterGets(AiTestCase):
     def test_the_model_is_the_one_that_was_configured(self):
         self.assertEqual(self.built_with(settings())["model"], DEFAULT_MODEL)
 
-    def test_no_provider_block_is_sent(self):
-        """Routing is OpenRouter's to decide, and its default leans on cost."""
-        made = self.built_with(settings())
-        self.assertNotIn("extra_body", made)
-        self.assertNotIn("provider", made.get("model_kwargs") or {})
+    def test_the_client_does_not_retry_behind_the_apps_back(self):
+        """A client retry is a wait nothing here can see, report or cut short."""
+        self.assertEqual(self.built_with(settings())["max_retries"], 0)
 
     def test_nothing_but_the_key_carries_the_key(self):
         made = self.built_with(settings())
         elsewhere = {name: value for name, value in made.items() if name != "api_key"}
         self.assertNotIn(FAKE_KEY, str(elsewhere))
+
+    def test_the_provider_block_rides_on_the_request(self):
+        """Routing goes per request, in `extra_body`, not on the client.
+
+        `extra_body` is copied into the request body verbatim, which is what a
+        field of OpenRouter's own needs: a keyword would be renamed to something
+        the OpenAI wire format knows, or dropped.
+        """
+        chat = FakeChat()
+        ai_book._bind(chat, settings(), "json_object", "book", {}, 400)
+        self.assertEqual(
+            chat.bindings[0]["extra_body"], {"provider": {"sort": "throughput"}}
+        )
+
+    def test_no_provider_block_when_there_is_nothing_to_say(self):
+        chat = FakeChat()
+        ai_book._bind(chat, settings(provider_sort=""), "json_object", "book", {}, 400)
+        self.assertNotIn("extra_body", chat.bindings[0])
+
+    def test_the_order_and_the_ignores_are_carried_too(self):
+        chat = FakeChat()
+        config = settings(provider_order=("a", "b"), provider_ignore=("c",))
+        ai_book._bind(chat, config, "json_object", "book", {}, 400)
+        self.assertEqual(
+            chat.bindings[0]["extra_body"]["provider"],
+            {"sort": "throughput", "order": ["a", "b"], "ignore": ["c"]},
+        )
+
+    def test_routing_is_not_charged_for(self):
+        """It is metadata OpenRouter reads and strips, not words the model sees.
+
+        Which is why the ledger never sees it: the cost of a request is what its
+        messages and schema come to, and a `provider` block is neither.
+        """
+        messages = [("system", "s"), ("human", "h")]
+        chat = FakeChat()
+        ai_book._bind(chat, settings(), "json_object", "book", {}, 400)
+        with_routing = ai_book.estimate_request(messages)
+        ai_book._bind(chat, settings(provider_sort=""), "json_object", "book", {}, 400)
+        self.assertEqual(with_routing, ai_book.estimate_request(messages))
 
 
 class TestSwitchedOff(AiTestCase):

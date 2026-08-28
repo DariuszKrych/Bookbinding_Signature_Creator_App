@@ -12,7 +12,7 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.59-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![Docker](https://img.shields.io/badge/Docker-micromamba-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Render](https://img.shields.io/badge/Render-deployed-46E3B7?logo=render&logoColor=black)](https://render.com/)
-[![Tests](https://img.shields.io/badge/tests-467-brightgreen)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-489-brightgreen)](#-testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 **[▶ Open the live app](https://bookbinding-signature-creator.onrender.com)** · [What it does](#-what-it-does) · [Architecture](#-deployment--architecture) · [Engineering notes](#-engineering-highlights) · [Run it locally](#-run-it-yourself)
@@ -166,9 +166,21 @@ So the worst a request can come to is *estimated input + `max_tokens`*, and one 
 
 **Measuring the input is the hard half, and it is why there are two estimators.** Against a real tokenizer, English prose runs about 4.5 bytes to the token, pure punctuation 1.6, and combining accents 1.2. One ratio is therefore either wasteful for the text the app sends or unsafe for text somebody can paste into the box. So prompt text — written here, and held to its ratio by a test against a real tokenizer — is measured at 3 bytes to the token; anything that has been outside at 1.2, which nothing realistic beats.
 
-**Running out is never an error.** When the ledger cannot afford a request, `from_plan` writes those chapters from their own outline summaries, for nothing. The same when the clock runs out, when the request budget runs out, when a reply is unreadable, and when a model refuses every rung of the JSON ladder. Every budget here says "no" rather than raising. **A shorter book, never a broken one.** Genuine service failures — a bad key, a rate limit, a network that is not there — still raise, because the reader has to be told about those.
+**Running out is never an error.** When the ledger cannot afford a request, `from_plan` writes those chapters from their own outline summaries, for nothing. The same when the clock runs out, when the request budget runs out, when a reply is unreadable, and when a model refuses every rung of the JSON ladder. Every budget here says "no" rather than raising. **A shorter book, never a broken one.** A bad key, no credit, a service that is not answering at all — those still raise, because the reader has to be told about them.
 
 Lowering `AI_TOKEN_LIMIT` shortens the book; a test walks it down to nothing and checks exactly that. Raising `AI_MAX_CALLS_PER_BOOK` gives more, smaller batches — not more tokens.
+
+#### When the provider is busy
+
+A **429** on a paid model is not a limit of OpenRouter's own — those apply to the free variants — it is the provider upstream being out of capacity. Which matters, because it means waiting works: the request was refused rather than rejected, and the same one a moment later usually goes through.
+
+So `_wait_out_rate_limits` waits and sends it again, for as long as three things allow. `AI_RATE_LIMIT_RETRIES` caps the attempts; `AI_TOTAL_BUDGET_SECONDS` refuses to start a wait that would outlast the book; and the service's own `Retry-After` is honoured up to half a minute. **The retries do not come out of `AI_MAX_CALLS_PER_BOOK`** — a refused request generated nothing and was not billed, so what that budget rations is work asked for rather than packets sent. The wait is reported on the progress bar, at the position it already holds, so a busy service looks different from a stopped one.
+
+The client's own retry is switched off (`max_retries=0`) so that all of this is the app's to decide: a retry inside the client is a wait nothing here can see, count against the clock, or judge not worth having.
+
+`AI_REQUEST_GAP_SECONDS` puts a second between one request and the next, because three fired back to back is the pattern most likely to trip a burst limit in the first place.
+
+If it is still busy when the retries run out, a **chapter batch goes quiet** like any other budget here and those chapters come from the plan. The **outline** is the one request that is reported instead, because there is no plan to write anything from if it never arrives.
 
 #### Every chapter gets the same room
 
@@ -191,7 +203,7 @@ Reading a book out of a reply that has not arrived yet is the interesting part, 
 
 **It is optional.** With no key set the button is drawn switched off with a line explaining why, and the rest of the app is untouched. The LangChain import happens *inside* the call that needs it, so a machine without `langchain-openai` still runs the whole app — the test suite is proof, since it never installs it.
 
-**The model is `meta-llama/llama-3.1-8b-instruct`.** One model, named, the same every time. Small is the point: at eight billion parameters it answers in a fraction of the time a large model takes. Which provider serves it is OpenRouter's decision — the request carries no `provider` block, and OpenRouter's own routing already weighs cost heavily.
+**The model is `meta-llama/llama-3.1-8b-instruct`.** One model, named, the same every time. Small is the point: at eight billion parameters it answers in a fraction of the time a large model takes. Which of the providers serving it answers is OpenRouter's decision, steered by a `provider` block the request carries — `sort: throughput` by default, so routing follows tokens per second rather than price. `OPENROUTER_PROVIDER_SORT`, `_ORDER` and `_IGNORE` change or clear it; fallbacks stay on either way.
 
 *It is a paid model,* at $0.02 per million tokens in and $0.04 out, so a whole book costs a small fraction of a penny. `OPENROUTER_FREE_ONLY` therefore defaults to **0**, since a guard set to refuse every paid model would refuse the app's own default. **The credit limit on the key is the ceiling**, and the only control OpenRouter enforces for you. A copy that must not be able to spend anything sets `OPENROUTER_FREE_ONLY=1` *and* `OPENROUTER_MODEL=openrouter/free`.
 
@@ -260,7 +272,12 @@ All optional except the key, all read from the environment, all documented in [`
 | `AI_CALL_TIMEOUT_SECONDS` | `120` | How long one request may take. A batch of three full-length chapters is the long one. |
 | `AI_TOTAL_BUDGET_SECONDS` | `420` | How long a whole book may take before it stops asking for more. |
 | `AI_CHAPTERS` | `5` | How many chapters every book has. Exactly this many — see below. |
-| `AI_MAX_CALLS_PER_BOOK` | `3` | The most requests one book may cost, counting retries. Not more tokens — see the ceiling above. |
+| `AI_MAX_CALLS_PER_BOOK` | `3` | The most requests one book may cost. Not more tokens — see the ceiling above. |
+| `AI_RATE_LIMIT_RETRIES` | `2` | Extra sends of one request while the service is busy. They cost time, not requests. |
+| `AI_REQUEST_GAP_SECONDS` | `1.0` | The least time between one request and the next, so a book is not a burst. |
+| `OPENROUTER_PROVIDER_SORT` | `throughput` | How OpenRouter picks between the providers serving the model: `throughput`, `latency`, `price`, or `none` to let it balance as it likes. |
+| `OPENROUTER_PROVIDER_ORDER` | *(none)* | Comma list of providers to try in order. |
+| `OPENROUTER_PROVIDER_IGNORE` | *(none)* | Comma list of providers to skip — for routing around one that is reliably busy. |
 
 #### Why it cannot leak
 
@@ -312,7 +329,7 @@ A sheet is folded across its width, so one sheet of *W × H* gives four book pag
 
 **🧪 Tests that refuse to mark their own homework**
 
-467 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, derive expected coordinates by hand rather than importing them from the code under test, and feed the AI writer the malformed JSON small models really send. [Details below.](#-testing)
+489 tests that read ink positions back out of finished PDFs, simulate the physical fold independently of the production formula, derive expected coordinates by hand rather than importing them from the code under test, and feed the AI writer the malformed JSON small models really send. [Details below.](#-testing)
 
 </td></tr>
 <tr><td>
@@ -664,7 +681,7 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
                    Script.test_ai_book Script.test_ai_editor -v
 ```
 
-**467 tests across five modules**, and they go out of their way not to mark their own homework:
+**489 tests across five modules**, and they go out of their way not to mark their own homework:
 
 **The imposition**
 
@@ -692,6 +709,7 @@ python -m unittest Script.test_imposition Script.test_manuscript Script.test_edi
 - **Budgets asserted as budgets.** A five-chapter book costs **exactly three requests**, split 3 then 2; a repair is *not* attempted when the allowance is gone. The chapter count is pinned from both ends — twelve planned is trimmed to five, two is padded to five, and the button's label must equal the schema's `minItems`.
 - **The token ceiling is measured, not argued.** A `GreedyChat` fills every reply to exactly the `max_tokens` it was sent — the worst legal case, which no real model reaches — and the cost is rebuilt from what was actually sent and said. Three ways: a real tokenizer (nine runs counted with `tiktoken` the way the account is billed, including descriptions of pure punctuation, Chinese, emoji and Cyrillic); the assumption underneath (the estimators held against that tokenizer over sixteen scripts plus every prompt the app sends, since the limit rests on the input estimate never reading low); and fuzzing (200 seeded books crossing eight alphabets with eight ways a reply can go wrong, at five limits and four chapter counts). The limit is read from `ai_config` rather than written out, so moving it cannot leave forty assertions checking a stale number.
 - **The floor too**: a limit of 50 tokens makes *no requests at all* and still returns five chapters and no error, and walking the limit down gives a shorter book rather than a broken one.
+- **A busy provider is tested without waiting for one.** `time.sleep` is replaced with a list, so the waits are recorded rather than taken and the assertions are about their length: a `Retry-After: 17` is waited for seventeen seconds, an hour-long one is capped, and a wait that would outlast `AI_TOTAL_BUDGET_SECONDS` is never started. A 429 then a good reply has to give a whole book on **three** requests, not four — the refused one does not come out of the budget — and a 429 on every attempt has to give five chapters from the plan on a batch and the readable banner on the outline.
 - **Truncation, three ways.** By actually truncating — a two-chapter reply cut mid-string, both chapters surviving without another request, the lost one filled from its outline summary. By the exception the OpenAI client raises *instead* of the reply, faked in the test file so nothing imports the client, and fed both ways a real one lands: before a word arrives, and after a whole reply has streamed onto the page. And by a `DutifulChat` that reads the length off the prompt, writes it fifteen percent over as models do, and is chopped wherever `max_tokens` falls — the assertion being that no chapter exceeds half again the shortest. What `paragraph_plan` asks for is pinned separately: it must cost less than the allowance it was given, at every allowance from a full one down to sixty tokens.
 
 **The key, and the words about it**
