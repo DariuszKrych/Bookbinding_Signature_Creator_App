@@ -2326,97 +2326,161 @@ st.iframe(
 # `__LOCKED__` carries the reasons the button is off that have nothing to do
 # with typing — a job running, a full disk, no key. While any of those hold, the
 # server has really disabled it, and the script keeps its hands off entirely.
+#
+# **The watcher is installed into the page's own realm, and that is not
+# fastidiousness.** This script runs inside a one-pixel iframe, and Streamlit
+# throws that iframe away and builds a new one whenever the script's *text*
+# changes — which is exactly when `__LOCKED__` flips, which is exactly when
+# somebody walks onto this screen. A listener registered from in here belongs to
+# the frame's realm: when the frame goes, the parent document is left holding a
+# handler whose realm no longer exists. It stays registered and never runs
+# again. A flag on the parent saying "already bound" then outlives the thing it
+# was describing, and every later frame skips the registration it actually
+# needed. The button sits there enabled with an empty box and nothing anywhere
+# reports a fault.
+#
+# So the frame does two small things: it puts this run's facts on the parent as
+# plain data, and — once — appends the watcher to the parent as a `<script>`, so
+# the code lives in the same realm as the flag guarding it and lasts as long as
+# the page. Later frames only update the data and call `__bindRefresh`.
 TYPING_SCRIPT = """
 <style>html, body { margin: 0; background: transparent; }</style>
 <script>
 (function () {
-  var page;
+  var top;
   try {
-    page = window.parent.document;
+    top = window.parent;
+    if (!top.document) return;
   } catch (error) {
     return;                       // Not the same origin: nothing to reach.
   }
 
-  var BOX = '.st-key-ai-prompt input';
-  var BUTTON = '.st-key-ai-write button';
-  var HINT = "__HINT__";
+  // This run's facts, handed over as data rather than baked into the watcher —
+  // which is written once and then never replaced. The selectors come from
+  // `ai_view`, beside the widgets they name: one written out by hand here went
+  // stale when the box changed from a one-line input to a text area, and the
+  // whole script quietly stopped doing anything.
+  top.__bindBox = "__BOX__";
+  top.__bindButton = "__BUTTON__";
+  top.__bindPanel = "__PANEL__";
+  top.__bindHint = "__HINT__";
+  top.__bindLocked = __LOCKED__;
 
-  // Read fresh on every reload of this frame, which happens whenever the lock
-  // changes — the script is only re-sent when its text changes, and the flag is
-  // part of its text.
-  window.parent.__bindLocked = __LOCKED__;
-
-  function label(button) {
-    // The bracketed hint, as an element. Streamlit renders the `**...**` in the
-    // label as a <strong>, so on a run the server drew it there is already one
-    // to find; on a run it did not, one is made. Either way it is tagged, so it
-    // is the same element next time.
-    var found = button.querySelector('[data-typed-hint]');
-    if (found) return found;
-    var bold = button.getElementsByTagName('strong');
-    if (bold.length) {
-      bold[0].setAttribute('data-typed-hint', '1');
-      return bold[0];
+  // Everything below runs in the *parent's* realm, not this frame's. `window`
+  // and `document` inside it are the app's own.
+  function watcher() {
+    function label(button) {
+      // The bracketed hint, as an element. Streamlit renders the `**...**` in
+      // the label as a <strong>, so on a run the server drew it there is
+      // already one to find; on a run it did not, one is made. Either way it is
+      // tagged, so it is the same element next time.
+      var found = button.querySelector('[data-typed-hint]');
+      if (found) return found;
+      var bold = button.getElementsByTagName('strong');
+      if (bold.length) {
+        bold[0].setAttribute('data-typed-hint', '1');
+        return bold[0];
+      }
+      var made = document.createElement('strong');
+      made.setAttribute('data-typed-hint', '1');
+      made.textContent = ' ' + window.__bindHint;
+      var into = button.querySelector('p') || button;
+      into.appendChild(made);
+      return made;
     }
-    var made = page.createElement('strong');
-    made.setAttribute('data-typed-hint', '1');
-    made.textContent = ' ' + HINT;
-    var into = button.querySelector('p') || button;
-    into.appendChild(made);
-    return made;
-  }
 
-  // Which way round the button is switched, and why it is done like this.
-  //
-  // The obvious version — let the server draw the button switched off and have
-  // this switch it on — does not work, and the way it fails is worth writing
-  // down. Streamlit's button ignores a click whenever *React* thinks it is
-  // disabled, and React thinks what the server told it. Clearing the attribute
-  // in the page changes how the button looks and lets the browser fire its
-  // events, and the component drops them on the floor anyway. The button lights
-  // up, the press does nothing, and it looks more broken than before.
-  //
-  // So it is the other way round. The server draws the button **on**, this
-  // makes it look and behave off while the box is empty, and the click handler
-  // in `app.py` refuses an empty description on the server. React is never
-  // told the button is off, so the first press after typing is a real one.
-  function refresh() {
-    if (window.parent.__bindLocked) return;
-    var box = page.querySelector(BOX);
-    var button = page.querySelector(BUTTON);
-    if (!box || !button) return;
-    var typed = box.value.trim().length > 0;
-    // The attribute is the browser's, not React's: it greys the button, stops
-    // the pointer and takes it out of the tab order, and React puts it back
-    // every time it redraws — which the observer below notices. Written only
-    // when it would actually change, or that observer would wake itself for
-    // ever.
-    if (button.disabled !== !typed) button.disabled = !typed;
-    if (button.getAttribute('aria-disabled') !== String(!typed)) {
-      button.setAttribute('aria-disabled', String(!typed));
+    // Which way round the button is switched, and why it is done like this.
+    //
+    // The obvious version — let the server draw the button switched off and
+    // have this switch it on — does not work, and the way it fails is worth
+    // writing down. Streamlit's button ignores a click whenever *React* thinks
+    // it is disabled, and React thinks what the server told it. Clearing the
+    // attribute in the page changes how the button looks and lets the browser
+    // fire its events, and the component drops them on the floor anyway. The
+    // button lights up, the press does nothing, and it looks more broken than
+    // before.
+    //
+    // So it is the other way round. The server draws the button **on**, this
+    // makes it look and behave off while the box is empty, and the click
+    // handler in `app.py` refuses an empty description on the server. React is
+    // never told the button is off, so the first press after typing is a real
+    // one.
+    function refresh() {
+      if (window.__bindLocked) return;
+      var box = document.querySelector(window.__bindBox);
+      var button = document.querySelector(window.__bindButton);
+      if (!box || !button) return;
+      var typed = box.value.trim().length > 0;
+      // The attribute is the browser's, not React's: it greys the button, stops
+      // the pointer and takes it out of the tab order, and React puts it back
+      // every time it redraws — which the observer below notices. Written only
+      // when it would actually change, or that observer would wake itself for
+      // ever.
+      if (button.disabled !== !typed) button.disabled = !typed;
+      if (button.getAttribute('aria-disabled') !== String(!typed)) {
+        button.setAttribute('aria-disabled', String(!typed));
+      }
+      var wanted = typed ? 'none' : '';
+      var hint = label(button);
+      if (hint.style.display !== wanted) hint.style.display = wanted;
     }
-    var wanted = typed ? 'none' : '';
-    var hint = label(button);
-    if (hint.style.display !== wanted) hint.style.display = wanted;
-  }
 
-  if (!window.parent.__bindTyping) {
-    window.parent.__bindTyping = true;
+    // Never more than one pass per animation frame, and this is not a
+    // micro-optimisation — it is what stops the tab freezing.
+    //
+    // `refresh` writes to the DOM, and the observer below watches the DOM.
+    // MutationObserver callbacks run as *microtasks*, and the microtask queue
+    // is drained to empty before the browser is allowed to paint or handle
+    // input — so a callback that mutates, however slightly, can queue the next
+    // one for ever without a single frame going by. The page does not slow
+    // down; it stops dead, with no error anywhere. Deferring the work to
+    // `requestAnimationFrame` breaks that by construction: at worst this runs
+    // once a frame, and the browser stays alive between them.
+    var pending = false;
+    function later() {
+      if (pending) return;
+      pending = true;
+      window.requestAnimationFrame(function () {
+        pending = false;
+        refresh();
+      });
+    }
+
+    window.__bindRefresh = refresh;
+
+    // Typing calls `refresh` directly rather than through `later`: this is the
+    // one path a person is waiting on, and a frame's delay is a frame too many.
     // Captured on the document rather than bound to the box, because Streamlit
     // replaces the box element on every rerun and a listener on it would go
-    // with it.
-    page.addEventListener('input', function (event) {
+    // with it. `input` fires on every keystroke, paste and undo, so the button
+    // keeps up with typing rather than waiting for the box to lose focus.
+    document.addEventListener('input', function (event) {
       var where = event.target;
-      if (where && where.closest && where.closest('.st-key-ai-prompt')) refresh();
+      if (where && where.closest && where.closest(window.__bindPanel)) refresh();
     }, true);
-    new window.parent.MutationObserver(refresh).observe(page.body, {
+
+    // React redraws the button on every rerun and puts the server's `disabled`
+    // back with it; this notices and says otherwise again. It fires for every
+    // change anywhere in the app, which is why it goes through `later`.
+    new MutationObserver(later).observe(document.body, {
       childList: true, subtree: true,
       attributes: true, attributeFilter: ['disabled'],
     });
+
+    refresh();
   }
 
-  refresh();
-  window.setTimeout(refresh, 120);   // The widgets may not be drawn yet.
+  if (!top.__bindTyping) {
+    top.__bindTyping = true;
+    var install = top.document.createElement('script');
+    install.textContent = '(' + watcher.toString() + ')();';
+    top.document.body.appendChild(install);   // Runs as it is appended.
+  }
+
+  if (top.__bindRefresh) {
+    top.__bindRefresh();
+    top.setTimeout(top.__bindRefresh, 120);   // Widgets may not be drawn yet.
+  }
 })();
 </script>
 """
@@ -2427,9 +2491,11 @@ TYPING_SCRIPT = """
 ai_locked = busy or full or not ai_ready or route != AI_ROUTE
 
 st.iframe(
-    TYPING_SCRIPT.replace("__LOCKED__", "true" if ai_locked else "false").replace(
-        "__HINT__", AI_HINT
-    ),
+    TYPING_SCRIPT.replace("__LOCKED__", "true" if ai_locked else "false")
+    .replace("__HINT__", AI_HINT)
+    .replace("__BOX__", ai_view.AI_PROMPT_SELECTOR)
+    .replace("__BUTTON__", ai_view.AI_BUTTON_SELECTOR)
+    .replace("__PANEL__", ai_view.AI_PROMPT_CONTAINER),
     width=1,
     height=1,
     tab_index=-1,
@@ -2590,11 +2656,19 @@ if pending_job is not None:
             # book being replaced was drawn long before this line, and adopting
             # deletes exactly those keys. See `book_editor.hand_over`.
             book_editor.hand_over(written)
+            # Short, and no instruction in it. The banner the writing screen
+            # draws a moment later is the one that says where the reader has
+            # been moved to and what to do there; two green banners both giving
+            # directions is one too many. And nothing here tells anybody to
+            # press 💾 Save: a draft lives in this browser session and dies with
+            # it, so pointing a first-time visitor at it as the way to keep a
+            # book is pointing them at the wrong thing. The downloads are the
+            # way to keep a book, and they are the first thing on the screen
+            # they are about to land on.
             done = (
                 f"Wrote “{written.display_title}” — {len(written.chapters)} "
-                f"chapters, {written.words:,} words. Nothing is saved yet: press "
-                "💾 Save to keep it."
-                + (f" Your previous book is in the drafts list as “{kept}”." if kept else "")
+                f"chapters, {written.words:,} words."
+                + (f" Your previous book was kept as the draft “{kept}”." if kept else "")
             )
         else:
             # Unreachable, and deliberately loud rather than silent. Every kind

@@ -32,11 +32,34 @@ from Script import ai_book, settings
 # a description somebody had just typed.
 AI_PROMPT_KEY = "ai-prompt"
 
+# The button's key, named rather than written out at the widget, because the
+# script in `app.py` has to find the same button on the page.
+AI_BUTTON_KEY = "ai-write"
+
 # Said on the button itself while the box is empty, and taken off it again the
 # moment a character is typed. One string, used by the label below and by the
 # script at the foot of `app.py` that keeps the label right between reruns — so
 # the two cannot drift.
 AI_HINT = "(Please type a description of the book to generate)"
+
+# How `TYPING_SCRIPT` in `app.py` finds the things it works on. Built from the
+# two keys above rather than written out by hand, for a reason that has already
+# cost this feature once.
+#
+# The box selector was hand-written as `input`, and stayed `input` when the
+# description grew from a one-line `st.text_input` into the `st.text_area`
+# below. A text area is a `<textarea>`, so `querySelector` found nothing, the
+# script's `refresh()` returned at its first line, and the button — which is
+# deliberately drawn *on*, so that the first press after typing is a real one —
+# simply stayed on with the box empty. Nothing failed loudly. The one guard that
+# makes a drawn-on button safe just stopped running.
+#
+# Both tags are listed, so moving back to a one-line box cannot break it in the
+# other direction either, and `test_ai_editor` ties these strings to the widgets
+# the app really draws.
+AI_PROMPT_CONTAINER = f".st-key-{AI_PROMPT_KEY}"
+AI_PROMPT_SELECTOR = f"{AI_PROMPT_CONTAINER} textarea, {AI_PROMPT_CONTAINER} input"
+AI_BUTTON_SELECTOR = f".st-key-{AI_BUTTON_KEY} button"
 
 settings.register(AI_PROMPT_KEY, "")
 
@@ -99,7 +122,7 @@ def render(*, busy, job, full, claim_job, handed_over=False):
         "✍️ Writing…" if writing
         else f"🤖 Write my {chapters} chapter mini-novel"
         + ("" if prompt.strip() else f"  **{AI_HINT}**"),
-        key="ai-write",
+        key=AI_BUTTON_KEY,
         type="primary",
         use_container_width=True,
         # Not switched off for an empty box, and that is deliberate. Streamlit's
@@ -128,10 +151,15 @@ def render(*, busy, job, full, claim_job, handed_over=False):
             "prompt": st.session_state.get(AI_PROMPT_KEY, ""),
         }
 
+    # Said before the button, not only after it. The move at the end of a job
+    # that takes minutes is the one thing on this screen a reader cannot undo by
+    # clicking the opposite button, so it is worth naming the screen they will
+    # arrive on while they are still deciding whether to press.
     st.caption(
         "It writes the words only — your page size, type and margins are left "
-        "exactly as you set them. When it finishes you land in the editor with "
-        "the book in it, to read, change and export however you like."
+        "exactly as you set them. When it finishes, this screen hands you over "
+        "to **✍️ Write your book** with the book already in it, to read, change "
+        "and download."
     )
 
     with st.expander("What to expect"):
@@ -147,8 +175,8 @@ def render(*, busy, job, full, claim_job, handed_over=False):
   where it is; if it had unsaved words they go to a draft of their own beside it,
   and the message afterwards names it. Nothing you typed is the price of
   pressing this button.
-- **Nothing is saved anywhere afterwards.** The book arrives in the editor
-  unsaved, with the three download buttons at the top of that screen.
+- **Nothing is kept on the server.** The book arrives on the writing screen, and
+  the download buttons at the top of it are how you keep a copy of it.
 """
         )
 

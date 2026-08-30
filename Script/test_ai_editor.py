@@ -21,7 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from Script import ai_book  # noqa: E402
+from Script import ai_book, ai_view  # noqa: E402
 from Script.manuscript import (  # noqa: E402
     Design,
     Manuscript,
@@ -232,6 +232,34 @@ class TestTheButtonKeepsUpWithTyping(AiEditorTestCase):
         self.assertIn("st-key-ai-prompt", self.scripts())
         self.assertIn("st-key-ai-write", self.scripts())
 
+    def test_the_script_looks_for_the_box_that_is_actually_drawn(self):
+        """The bug this test exists to stop coming back, and it came back once.
+
+        The script's box selector said `input` for as long as the description
+        was a one-line `st.text_input`. When it became a `st.text_area` nothing
+        broke loudly: `querySelector` simply found nothing, `refresh()` returned
+        at its first line, and the button — which is drawn **on** by design, so
+        that the first press after typing is a real one — sat there enabled with
+        an empty box for every visitor.
+
+        So the two selectors live in `ai_view`, next to the widgets they name,
+        and this ties them to the kind of widget the app really draws.
+        """
+        self.assertIsNotNone(
+            self.at.text_area(key="ai-prompt"), "the description box is a text area"
+        )
+        self.assertIn("textarea", ai_view.AI_PROMPT_SELECTOR)
+        self.assertIn(ai_view.AI_PROMPT_SELECTOR, self.scripts())
+        self.assertIn(ai_view.AI_BUTTON_SELECTOR, self.scripts())
+
+    def test_the_script_watches_the_box_for_every_keystroke(self):
+        """Not blur, and not a poll. Streamlit sends a text area's value when it
+        loses focus, and waiting for that would mean clicking off the box before
+        the button would light up — two clicks for one press."""
+        script = self.scripts()
+        self.assertIn("addEventListener('input'", script)
+        self.assertIn("MutationObserver", script)
+
     def test_the_script_says_the_same_words_as_the_button(self):
         """One string in `app.py`, so the label and the script cannot drift."""
         self.assertIn(
@@ -249,7 +277,21 @@ class TestTheButtonKeepsUpWithTyping(AiEditorTestCase):
         on a button that a running job, a full disk or a missing key turned off.
         `TestSwitchedOffLeavesTheScriptLocked` is the other half of this.
         """
-        self.assertIn("if (window.parent.__bindLocked) return;", self.scripts())
+        self.assertIn("if (window.__bindLocked) return;", self.scripts())
+
+    def test_the_watcher_is_installed_into_the_page_rather_than_the_frame(self):
+        """The other half of why this broke, and the half that is invisible.
+
+        The script runs in a one-pixel iframe that Streamlit rebuilds whenever
+        the script's text changes — which is exactly when the lock flag flips,
+        which is exactly when somebody walks onto this screen. A listener
+        registered from inside that frame dies with it, while the "already
+        bound" flag on the parent does not; every later frame then skips the
+        registration it actually needed, and nothing reports a fault.
+        """
+        script = self.scripts()
+        self.assertIn("createElement('script')", script)
+        self.assertIn("watcher.toString()", script)
 
     def test_a_typed_description_survives_leaving_the_screen(self):
         """It used to live above the view radio, drawn on every run, so nothing
@@ -381,13 +423,31 @@ class TestMovingToTheWritingView(AiEditorTestCase):
         self.assertEqual(self.state("route"), WRITE_VIEW)
         self.assertFalse(self.at.exception, self.at.exception)
 
-    def test_it_says_where_the_book_on_screen_came_from(self):
+    def test_it_says_the_reader_has_been_moved_and_why(self):
+        """The move is the surprising part: a button was pressed on one screen
+        and the whole page changed. The banner leads with that, names the screen
+        they are now on, and points at the way out — rather than describing the
+        book and leaving them to work out where they are."""
         self.generate()
         banner = "\n".join(str(element.value) for element in self.at.success)
+        self.assertIn("moved to", banner.lower())
+        self.assertIn("Write your book", banner)
         self.assertIn("The Paperclip", banner)
-        # And where to go next, which is the row of download buttons the
-        # writing screen now opens on rather than a numbered step below.
-        self.assertIn("download buttons at the top", banner)
+        self.assertIn("download buttons", banner)
+
+    def test_nothing_after_a_generation_tells_a_new_reader_to_save(self):
+        """A draft lives in this browser session and dies with it, so pointing a
+        first-time visitor at 💾 Save as the way to keep a book points them at
+        the wrong thing. The downloads are that, and they are the first thing on
+        the screen the reader has just landed on.
+
+        The banners only. 💾 Save is still explained *inside* the drafts panel
+        at the foot of the writing screen, which is folded shut and is for
+        somebody who went looking for it.
+        """
+        self.generate()
+        banners = "\n".join(str(element.value) for element in self.at.success)
+        self.assertNotIn("Save", banners)
 
     def test_the_banner_is_said_once_and_then_stops(self):
         """It describes how the book arrived, which stops being news the moment
@@ -395,7 +455,7 @@ class TestMovingToTheWritingView(AiEditorTestCase):
         self.generate()
         self.at.text_input(key="bk-title").set_value("Mine now").run()
         banner = "\n".join(str(element.value) for element in self.at.success)
-        self.assertNotIn("yours now", banner)
+        self.assertNotIn("moved to", banner.lower())
 
     def test_a_failure_leaves_you_where_you_were_with_what_you_typed(self):
         """Nothing arrived, so there is nothing to move to — and the
@@ -457,7 +517,8 @@ class TestKeepingWhatWasThere(AiEditorTestCase):
         self.at.button(key="bk-save").click().run()
         self.generate()
         banner = "\n".join(str(element.value) for element in self.at.success)
-        self.assertIn("previous book is in the drafts list", banner)
+        self.assertIn("previous book was kept as the draft", banner)
+        self.assertIn("Demon Noble Girl", banner)
         self.assertIn("Demon Noble Girl", banner)
 
     def test_an_empty_editor_leaves_no_draft_behind(self):

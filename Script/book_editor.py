@@ -1752,12 +1752,17 @@ def render(editor, folder):
     # The banner for a book that has just been written by a model. Popped rather
     # than read, so it says so once and then stops — it describes how the book
     # arrived, which stops being news the moment the user starts editing it.
+    #
+    # It leads with the move, because the move is the surprising part: the
+    # reader pressed a button on the AI screen and the whole page changed under
+    # them. Saying what the book is before saying where they are leaves them
+    # working that out for themselves.
     if st.session_state.pop(HANDOFF, False):
         st.success(
-            f"**{book.display_title}** is yours now — {len(book.chapters)} "
-            f"chapters, {book.words:,} words. Read it, change anything you "
-            "like, and take it away with the download buttons at the top of "
-            "this screen. Nothing is saved yet.",
+            f"**You have been moved to ✍️ Write your book** — the AI has "
+            f"finished, and this is the screen where you read and change it. "
+            f"**{book.display_title}**: {len(book.chapters)} chapters, "
+            f"{book.words:,} words. The download buttons above take it away.",
             icon="🤖",
         )
 

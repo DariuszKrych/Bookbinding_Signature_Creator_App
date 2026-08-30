@@ -239,6 +239,10 @@ So it goes the other way round. **The server draws the button on**, the script m
 
 **The server still decides.** The script only changes what is drawn between reruns, and a test pins the words it puts on the button to the same string the label is built from. It is also told when the button is off for a reason unrelated to typing — a job running, a full disk, no key — and then keeps its hands off entirely.
 
+**Two things about it broke silently once, and both are now pinned by tests.** The first was a selector: it looked for an `input`, and stayed looking for an `input` when the description grew into a text area. `querySelector` found nothing, the script returned at its first line, and the button sat there enabled with an empty box. Nothing errored. The selectors are now built from the widget keys in [`Script/ai_view.py`](./Script/ai_view.py), and a test asserts the box the app draws is the tag the script looks for.
+
+The second is subtler and is why the script no longer *contains* the watcher. It runs in a one-pixel iframe, and Streamlit rebuilds that iframe whenever the script's text changes — which is exactly when the lock flag flips, which is exactly when somebody walks onto this screen. A listener registered from inside the frame dies with the frame, while an "already bound" flag on the parent survives it, so every later frame skipped the registration it needed. The frame now appends the watcher to the page as a `<script>`, so the code and the flag guarding it live in the same realm and last as long as the tab; the frame only hands over this run's facts. The watcher also coalesces its work into one pass per animation frame — its own DOM writes wake the `MutationObserver` watching them, and a mutation made from a microtask can queue the next one forever without a frame going by, which freezes the tab rather than slowing it.
+
 #### Setting the key on Render
 
 **The key is not part of the deploy.** Render pulls the code from GitHub but reads the key from its *own* settings, which never touch the repository — two separate paths into the container. Set it once, by hand, and every future `git push` picks it up.
@@ -633,10 +637,15 @@ underneath it.
 Describe the book — subject, voice, who it is for, what should happen — and press it. **The
 book appears under the button as it is written**, a sentence at a time. The screen stays put
 while it writes, and that is deliberate: the progress bar and the streaming box both live
-here, and a job whose screen stops being drawn is a job the runner abandons. When it
-finishes you land in the **writing** screen with the title, author, dedication and five
-chapters in the editor and a banner saying so — an ordinary unsaved draft: edit it, save it,
-build it, convert it.
+here, and a job whose screen stops being drawn is a job the runner abandons.
+
+When it finishes you are moved to **✍️ Write your book**, with the title, author, dedication
+and five chapters already in the editor. The banner there leads with the move — you pressed
+a button on one screen and the whole page changed, so being told *where you are and why* is
+worth more than being told what the book is. It does not tell you to save it: a draft lives
+in this browser session and dies with it, and the three download buttons at the top of that
+screen are the ones that actually keep a book. The AI screen says the same thing before you
+press, so the move is expected rather than surprising.
 
 **It is always five chapters**, whatever the description says, so describe *what happens* rather than how long it should be. "A short novel" or "an epic" changes the voice and the pacing, not the count.
 
